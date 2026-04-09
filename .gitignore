@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local toolchains
+.tools/
+
+# Local environment overrides and secrets
+.env
+*.local
+conf/environments/*.env
+!conf/environments/*.env.example
+
+# Spark and local runtime artifacts
+derby.log
+metastore_db/
+spark-warehouse/
+data/metadata/spark-warehouse/
+
+# Generated data
+data/raw/*
+!data/raw/.gitkeep
+data/bronze/*
+!data/bronze/.gitkeep
+data/metadata/*
+!data/metadata/.gitkeep
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
