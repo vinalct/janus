@@ -1,0 +1,79 @@
+source_id: federal_open_data_example
+name: Federal Open Data Example Source
+description: Example source definition exercising the canonical JANUS source contract.
+owner: janus
+enabled: true
+source_type: api
+strategy: api
+strategy_variant: page_number_api
+federation_level: federal
+domain: example
+public_access: true
+tags:
+  - example
+  - contract
+
+access:
+  base_url: https://example.invalid
+  path: /datasets
+  method: GET
+  format: json
+  timeout_seconds: 30
+  headers:
+    Accept: application/json
+  params:
+    dataset: janus-demo
+  auth:
+    type: header_token
+    env_var: JANUS_EXAMPLE_API_TOKEN
+    header_name: X-API-Token
+    token_prefix: Token
+  pagination:
+    type: page_number
+    page_param: page
+    size_param: page_size
+    page_size: 100
+  rate_limit:
+    requests_per_minute: 30
+    concurrency: 1
+    backoff_seconds: 5
+
+extraction:
+  mode: incremental
+  checkpoint_field: updated_at
+  checkpoint_strategy: max_value
+  lookback_days: 1
+  retry:
+    max_attempts: 3
+    backoff_strategy: exponential
+    backoff_seconds: 2
+
+schema:
+  mode: explicit
+  path: conf/schemas/example/source_schema.json
+
+spark:
+  input_format: json
+  write_mode: append
+  repartition: 4
+  partition_by:
+    - ingestion_date
+
+outputs:
+  raw:
+    path: data/raw/example/federal_open_data_example
+    format: json
+  bronze:
+    path: data/bronze/example/federal_open_data_example
+    format: parquet
+  metadata:
+    path: data/metadata/example/federal_open_data_example
+    format: json
+
+quality:
+  required_fields:
+    - id
+    - updated_at
+  unique_fields:
+    - id
+  allow_schema_evolution: true
