@@ -122,9 +122,12 @@ class StrategyCatalog:
 
     @classmethod
     def with_defaults(cls) -> Self:
-        strategies = {
-            family: PlanningStrategy(family)
-            for family in sorted(SUPPORTED_STRATEGY_VARIANTS)
+        from janus.strategies.api import ApiStrategy
+
+        strategies: dict[str, BaseStrategy] = {
+            "api": ApiStrategy(),
+            "catalog": PlanningStrategy("catalog"),
+            "file": PlanningStrategy("file"),
         }
         bindings = tuple(
             StrategyBinding(family=family, variant=variant, strategy=strategies[family])
