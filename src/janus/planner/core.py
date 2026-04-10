@@ -123,11 +123,12 @@ class StrategyCatalog:
     @classmethod
     def with_defaults(cls) -> Self:
         from janus.strategies.api import ApiStrategy
+        from janus.strategies.files import FileStrategy
 
         strategies: dict[str, BaseStrategy] = {
             "api": ApiStrategy(),
             "catalog": PlanningStrategy("catalog"),
-            "file": PlanningStrategy("file"),
+            "file": FileStrategy(),
         }
         bindings = tuple(
             StrategyBinding(family=family, variant=variant, strategy=strategies[family])
