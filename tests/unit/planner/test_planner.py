@@ -358,6 +358,9 @@ def test_main_executes_source_through_framework_runtime(tmp_path, capsys, monkey
             }
 
     class FakeSourceExecutor:
+        def __init__(self, logger=None):
+            self.logger = logger
+
         def execute(self, planned_run, spark, environment_config):
             assert planned_run.plan.source.source_id == "cli_source"
             assert spark.sparkContext.appName == "janus-exec-test"
@@ -386,8 +389,14 @@ def test_main_executes_source_through_framework_runtime(tmp_path, capsys, monkey
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
+    log_events = [
+        json.loads(line)["event"] for line in captured.err.splitlines() if line.strip()
+    ]
+
     assert exit_code == 0
-    assert captured.err == ""
+    assert "cli_execution_requested" in log_events
+    assert "spark_session_started" in log_events
+    assert "spark_session_stopped" in log_events
     assert payload["planned_run"]["run"]["run_id"] == "run-cli-exec-001"
     assert payload["executed_run"]["status"] == "succeeded"
     assert payload["spark_session"]["app_name"] == "janus-exec-test"

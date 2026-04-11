@@ -12,6 +12,7 @@ from janus.normalizers import BaseNormalizer
 from janus.planner import PlannedRun
 from janus.quality import PersistedValidationReport, QualityGate, ValidationReportStore
 from janus.readers import SparkDatasetReader
+from janus.utils.logging import StructuredLogger
 from janus.utils.storage import StorageLayout
 from janus.writers import SparkDatasetWriter
 
@@ -111,6 +112,7 @@ class ExecutedRun:
 
 @dataclass(slots=True)
 class SourceExecutor:
+    logger: StructuredLogger | None = None
     reader: SparkDatasetReader = field(default_factory=SparkDatasetReader)
     normalizer: BaseNormalizer = field(default_factory=BaseNormalizer)
     quality_gate: QualityGate = field(
@@ -131,6 +133,8 @@ class SourceExecutor:
         storage_layout = self.storage_layout_resolver(planned_run.plan, environment_config)
         plan = _plan_with_storage_layout_outputs(planned_run.plan, storage_layout)
         runtime_planned_run = replace(planned_run, plan=plan)
+        logger = _bind_execution_logger(self.logger, plan)
+        _attach_strategy_logger(planned_run.strategy, logger)
 
         extraction_result: ExtractionResult | None = None
         write_results: tuple[WriteResult, ...] = ()
@@ -138,20 +142,69 @@ class SourceExecutor:
         strategy_metadata: dict[str, Any] = {}
 
         try:
+            _log_info(
+                logger,
+                "source_execution_started",
+                extraction_mode=plan.extraction_mode,
+                checkpoint_strategy=plan.checkpoint_strategy,
+                raw_output_path=plan.raw_output.path,
+                bronze_output_path=plan.bronze_output.path,
+                metadata_output_path=plan.metadata_output.path,
+            )
+
             self.observer.start_run(plan)
+            _log_info(logger, "run_observation_started")
+
+            _log_info(
+                logger,
+                "source_extraction_started",
+                pagination_type=plan.source_config.access.pagination.type,
+                auth_type=plan.source_config.access.auth.type,
+            )
             extraction_result = planned_run.strategy.extract(plan, hook=planned_run.hook)
+            _log_info(
+                logger,
+                "source_extraction_finished",
+                records_extracted=extraction_result.records_extracted or 0,
+                artifact_count=len(extraction_result.artifacts),
+                checkpoint_value=extraction_result.checkpoint_value,
+            )
+
             raw_write_results = _raw_write_results(plan, extraction_result)
             write_results = raw_write_results
+            _log_info(
+                logger,
+                "raw_outputs_materialized",
+                artifact_count=len(raw_write_results),
+            )
 
             handoff = planned_run.strategy.build_normalization_handoff(
                 plan,
                 extraction_result,
                 hook=planned_run.hook,
             )
+            _log_info(
+                logger,
+                "normalization_handoff_prepared",
+                artifact_count=len(handoff.artifacts),
+                is_empty=handoff.is_empty,
+            )
+
             normalized_dataframe = None
             if not handoff.is_empty:
+                _log_info(logger, "spark_read_started", artifact_count=len(handoff.artifacts))
                 raw_dataframe = self.reader.read_extraction_result(spark, handoff)
+                _log_info(logger, "spark_read_finished")
+
+                _log_info(logger, "normalization_started")
                 normalized_dataframe = self.normalizer.normalize(raw_dataframe, plan)
+                _log_info(logger, "normalization_finished")
+
+                _log_info(
+                    logger,
+                    "bronze_write_started",
+                    bronze_output_path=plan.bronze_output.path,
+                )
                 bronze_result = self.writer_factory(storage_layout).write(
                     normalized_dataframe,
                     plan,
@@ -159,6 +212,15 @@ class SourceExecutor:
                     count_records=True,
                 )
                 write_results = raw_write_results + (bronze_result,)
+                _log_info(
+                    logger,
+                    "bronze_write_finished",
+                    path=bronze_result.path,
+                    format=bronze_result.format,
+                    mode=bronze_result.mode,
+                    records_written=bronze_result.records_written,
+                    partition_by=list(bronze_result.partition_by),
+                )
 
             strategy_metadata = dict(
                 planned_run.strategy.emit_metadata(
@@ -168,11 +230,25 @@ class SourceExecutor:
                     hook=planned_run.hook,
                 )
             )
+            _log_info(
+                logger,
+                "strategy_metadata_emitted",
+                metadata_keys=sorted(strategy_metadata),
+            )
+
+            _log_info(logger, "quality_validation_started")
             validation_report = self.quality_gate.validate_and_store(
                 plan,
                 dataframe=normalized_dataframe,
                 write_results=write_results,
                 raise_on_failure=False,
+            )
+            _log_info(
+                logger,
+                "quality_validation_finished",
+                is_successful=validation_report.report.is_successful,
+                summary=validation_report.report.summary(),
+                validation_report_path=str(validation_report.path),
             )
             if not validation_report.report.is_successful:
                 failure = RuntimeError(_quality_failure_message(validation_report))
@@ -181,6 +257,12 @@ class SourceExecutor:
                     failure,
                     extraction_result,
                     write_results,
+                )
+                _log_error(
+                    logger,
+                    "source_execution_failed",
+                    failure_reason=str(failure),
+                    error_type=type(failure).__name__,
                 )
                 return _build_executed_run(
                     runtime_planned_run,
@@ -195,6 +277,14 @@ class SourceExecutor:
                 )
 
             persisted = self.observer.record_success(plan, extraction_result, write_results)
+            _log_info(
+                logger,
+                "source_execution_succeeded",
+                records_extracted=extraction_result.records_extracted or 0,
+                materialized_output_count=len(write_results),
+                run_metadata_path=str(getattr(persisted, "run_metadata_path", "")),
+                lineage_path=str(getattr(persisted, "lineage_path", "")),
+            )
             return _build_executed_run(
                 runtime_planned_run,
                 status="succeeded",
@@ -205,6 +295,12 @@ class SourceExecutor:
                 strategy_metadata=strategy_metadata,
             )
         except Exception as exc:
+            _log_exception(
+                logger,
+                "source_execution_failed",
+                failure_reason=str(exc),
+                error_type=type(exc).__name__,
+            )
             persisted = self.observer.record_failure(plan, exc, extraction_result, write_results)
             return _build_executed_run(
                 runtime_planned_run,
@@ -217,6 +313,44 @@ class SourceExecutor:
                 failure_reason=str(exc),
                 error_type=type(exc).__name__,
             )
+
+
+def _bind_execution_logger(
+    logger: StructuredLogger | None,
+    plan: ExecutionPlan,
+) -> StructuredLogger | None:
+    if logger is None:
+        return None
+    return logger.bind(
+        run_id=plan.run_context.run_id,
+        source_id=plan.source.source_id,
+        source_name=plan.source.name,
+        environment=plan.run_context.environment,
+        strategy_family=plan.source.strategy,
+        strategy_variant=plan.source.strategy_variant,
+    )
+
+
+def _attach_strategy_logger(strategy: Any, logger: StructuredLogger | None) -> None:
+    if logger is None or not hasattr(strategy, "logger"):
+        return
+    if strategy.logger is None:
+        strategy.logger = logger
+
+
+def _log_info(logger: StructuredLogger | None, event: str, **fields: Any) -> None:
+    if logger is not None:
+        logger.info(event, **fields)
+
+
+def _log_error(logger: StructuredLogger | None, event: str, **fields: Any) -> None:
+    if logger is not None:
+        logger.error(event, **fields)
+
+
+def _log_exception(logger: StructuredLogger | None, event: str, **fields: Any) -> None:
+    if logger is not None:
+        logger.exception(event, **fields)
 
 
 def _plan_with_storage_layout_outputs(

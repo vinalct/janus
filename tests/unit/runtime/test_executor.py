@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,7 @@ from janus.planner import PlannedRun
 from janus.quality import PersistedValidationReport, ValidationCheck, ValidationReport
 from janus.registry import load_registry
 from janus.runtime import SourceExecutor
+from janus.utils.logging import build_structured_logger
 from janus.utils.storage import StorageLayout
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -191,8 +194,11 @@ def test_source_executor_runs_framework_pipeline_and_returns_summary(tmp_path):
     metadata_root = tmp_path / "data" / "metadata" / "example" / "federal_open_data_example"
     bronze_path = tmp_path / "data" / "bronze" / "example" / "federal_open_data_example"
 
+    stream = StringIO()
+    logger = build_structured_logger("janus.tests.executor.progress", stream=stream)
     observer = FakeObserver(calls, metadata_root)
     executor = SourceExecutor(
+        logger=logger,
         reader=FakeReader(calls),
         normalizer=FakeNormalizer(calls),
         quality_gate=FakeQualityGate(
@@ -228,6 +234,13 @@ def test_source_executor_runs_framework_pipeline_and_returns_summary(tmp_path):
     )
     assert observer.seen_metadata_output_path == str(metadata_root)
     assert planned_run.strategy.seen_metadata_output_path == str(metadata_root)
+
+    log_events = [json.loads(line)["event"] for line in stream.getvalue().splitlines()]
+    assert "source_execution_started" in log_events
+    assert "source_extraction_started" in log_events
+    assert "bronze_write_finished" in log_events
+    assert "quality_validation_finished" in log_events
+    assert "source_execution_succeeded" in log_events
 
 
 def test_source_executor_records_failed_status_when_quality_validation_fails(tmp_path):

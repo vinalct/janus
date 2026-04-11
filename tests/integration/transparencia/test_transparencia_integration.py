@@ -76,6 +76,7 @@ def test_transparencia_source_contract_uses_safe_api_settings():
     assert source_config.access.path == "/api-de-dados/servidores/por-orgao"
     assert source_config.access.auth.type == "header_token"
     assert source_config.access.auth.header_name == "chave-api-dados"
+    assert source_config.access.pagination.page_size == 15
     assert source_config.access.rate_limit.requests_per_minute == 60
     assert source_config.access.rate_limit.concurrency == 1
     assert source_config.extraction.mode == "snapshot"

@@ -12,6 +12,7 @@ from janus.planner import Planner, PlannerError, PlanningRequest
 from janus.registry import SourceNotFoundError
 from janus.runtime import SourceExecutor
 from janus.utils.environment import build_spark_session, load_environment_config, prepare_runtime
+from janus.utils.logging import build_structured_logger
 
 
 def default_project_root() -> Path:
@@ -165,9 +166,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.execute:
         assert planned_run is not None
+        execution_logger = build_structured_logger(
+            "janus.execution",
+            level=config.get("runtime", {}).get("log_level", "INFO"),
+        ).bind(
+            environment=config.get("name", args.environment),
+            project_root=str(project_root),
+        )
+        execution_logger.info(
+            "cli_execution_requested",
+            source_id=args.source_id,
+            include_disabled=args.include_disabled,
+        )
+
         try:
+            execution_logger.info(
+                "spark_session_starting",
+                app_name=config.get("spark", {}).get("app_name"),
+                master=config.get("spark", {}).get("master"),
+            )
             spark = build_spark_session(config, resolved_paths)
         except Exception as exc:  # pragma: no cover - defensive entrypoint guard
+            execution_logger.exception(
+                "spark_session_failed",
+                failure_reason=str(exc),
+                error_type=type(exc).__name__,
+            )
             print(str(exc), file=sys.stderr)
             return 1
 
@@ -176,10 +200,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "app_name": spark.sparkContext.appName,
                 "master": spark.sparkContext.master,
             }
-            executed_run = SourceExecutor().execute(planned_run, spark, config)
+            execution_logger.info(
+                "spark_session_started",
+                app_name=spark.sparkContext.appName,
+                master=spark.sparkContext.master,
+            )
+            executed_run = SourceExecutor(logger=execution_logger).execute(
+                planned_run,
+                spark,
+                config,
+            )
             summary["executed_run"] = executed_run.to_summary()
         finally:
             spark.stop()
+            execution_logger.info("spark_session_stopped")
 
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0 if executed_run.is_successful else 1

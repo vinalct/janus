@@ -208,6 +208,16 @@ class ApiStrategy(BaseStrategy):
             sleeper=self.sleeper,
         )
         logger = self._bind_logger(plan)
+        if logger is not None:
+            logger.info(
+                "api_extraction_started",
+                request_url=base_request.full_url(),
+                method=base_request.method,
+                pagination_type=plan.source_config.access.pagination.type,
+                page_size=plan.source_config.access.pagination.page_size,
+                checkpoint_loaded=checkpoint_state is not None,
+                timeout_seconds=base_request.timeout_seconds,
+            )
 
         artifacts = []
         total_records = 0
@@ -224,6 +234,16 @@ class ApiStrategy(BaseStrategy):
                         request,
                         checkpoint_state=checkpoint_state,
                         pagination_state=pagination_state,
+                    )
+
+                if logger is not None:
+                    logger.info(
+                        "api_request_started",
+                        request_index=pagination_state.request_index,
+                        page_number=pagination_state.page_number,
+                        offset=pagination_state.offset,
+                        cursor=pagination_state.cursor,
+                        request_url=request.full_url(),
                     )
 
                 response, attempts_used = self._send_with_retries(
@@ -263,12 +283,48 @@ class ApiStrategy(BaseStrategy):
                 next_cursor = None
                 if api_hook is not None:
                     next_cursor = api_hook.resolve_next_cursor(plan, request, response, payload)
-                pagination_state = paginator.next_state(
+                next_pagination_state = paginator.next_state(
                     pagination_state,
                     records_extracted=len(records),
                     payload=payload,
                     next_cursor=next_cursor,
                 )
+                if logger is not None:
+                    logger.info(
+                        "api_request_finished",
+                        request_index=pagination_state.request_index,
+                        page_number=pagination_state.page_number,
+                        offset=pagination_state.offset,
+                        cursor=pagination_state.cursor,
+                        status_code=response.status_code,
+                        attempts_used=attempts_used,
+                        records_extracted=len(records),
+                        total_records=total_records,
+                        artifact_path=persisted.artifact.path,
+                        has_next_page=next_pagination_state is not None,
+                        next_page_number=(
+                            next_pagination_state.page_number
+                            if next_pagination_state is not None
+                            else None
+                        ),
+                        next_offset=(
+                            next_pagination_state.offset
+                            if next_pagination_state is not None
+                            else None
+                        ),
+                    )
+                pagination_state = next_pagination_state
+
+        if logger is not None:
+            logger.info(
+                "api_extraction_finished",
+                request_count=successful_requests,
+                retry_count=max(total_attempts - successful_requests, 0),
+                attempt_count=total_attempts,
+                records_extracted=total_records,
+                artifact_count=len(artifacts),
+                checkpoint_value=checkpoint_value,
+            )
 
         extraction_result = ExtractionResult.from_plan(
             plan,

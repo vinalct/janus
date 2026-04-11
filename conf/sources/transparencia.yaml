@@ -2,7 +2,7 @@ source_id: transparencia_servidores_por_orgao
 name: Portal da Transparencia - Servidores agregados por orgao
 description: Snapshot ingestion of aggregated federal executive servidor counts by orgao from the Portal da Transparencia API.
 owner: janus
-enabled: true
+enabled: false
 source_type: api
 strategy: api
 strategy_variant: page_number_api
@@ -31,7 +31,7 @@ access:
     type: page_number
     page_param: pagina
     size_param: tamanhoPagina
-    page_size: 100
+    page_size: 15
   rate_limit:
     requests_per_minute: 60
     concurrency: 1

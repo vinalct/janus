@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -11,6 +12,7 @@ from janus.checkpoints import CheckpointStore
 from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.planner import StrategyCatalog
 from janus.strategies.api import ApiHook, ApiResponse, ApiStrategy
+from janus.utils.logging import build_structured_logger
 from janus.utils.storage import StorageLayout
 
 
@@ -82,6 +84,37 @@ def test_default_strategy_catalog_uses_api_strategy_for_api_variants(tmp_path):
 
     assert isinstance(binding.strategy, ApiStrategy)
     assert binding.dispatch_path == "api.page_number_api"
+
+
+def test_api_strategy_logs_page_progress(tmp_path):
+    stream = StringIO()
+    logger = build_structured_logger("janus.tests.api.progress", stream=stream)
+    plan = _build_plan(tmp_path, source_id="logged_page_source", page_size=2)
+    strategy, _transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"records": [{"id": "1"}, {"id": "2"}]}),
+            ResponseSpec(200, {"records": [{"id": "3"}]}),
+        ],
+        logger=logger,
+    )
+
+    strategy.extract(plan)
+
+    payloads = [json.loads(line) for line in stream.getvalue().splitlines()]
+    events = [payload["event"] for payload in payloads]
+    finished_pages = [
+        payload for payload in payloads if payload["event"] == "api_request_finished"
+    ]
+
+    assert events[0] == "api_extraction_started"
+    assert events[-1] == "api_extraction_finished"
+    assert [page["fields"]["page_number"] for page in finished_pages] == [1, 2]
+    assert finished_pages[0]["fields"]["records_extracted"] == 2
+    assert finished_pages[0]["fields"]["has_next_page"] is True
+    assert finished_pages[0]["fields"]["next_page_number"] == 2
+    assert finished_pages[1]["fields"]["records_extracted"] == 1
+    assert finished_pages[1]["fields"]["has_next_page"] is False
 
 
 def test_api_strategy_page_number_extracts_raw_pages_and_tracks_checkpoint(tmp_path):
@@ -259,6 +292,7 @@ def _build_strategy(
     responses: list[ResponseSpec | Exception],
     *,
     sleeper=None,
+    logger=None,
 ):
     transport = FakeTransport(responses)
     strategy = ApiStrategy(
@@ -266,6 +300,7 @@ def _build_strategy(
         storage_layout_factory=lambda plan: _storage_layout(tmp_path),
         sleeper=sleeper or (lambda seconds: None),
         clock=lambda: 0.0,
+        logger=logger,
     )
     return strategy, transport
 
