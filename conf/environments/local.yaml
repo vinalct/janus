@@ -14,7 +14,8 @@ spark:
     runtime_package: ${JANUS_ICEBERG_RUNTIME_PACKAGE:-org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.1}
     default_namespace: ${JANUS_ICEBERG_DEFAULT_NAMESPACE:-bronze}
   config:
-    spark.driver.bindAddress: 127.0.0.1
+    spark.driver.bindAddress: ${JANUS_SPARK_DRIVER_BIND_ADDRESS:-127.0.0.1}
+    spark.driver.host: ${JANUS_SPARK_DRIVER_HOST:-127.0.0.1}
     spark.sql.session.timeZone: UTC
     spark.sql.shuffle.partitions: "4"
     spark.ui.enabled: "false"

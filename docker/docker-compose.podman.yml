@@ -1,0 +1,4 @@
+services:
+  janus:
+    userns_mode: keep-id
+    user: "${JANUS_UID:-1000}:${JANUS_GID:-1000}"
