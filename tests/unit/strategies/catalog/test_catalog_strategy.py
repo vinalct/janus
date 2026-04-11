@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -12,6 +13,7 @@ from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.planner import StrategyCatalog
 from janus.strategies.api import ApiResponse
 from janus.strategies.catalog import CatalogStrategy
+from janus.utils.logging import build_structured_logger
 from janus.utils.storage import StorageLayout
 
 
@@ -59,6 +61,60 @@ def test_default_strategy_catalog_uses_catalog_strategy_for_catalog_variants(tmp
 
     assert isinstance(binding.strategy, CatalogStrategy)
     assert binding.dispatch_path == "catalog.metadata_catalog"
+
+
+def test_catalog_strategy_logs_page_progress(tmp_path):
+    stream = StringIO()
+    logger = build_structured_logger("janus.tests.catalog.progress", stream=stream)
+    plan = _build_plan(tmp_path, source_id="logged_catalog_source", page_size=2)
+    strategy, _transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(
+                200,
+                {
+                    "result": {
+                        "results": [
+                            {"id": "dataset-1", "title": "Dataset 1"},
+                            {"id": "dataset-2", "title": "Dataset 2"},
+                        ]
+                    }
+                },
+            ),
+            ResponseSpec(
+                200,
+                {
+                    "result": {
+                        "results": [
+                            {"id": "dataset-3", "title": "Dataset 3"},
+                        ]
+                    }
+                },
+            ),
+        ],
+        logger=logger,
+    )
+
+    strategy.extract(plan)
+
+    payloads = [json.loads(line) for line in stream.getvalue().splitlines()]
+    events = [payload["event"] for payload in payloads]
+    finished_pages = [
+        payload for payload in payloads if payload["event"] == "catalog_request_finished"
+    ]
+
+    assert events[0] == "catalog_extraction_started"
+    assert events[-1] == "catalog_extraction_finished"
+    assert [page["fields"]["page_number"] for page in finished_pages] == [1, 2]
+    assert finished_pages[0]["fields"]["records_extracted"] == 2
+    assert finished_pages[0]["fields"]["entities_extracted"] == 2
+    assert finished_pages[0]["fields"]["has_next_page"] is True
+    assert finished_pages[0]["fields"]["next_page_number"] == 2
+    assert finished_pages[1]["fields"]["records_extracted"] == 1
+    assert finished_pages[1]["fields"]["entities_extracted"] == 1
+    assert finished_pages[1]["fields"]["has_next_page"] is False
+    assert payloads[-1]["fields"]["records_extracted"] == 3
+    assert payloads[-1]["fields"]["request_count"] == 2
 
 
 def test_catalog_strategy_page_number_extracts_raw_pages_and_normalized_entities(tmp_path):
@@ -348,13 +404,20 @@ def test_catalog_strategy_resource_catalog_uses_resource_root_results_for_handof
     assert all(record["entity_type"] == "resource" for record in resource_records)
 
 
-def _build_strategy(tmp_path: Path, responses: list[ResponseSpec | Exception], *, sleeper=None):
+def _build_strategy(
+    tmp_path: Path,
+    responses: list[ResponseSpec | Exception],
+    *,
+    sleeper=None,
+    logger=None,
+):
     transport = FakeTransport(responses)
     strategy = CatalogStrategy(
         transport_factory=lambda: transport,
         storage_layout_factory=lambda plan: _storage_layout(tmp_path),
         sleeper=sleeper or (lambda seconds: None),
         clock=lambda: 0.0,
+        logger=logger,
     )
     return strategy, transport
 

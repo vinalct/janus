@@ -1,0 +1,106 @@
+{
+  "help": "https://dados.gov.br/dados/api/3/action/help_show?name=package_search",
+  "success": true,
+  "result": {
+    "count": 3,
+    "results": [
+      {
+        "id": "dataset-orcamento-federal",
+        "name": "orcamento-federal",
+        "title": "Orcamento Federal",
+        "notes": "Metadados de demonstracao para o catalogo de dados abertos.",
+        "metadata_created": "2026-04-01T10:00:00",
+        "metadata_modified": "2026-04-09T10:30:00",
+        "owner_org": "org-planejamento",
+        "license_id": "cc-by",
+        "license_title": "Creative Commons Attribution",
+        "private": false,
+        "state": "active",
+        "organization": {
+          "id": "org-planejamento",
+          "name": "ministerio-do-planejamento",
+          "title": "Ministerio do Planejamento",
+          "description": "Organizacao federal publicadora do conjunto.",
+          "state": "active",
+          "package_count": 120
+        },
+        "groups": [
+          {
+            "id": "group-orcamento",
+            "name": "orcamento",
+            "title": "Orcamento",
+            "description": "Tema de catalogo ligado a orcamento publico.",
+            "state": "active"
+          }
+        ],
+        "resources": [
+          {
+            "id": "resource-orcamento-csv",
+            "name": "orcamento-2026-csv",
+            "description": "Arquivo tabular principal.",
+            "format": "CSV",
+            "url": "https://dados.gov.br/arquivos/orcamento-2026.csv",
+            "created": "2026-04-01T11:00:00",
+            "metadata_modified": "2026-04-09T10:40:00",
+            "package_id": "dataset-orcamento-federal",
+            "state": "active"
+          },
+          {
+            "id": "resource-orcamento-dicionario",
+            "name": "dicionario-orcamento",
+            "description": "Dicionario de dados.",
+            "format": "PDF",
+            "url": "https://dados.gov.br/arquivos/dicionario-orcamento.pdf",
+            "created": "2026-04-01T11:05:00",
+            "metadata_modified": "2026-04-09T10:45:00",
+            "package_id": "dataset-orcamento-federal",
+            "state": "active"
+          }
+        ]
+      },
+      {
+        "id": "dataset-compras-publicas",
+        "name": "compras-publicas",
+        "title": "Compras Publicas Federais",
+        "notes": "Catalogo de recursos publicados para compras publicas.",
+        "metadata_created": "2026-03-22T09:00:00",
+        "metadata_modified": "2026-04-08T18:15:00",
+        "owner_org": "org-gestao",
+        "license_id": "cc-by",
+        "license_title": "Creative Commons Attribution",
+        "private": false,
+        "state": "active",
+        "organization": {
+          "id": "org-gestao",
+          "name": "ministerio-da-gestao",
+          "title": "Ministerio da Gestao",
+          "description": "Organizacao federal responsavel pela publicacao.",
+          "state": "active",
+          "package_count": 87
+        },
+        "groups": [
+          {
+            "id": "group-compras",
+            "name": "compras-governamentais",
+            "title": "Compras Governamentais",
+            "description": "Tema de catalogo ligado a compras publicas.",
+            "state": "active"
+          }
+        ],
+        "resources": [
+          {
+            "id": "resource-compras-api",
+            "name": "compras-api",
+            "description": "Endpoint documentado para consulta.",
+            "format": "JSON",
+            "url": "https://dados.gov.br/api/compras",
+            "created": "2026-03-22T10:00:00",
+            "metadata_modified": "2026-04-08T18:45:00",
+            "package_id": "dataset-compras-publicas",
+            "state": "active"
+          }
+        ]
+      }
+    ]
+  }
+}

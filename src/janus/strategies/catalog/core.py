@@ -267,6 +267,16 @@ class CatalogStrategy(BaseStrategy):
             sleeper=self.sleeper,
         )
         logger = self._bind_logger(plan)
+        if logger is not None:
+            logger.info(
+                "catalog_extraction_started",
+                request_url=base_request.full_url(),
+                method=base_request.method,
+                pagination_type=plan.source_config.access.pagination.type,
+                page_size=plan.source_config.access.pagination.page_size,
+                checkpoint_loaded=checkpoint_state is not None,
+                timeout_seconds=base_request.timeout_seconds,
+            )
 
         raw_artifacts: list[ExtractedArtifact] = []
         normalized_records: dict[str, list[dict[str, Any]]] = {
@@ -287,6 +297,16 @@ class CatalogStrategy(BaseStrategy):
                         request,
                         checkpoint_state=checkpoint_state,
                         pagination_state=pagination_state,
+                    )
+
+                if logger is not None:
+                    logger.info(
+                        "catalog_request_started",
+                        request_index=pagination_state.request_index,
+                        page_number=pagination_state.page_number,
+                        offset=pagination_state.offset,
+                        cursor=pagination_state.cursor,
+                        request_url=request.full_url(),
                     )
 
                 response, attempts_used = self._send_with_retries(
@@ -323,6 +343,10 @@ class CatalogStrategy(BaseStrategy):
                     hook=catalog_hook,
                 )
                 page_record_total += primary_batch_size
+                entity_counts_before = {
+                    entity_type: len(records)
+                    for entity_type, records in normalized_records.items()
+                }
                 checkpoint_value = self._collect_catalog_entities(
                     plan,
                     payload=payload,
@@ -335,11 +359,50 @@ class CatalogStrategy(BaseStrategy):
                     entity_indexes=entity_indexes,
                     current_checkpoint_value=checkpoint_value,
                 )
-                pagination_state = paginator.next_state(
+                entity_counts_after = {
+                    entity_type: len(records)
+                    for entity_type, records in normalized_records.items()
+                }
+                page_entity_count = sum(
+                    entity_counts_after[entity_type] - entity_counts_before[entity_type]
+                    for entity_type in ENTITY_TYPE_ORDER
+                )
+                next_pagination_state = paginator.next_state(
                     pagination_state,
                     records_extracted=primary_batch_size,
                     payload=payload,
                 )
+                if logger is not None:
+                    logger.info(
+                        "catalog_request_finished",
+                        request_index=pagination_state.request_index,
+                        page_number=pagination_state.page_number,
+                        offset=pagination_state.offset,
+                        cursor=pagination_state.cursor,
+                        status_code=response.status_code,
+                        attempts_used=attempts_used,
+                        records_extracted=primary_batch_size,
+                        entities_extracted=page_entity_count,
+                        total_records=page_record_total,
+                        total_entities=sum(entity_counts_after.values()),
+                        organizations_extracted=entity_counts_after["organization"],
+                        groups_extracted=entity_counts_after["group"],
+                        datasets_extracted=entity_counts_after["dataset"],
+                        resources_extracted=entity_counts_after["resource"],
+                        artifact_path=persisted.artifact.path,
+                        has_next_page=next_pagination_state is not None,
+                        next_page_number=(
+                            next_pagination_state.page_number
+                            if next_pagination_state is not None
+                            else None
+                        ),
+                        next_offset=(
+                            next_pagination_state.offset
+                            if next_pagination_state is not None
+                            else None
+                        ),
+                    )
+                pagination_state = next_pagination_state
 
         normalized_artifacts = self._persist_normalized_records(
             plan,
@@ -347,6 +410,23 @@ class CatalogStrategy(BaseStrategy):
             normalized_records,
         )
         records_extracted = sum(len(records) for records in normalized_records.values())
+        if logger is not None:
+            logger.info(
+                "catalog_extraction_finished",
+                request_count=successful_requests,
+                retry_count=max(total_attempts - successful_requests, 0),
+                attempt_count=total_attempts,
+                records_extracted=records_extracted,
+                page_record_count=page_record_total,
+                raw_artifact_count=len(raw_artifacts),
+                normalized_artifact_count=len(normalized_artifacts),
+                artifact_count=len(raw_artifacts) + len(normalized_artifacts),
+                checkpoint_value=checkpoint_value,
+                organizations_extracted=len(normalized_records["organization"]),
+                groups_extracted=len(normalized_records["group"]),
+                datasets_extracted=len(normalized_records["dataset"]),
+                resources_extracted=len(normalized_records["resource"]),
+            )
 
         extraction_result = ExtractionResult.from_plan(
             plan,
