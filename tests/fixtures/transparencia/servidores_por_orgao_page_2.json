@@ -1,0 +1,17 @@
+[
+  {
+    "qntPessoas": 12,
+    "qntVinculos": 14,
+    "skSituacao": 2,
+    "descSituacao": "Inativo",
+    "skTipoVinculo": 3,
+    "descTipoVinculo": "Outros",
+    "skTipoServidor": 1,
+    "descTipoServidor": "Civil",
+    "licenca": 1,
+    "codOrgaoExercicioSiape": "24000",
+    "nomOrgaoExercicioSiape": "Ministerio da Ciencia e Tecnologia",
+    "codOrgaoSuperiorExercicioSiape": "24000",
+    "nomOrgaoSuperiorExercicioSiape": "Ministerio da Ciencia e Tecnologia"
+  }
+]

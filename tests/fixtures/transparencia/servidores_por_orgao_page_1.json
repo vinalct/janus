@@ -1,0 +1,32 @@
+[
+  {
+    "qntPessoas": 120,
+    "qntVinculos": 138,
+    "skSituacao": 1,
+    "descSituacao": "Ativo",
+    "skTipoVinculo": 2,
+    "descTipoVinculo": "Cargo",
+    "skTipoServidor": 1,
+    "descTipoServidor": "Civil",
+    "licenca": 0,
+    "codOrgaoExercicioSiape": "26246",
+    "nomOrgaoExercicioSiape": "Universidade Federal de Pernambuco",
+    "codOrgaoSuperiorExercicioSiape": "26000",
+    "nomOrgaoSuperiorExercicioSiape": "Ministerio da Educacao"
+  },
+  {
+    "qntPessoas": 47,
+    "qntVinculos": 51,
+    "skSituacao": 1,
+    "descSituacao": "Ativo",
+    "skTipoVinculo": 1,
+    "descTipoVinculo": "Funcao",
+    "skTipoServidor": 1,
+    "descTipoServidor": "Civil",
+    "licenca": 0,
+    "codOrgaoExercicioSiape": "25000",
+    "nomOrgaoExercicioSiape": "Ministerio da Fazenda",
+    "codOrgaoSuperiorExercicioSiape": "22000",
+    "nomOrgaoSuperiorExercicioSiape": "Ministerio da Economia"
+  }
+]
