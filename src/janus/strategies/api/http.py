@@ -3,13 +3,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import OpenerDirector, Request, build_opener
+from urllib.request import HTTPSHandler, OpenerDirector, Request, build_opener
 
 from janus.models import AuthConfig
 
@@ -109,10 +111,13 @@ class UrllibApiTransport:
     """Stdlib-backed HTTP transport with an explicit open/close lifecycle."""
 
     opener: OpenerDirector | None = None
+    ca_bundle_path: str | None = None
 
     def open(self) -> None:
         if self.opener is None:
-            self.opener = build_opener()
+            self.opener = build_opener(
+                HTTPSHandler(context=_build_ssl_context(self.ca_bundle_path))
+            )
 
     def close(self) -> None:
         self.opener = None
@@ -170,6 +175,62 @@ class ApiClient:
         return self.transport.send(request)
 
 
+def _build_ssl_context(ca_bundle_path: str | None = None) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    for candidate in _ca_bundle_candidates(ca_bundle_path):
+        if _is_optional_ca_bundle(candidate) and not Path(candidate).is_file():
+            continue
+        context.load_verify_locations(cafile=candidate)
+    return context
+
+
+def _resolve_ca_bundle(ca_bundle_path: str | None = None) -> str | None:
+    candidates = _ca_bundle_candidates(ca_bundle_path)
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _ca_bundle_candidates(ca_bundle_path: str | None = None) -> tuple[str, ...]:
+    candidates: list[str] = []
+    _append_ca_candidate(candidates, ca_bundle_path)
+
+    for env_var in ("JANUS_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        _append_ca_candidate(candidates, os.getenv(env_var))
+
+    try:
+        import certifi
+    except ImportError:
+        pass
+    else:
+        _append_ca_candidate(candidates, certifi.where())
+
+    _append_ca_candidate(candidates, os.getenv("JANUS_SYSTEM_CA_BUNDLE"))
+    _append_ca_candidate(candidates, "/etc/ssl/certs/ca-certificates.crt")
+    return tuple(candidates)
+
+
+def _append_ca_candidate(candidates: list[str], value: str | None) -> None:
+    if value is None or not value.strip():
+        return
+    candidate = value.strip()
+    if candidate not in candidates:
+        candidates.append(candidate)
+
+
+def _is_optional_ca_bundle(path: str) -> bool:
+    configured_paths = {
+        value.strip()
+        for value in (
+            os.getenv("JANUS_CA_BUNDLE"),
+            os.getenv("SSL_CERT_FILE"),
+            os.getenv("REQUESTS_CA_BUNDLE"),
+        )
+        if value is not None and value.strip()
+    }
+    return path not in configured_paths
+
+
 def inject_auth(
     request: ApiRequest,
     auth: AuthConfig,
@@ -184,7 +245,7 @@ def inject_auth(
     if auth.type == "basic":
         username = _require_secret(auth.username_env_var, env_reader)
         password = _require_secret(auth.password_env_var, env_reader)
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
         return request.with_header("Authorization", f"Basic {token}")
 
     token = _require_secret(auth.env_var, env_reader)

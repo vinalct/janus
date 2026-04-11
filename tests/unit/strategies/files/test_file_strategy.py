@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
@@ -14,6 +16,7 @@ from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.planner import StrategyCatalog
 from janus.strategies.api import ApiResponse
 from janus.strategies.files import FileIntegrityError, FileStrategy
+from janus.utils.logging import build_structured_logger
 from janus.utils.storage import StorageLayout
 
 
@@ -68,6 +71,62 @@ def test_default_strategy_catalog_uses_file_strategy_for_file_variants(tmp_path)
 
     assert isinstance(binding.strategy, FileStrategy)
     assert binding.dispatch_path == "file.static_file"
+
+
+def test_file_strategy_logs_archive_progress(tmp_path):
+    stream = StringIO()
+    logger = build_structured_logger("janus.tests.file.progress", stream=stream)
+    archive_path = tmp_path / "fixtures" / "package_2026-04.zip"
+    archive_path.parent.mkdir(parents=True)
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr("nested/records.csv", "id,name\n1,alpha\n")
+        archive.writestr("notes/readme.txt", "ignore me\n")
+    plan = _build_plan(
+        tmp_path,
+        source_id="logged_archive_source",
+        variant="archive_package",
+        access_path=archive_path,
+        access_format="binary",
+        file_pattern="*.csv",
+    )
+    strategy, _transport = _build_strategy(tmp_path, logger=logger)
+
+    strategy.extract(plan)
+
+    payloads = [json.loads(line) for line in stream.getvalue().splitlines()]
+    events = [payload["event"] for payload in payloads]
+    persisted = _event_payload(payloads, "file_payload_persisted")
+    archive_extracted = _event_payload(payloads, "file_archive_extracted")
+    finished = payloads[-1]
+
+    assert events == [
+        "file_extraction_started",
+        "file_discovery_finished",
+        "file_candidate_started",
+        "file_payload_loaded",
+        "file_payload_persisted",
+        "file_archive_extracted",
+        "file_extraction_finished",
+    ]
+    assert payloads[1]["fields"]["discovered_file_count"] == 1
+    assert payloads[1]["fields"]["selected_file_count"] == 1
+    assert payloads[2]["fields"]["source_kind"] == "local"
+    assert payloads[2]["fields"]["filename"] == "package_2026-04.zip"
+    assert payloads[3]["fields"]["attempts_used"] == 1
+    assert persisted["fields"]["resolved_version"] == "2026-04"
+    assert persisted["fields"]["artifact_format"] == "binary"
+    assert persisted["fields"]["checksum_verified"] is False
+    assert persisted["fields"]["is_archive"] is True
+    assert archive_extracted["fields"]["archive_member_count"] == 1
+    assert archive_extracted["fields"]["first_member_artifact_path"].endswith(
+        "nested/records.csv"
+    )
+    assert finished["event"] == "file_extraction_finished"
+    assert finished["fields"]["persisted_file_count"] == 1
+    assert finished["fields"]["archive_member_count"] == 1
+    assert finished["fields"]["normalization_candidate_count"] == 1
+    assert finished["fields"]["artifact_count"] == 2
+    assert finished["fields"]["checkpoint_value"] == "2026-04"
 
 
 def test_file_strategy_static_local_file_persists_raw_and_builds_csv_handoff(tmp_path):
@@ -258,11 +317,19 @@ def test_file_strategy_rejects_local_checksum_mismatch(tmp_path):
         strategy.extract(plan)
 
 
+def _event_payload(payloads: list[dict], event: str) -> dict:
+    for payload in payloads:
+        if payload["event"] == event:
+            return payload
+    raise AssertionError(f"event {event!r} was not emitted")
+
+
 def _build_strategy(
     tmp_path: Path,
     responses: list[ResponseSpec | Exception] | None = None,
     *,
     sleeper=None,
+    logger=None,
 ):
     transport = FakeTransport(responses or [])
     strategy = FileStrategy(
@@ -270,6 +337,7 @@ def _build_strategy(
         storage_layout_factory=lambda plan: _storage_layout(tmp_path),
         sleeper=sleeper or (lambda seconds: None),
         clock=lambda: 0.0,
+        logger=logger,
     )
     return strategy, transport
 

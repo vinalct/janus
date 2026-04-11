@@ -8,6 +8,7 @@ services:
     environment:
       PYTHONPATH: /workspace/src
       JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+      JANUS_CA_BUNDLE: /workspace/conf/certs/rnpicpedugr46ovtlsca2025.pem
     user: "${JANUS_CONTAINER_USER:-1000:1000}"
     stdin_open: true
     tty: true

@@ -1,0 +1,71 @@
+source_id: inep_censo_escolar_microdados
+name: INEP - Microdados do Censo Escolar da Educacao Basica
+description: Bulk ZIP ingestion for the public INEP Censo Escolar microdata package.
+owner: janus
+enabled: false
+source_type: file
+strategy: file
+strategy_variant: archive_package
+federation_level: federal
+domain: educacao
+public_access: true
+tags:
+  - inep
+  - censo-escolar
+  - microdados
+  - bulk-file
+  - federal
+
+access:
+  url: https://download.inep.gov.br/dados_abertos/microdados_censo_escolar_2024.zip
+  method: GET
+  format: binary
+  timeout_seconds: 300
+  headers:
+    Accept: application/zip, application/octet-stream
+  file_pattern: "*/dados/microdados_ed_basica_2024.csv"
+  auth:
+    type: none
+  pagination:
+    type: none
+  rate_limit:
+    requests_per_minute: 12
+    concurrency: 1
+    backoff_seconds: 30
+
+extraction:
+  mode: snapshot
+  checkpoint_strategy: none
+  retry:
+    max_attempts: 4
+    backoff_strategy: exponential
+    backoff_seconds: 5
+
+schema:
+  mode: explicit
+  path: conf/schemas/inep/censo_escolar_microdados_schema.json
+
+spark:
+  input_format: csv
+  write_mode: overwrite
+  repartition: 1
+  partition_by:
+    - ingestion_date
+
+outputs:
+  raw:
+    path: data/raw/inep/censo_escolar_microdados
+    format: binary
+  bronze:
+    path: data/bronze/inep/censo_escolar_microdados
+    format: parquet
+  metadata:
+    path: data/metadata/inep/censo_escolar_microdados
+    format: json
+
+quality:
+  required_fields:
+    - NU_ANO_CENSO
+    - CO_ENTIDADE
+    - TP_DEPENDENCIA
+  allow_schema_evolution: true

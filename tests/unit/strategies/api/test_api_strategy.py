@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import janus.strategies.api.http as http_module
 from janus.checkpoints import CheckpointStore
 from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.planner import StrategyCatalog
@@ -75,6 +76,20 @@ class WindowHook(ApiHook):
         del request
         del response
         return payload["payload"]["rows"]
+
+
+def test_urllib_transport_prefers_explicit_or_environment_ca_bundle(tmp_path, monkeypatch):
+    explicit_bundle = tmp_path / "explicit-ca.pem"
+    env_bundle = tmp_path / "env-ca.pem"
+    explicit_bundle.write_text("explicit", encoding="utf-8")
+    env_bundle.write_text("env", encoding="utf-8")
+
+    monkeypatch.setenv("JANUS_CA_BUNDLE", str(env_bundle))
+    monkeypatch.setenv("SSL_CERT_FILE", "/tmp/ignored-ssl-cert-file.pem")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/tmp/ignored-requests-ca-bundle.pem")
+
+    assert http_module._resolve_ca_bundle(str(explicit_bundle)) == str(explicit_bundle)
+    assert http_module._resolve_ca_bundle() == str(env_bundle)
 
 
 def test_default_strategy_catalog_uses_api_strategy_for_api_variants(tmp_path):

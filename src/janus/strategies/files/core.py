@@ -221,19 +221,70 @@ class FileStrategy(BaseStrategy):
             sleeper=self.sleeper,
         )
 
+        if logger is not None:
+            logger.info(
+                "file_extraction_started",
+                strategy_variant=plan.source.strategy_variant,
+                extraction_mode=plan.extraction_mode,
+                checkpoint_strategy=plan.checkpoint_strategy,
+                checkpoint_loaded=checkpoint_state is not None,
+                checkpoint_value=(
+                    checkpoint_state.checkpoint_value if checkpoint_state is not None else None
+                ),
+                access_format=plan.source_config.access.format,
+                input_format=plan.source_config.spark.input_format,
+                file_pattern=plan.source_config.access.file_pattern,
+                timeout_seconds=plan.source_config.access.timeout_seconds,
+                requests_per_minute=(
+                    plan.source_config.access.rate_limit.requests_per_minute
+                ),
+                concurrency=plan.source_config.access.rate_limit.concurrency,
+            )
+
         discovered_files = self._discover_files(plan, file_hook)
         selected_files = self._select_files(plan, discovered_files, checkpoint_state)
+        if logger is not None:
+            logger.info(
+                "file_discovery_finished",
+                discovered_file_count=len(discovered_files),
+                selected_file_count=len(selected_files),
+                checkpoint_loaded=checkpoint_state is not None,
+                discovered_source_kinds=sorted(
+                    {file.source_kind for file in discovered_files}
+                ),
+                selected_versions=[file.version for file in selected_files],
+            )
 
         artifacts: list[ExtractedArtifact] = []
         persisted_file_count = 0
         archive_member_count = 0
         checksum_verified_count = 0
         skipped_file_count = 0
+        total_attempts = 0
+        loaded_file_count = 0
         checkpoint_value: str | None = None
         resolved_versions: list[str] = []
 
         with ApiClient(self.transport_factory()) as client:
-            for discovered_file in selected_files:
+            for file_index, discovered_file in enumerate(selected_files, start=1):
+                if logger is not None:
+                    logger.info(
+                        "file_candidate_started",
+                        file_index=file_index,
+                        selected_file_count=len(selected_files),
+                        source_kind=discovered_file.source_kind,
+                        source_location=_redacted_location(discovered_file),
+                        filename=discovered_file.filename,
+                        candidate_format=discovered_file.format,
+                        candidate_version=discovered_file.version,
+                        size_bytes=discovered_file.size_bytes,
+                        modified_at=(
+                            discovered_file.modified_at.isoformat()
+                            if discovered_file.modified_at is not None
+                            else None
+                        ),
+                    )
+
                 payload, response, attempts_used = self._load_payload(
                     plan,
                     discovered_file,
@@ -241,6 +292,19 @@ class FileStrategy(BaseStrategy):
                     throttle=throttle,
                     logger=logger,
                 )
+                total_attempts += attempts_used
+                loaded_file_count += 1
+                if logger is not None:
+                    logger.info(
+                        "file_payload_loaded",
+                        file_index=file_index,
+                        source_kind=discovered_file.source_kind,
+                        filename=discovered_file.filename,
+                        status_code=response.status_code if response is not None else None,
+                        attempts_used=attempts_used,
+                        payload_size_bytes=len(payload),
+                    )
+
                 if file_hook is not None:
                     payload = file_hook.prepare_download(
                         plan,
@@ -262,6 +326,19 @@ class FileStrategy(BaseStrategy):
 
                 if _should_skip_for_checkpoint(plan, checkpoint_state, version):
                     skipped_file_count += 1
+                    if logger is not None:
+                        logger.info(
+                            "file_candidate_skipped",
+                            file_index=file_index,
+                            filename=resolved_filename,
+                            resolved_version=version,
+                            checkpoint_value=(
+                                checkpoint_state.checkpoint_value
+                                if checkpoint_state is not None
+                                else None
+                            ),
+                            reason="checkpoint_not_newer",
+                        )
                     continue
 
                 expected_checksum = self._expected_checksum(
@@ -271,6 +348,7 @@ class FileStrategy(BaseStrategy):
                     file_hook=file_hook,
                 )
                 actual_checksum = sha256(payload).hexdigest()
+                checksum_verified = expected_checksum is not None
                 if expected_checksum is not None:
                     if actual_checksum.lower() != expected_checksum.lower():
                         raise FileIntegrityError(
@@ -279,6 +357,15 @@ class FileStrategy(BaseStrategy):
                         )
                     checksum_verified_count += 1
 
+                is_archive = _is_archive_file(plan, resolved_file, payload)
+                artifact_format = (
+                    "binary"
+                    if is_archive
+                    else _infer_handoff_format(
+                        resolved_file,
+                        fallback=plan.source_config.spark.input_format,
+                    )
+                )
                 persisted_original = raw_writer.write_bytes(
                     plan,
                     _raw_download_relative_path(version, resolved_filename),
@@ -293,22 +380,28 @@ class FileStrategy(BaseStrategy):
                 artifacts.append(
                     ExtractedArtifact(
                         path=persisted_original.artifact.path,
-                        format=(
-                            "binary"
-                            if _is_archive_file(plan, resolved_file, payload)
-                            else _infer_handoff_format(
-                                resolved_file,
-                                fallback=plan.source_config.spark.input_format,
-                            )
-                        ),
+                        format=artifact_format,
                         checksum=persisted_original.artifact.checksum,
                     )
                 )
                 persisted_file_count += 1
                 resolved_versions.append(version)
                 checkpoint_value = _max_checkpoint_value(checkpoint_value, version)
+                if logger is not None:
+                    logger.info(
+                        "file_payload_persisted",
+                        file_index=file_index,
+                        filename=resolved_filename,
+                        source_kind=resolved_file.source_kind,
+                        resolved_version=version,
+                        artifact_path=persisted_original.artifact.path,
+                        artifact_format=artifact_format,
+                        checksum_verified=checksum_verified,
+                        is_archive=is_archive,
+                        payload_size_bytes=len(payload),
+                    )
 
-                if _is_archive_file(plan, resolved_file, payload):
+                if is_archive:
                     extracted_artifacts = self._extract_archive(
                         plan,
                         raw_writer,
@@ -319,6 +412,17 @@ class FileStrategy(BaseStrategy):
                     )
                     artifacts.extend(extracted_artifacts)
                     archive_member_count += len(extracted_artifacts)
+                    if logger is not None:
+                        logger.info(
+                            "file_archive_extracted",
+                            file_index=file_index,
+                            archive_filename=resolved_file.filename,
+                            resolved_version=version,
+                            archive_member_count=len(extracted_artifacts),
+                            first_member_artifact_path=(
+                                extracted_artifacts[0].path if extracted_artifacts else None
+                            ),
+                        )
 
         normalization_candidate_count = sum(
             1 for artifact in artifacts if artifact.format == plan.source_config.spark.input_format
@@ -335,6 +439,23 @@ class FileStrategy(BaseStrategy):
         }
         if resolved_versions:
             extraction_metadata["resolved_versions"] = ",".join(resolved_versions)
+
+        if logger is not None:
+            logger.info(
+                "file_extraction_finished",
+                discovered_file_count=len(discovered_files),
+                selected_file_count=len(selected_files),
+                load_count=loaded_file_count,
+                attempt_count=total_attempts,
+                retry_count=max(total_attempts - loaded_file_count, 0),
+                persisted_file_count=persisted_file_count,
+                archive_member_count=archive_member_count,
+                checksum_verified_count=checksum_verified_count,
+                skipped_file_count=skipped_file_count,
+                normalization_candidate_count=normalization_candidate_count,
+                artifact_count=len(artifacts),
+                checkpoint_value=checkpoint_value,
+            )
 
         extraction_result = ExtractionResult.from_plan(
             plan,

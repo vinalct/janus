@@ -1,0 +1,71 @@
+{
+  "type": "struct",
+  "fields": [
+    {
+      "name": "NU_ANO_CENSO",
+      "type": "integer",
+      "nullable": false,
+      "metadata": {}
+    },
+    {
+      "name": "CO_ENTIDADE",
+      "type": "string",
+      "nullable": false,
+      "metadata": {}
+    },
+    {
+      "name": "NO_ENTIDADE",
+      "type": "string",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "CO_UF",
+      "type": "integer",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "SG_UF",
+      "type": "string",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "CO_MUNICIPIO",
+      "type": "string",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "NO_MUNICIPIO",
+      "type": "string",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "TP_DEPENDENCIA",
+      "type": "integer",
+      "nullable": false,
+      "metadata": {}
+    },
+    {
+      "name": "TP_LOCALIZACAO",
+      "type": "integer",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "TP_SITUACAO_FUNCIONAMENTO",
+      "type": "integer",
+      "nullable": true,
+      "metadata": {}
+    },
+    {
+      "name": "QT_MAT_BAS",
+      "type": "integer",
+      "nullable": true,
+      "metadata": {}
+    }
+  ]
+}
