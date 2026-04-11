@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
-from janus.utils.runtime import (
+from janus.utils.environment import (
     build_spark_options,
     build_spark_session,
     load_environment_config,

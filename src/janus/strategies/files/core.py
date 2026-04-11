@@ -35,8 +35,8 @@ from janus.strategies.api import (
     inject_auth,
 )
 from janus.strategies.base import BaseStrategy, SourceHook
+from janus.utils.environment import load_environment_config, prepare_runtime, resolve_project_path
 from janus.utils.logging import StructuredLogger, redact_url
-from janus.utils.runtime import load_environment_config, resolve_project_path
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
 
@@ -754,6 +754,7 @@ def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:
         plan.run_context.environment,
         plan.run_context.project_root,
     )
+    prepare_runtime(environment_config, plan.run_context.project_root)
     return StorageLayout.from_environment_config(
         environment_config,
         plan.run_context.project_root,

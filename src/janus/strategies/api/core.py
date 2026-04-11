@@ -14,8 +14,8 @@ from urllib.parse import urljoin
 from janus.checkpoints import CheckpointState, CheckpointStore
 from janus.models import ExecutionPlan, ExtractionResult, SourceConfig, WriteResult
 from janus.strategies.base import BaseStrategy, SourceHook
+from janus.utils.environment import load_environment_config, prepare_runtime
 from janus.utils.logging import StructuredLogger, redact_url
-from janus.utils.runtime import load_environment_config
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
 
@@ -395,7 +395,10 @@ class ApiStrategy(BaseStrategy):
             if 200 <= response.status_code < 300:
                 return response, attempt
 
-            if response.status_code not in RETRYABLE_STATUS_CODES or attempt == retry_config.max_attempts:
+            if (
+                response.status_code not in RETRYABLE_STATUS_CODES
+                or attempt == retry_config.max_attempts
+            ):
                 raise ApiResponseError(response)
 
             self._sleep_for_retry(plan, attempt, response=response, logger=logger)
@@ -438,7 +441,8 @@ class ApiStrategy(BaseStrategy):
                 return [json.loads(line) for line in text.splitlines() if line.strip()]
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ApiPayloadError(
-                f"Failed to decode {format_name} payload from {redact_url(response.request.full_url())}"
+                "Failed to decode "
+                f"{format_name} payload from {redact_url(response.request.full_url())}"
             ) from exc
 
         raise ApiPayloadError(f"Unsupported API payload format: {format_name}")
@@ -540,6 +544,7 @@ def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:
         plan.run_context.environment,
         plan.run_context.project_root,
     )
+    prepare_runtime(environment_config, plan.run_context.project_root)
     return StorageLayout.from_environment_config(
         environment_config,
         plan.run_context.project_root,

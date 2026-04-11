@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,20 @@ ICEBERG_SESSION_EXTENSIONS = (
     "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
 )
 ICEBERG_CATALOG_IMPL = "org.apache.iceberg.spark.SparkCatalog"
+RUNTIME_SCRATCH_DIR_ENV = "JANUS_RUNTIME_SCRATCH_DIR"
+DEFAULT_RUNTIME_SCRATCH_DIR = "/tmp/janus/runtime"
+FALLBACK_RUNTIME_PATH_KEYS = frozenset(
+    {"warehouse_dir", "ivy_dir", "iceberg_warehouse_dir"}
+)
+_RUNTIME_PATH_CONFIG_LOCATIONS = {
+    "root_dir": ("storage", "root_dir"),
+    "raw_dir": ("storage", "raw_dir"),
+    "bronze_dir": ("storage", "bronze_dir"),
+    "metadata_dir": ("storage", "metadata_dir"),
+    "warehouse_dir": ("spark", "warehouse_dir"),
+    "ivy_dir": ("spark", "ivy_dir"),
+    "iceberg_warehouse_dir": ("spark", "iceberg", "warehouse_dir"),
+}
 
 
 def expand_env_vars(value: Any) -> Any:
@@ -72,8 +87,16 @@ def materialize_runtime_paths(config: dict[str, Any], project_root: Path) -> dic
 
 def prepare_runtime(config: dict[str, Any], project_root: Path) -> dict[str, Path]:
     paths = materialize_runtime_paths(config, project_root)
-    for path in paths.values():
-        path.mkdir(parents=True, exist_ok=True)
+    for key, path in tuple(paths.items()):
+        try:
+            _ensure_writable_directory(path)
+        except PermissionError:
+            if key not in FALLBACK_RUNTIME_PATH_KEYS:
+                raise
+            fallback = _fallback_runtime_path(project_root, key)
+            _ensure_writable_directory(fallback)
+            paths[key] = fallback
+            _set_config_path(config, key, fallback)
     return paths
 
 
@@ -145,3 +168,39 @@ def build_spark_session(config: dict[str, Any], resolved_paths: dict[str, Path])
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel(config.get("runtime", {}).get("log_level", "WARN"))
     return spark
+
+
+def _ensure_writable_directory(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=path):
+            pass
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise PermissionError(exc.errno, exc.strerror, str(path)) from exc
+
+
+def _fallback_runtime_path(project_root: Path, key: str) -> Path:
+    scratch_root = Path(os.getenv(RUNTIME_SCRATCH_DIR_ENV, DEFAULT_RUNTIME_SCRATCH_DIR))
+    project_segment = _safe_path_segment(project_root.resolve().name or "project")
+    return scratch_root / project_segment / key
+
+
+def _safe_path_segment(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-._")
+    return normalized or "project"
+
+
+def _set_config_path(config: dict[str, Any], key: str, path: Path) -> None:
+    location = _RUNTIME_PATH_CONFIG_LOCATIONS.get(key)
+    if location is None:
+        return
+
+    current: Any = config
+    for segment in location[:-1]:
+        if not isinstance(current, dict):
+            return
+        current = current.setdefault(segment, {})
+    if isinstance(current, dict):
+        current[location[-1]] = str(path)

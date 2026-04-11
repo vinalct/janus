@@ -17,7 +17,7 @@ from janus.quality import (
     load_expected_fields_from_schema_path,
 )
 from janus.registry import load_registry
-from janus.utils.runtime import resolve_project_path
+from janus.utils.environment import resolve_project_path
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession

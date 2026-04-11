@@ -28,7 +28,7 @@ JANUS keeps runtime settings in checked-in environment profiles:
 - `conf/environments/local.yaml`
 - `conf/environments/cluster.yaml`
 
-Each file supports `${ENV_VAR:-default}` interpolation through `janus.utils.runtime.expand_env_vars`, which means the repository can define sane defaults while still allowing environment-specific overrides outside source code.
+Each file supports `${ENV_VAR:-default}` interpolation through `janus.utils.environment.expand_env_vars`, which means the repository can define sane defaults while still allowing environment-specific overrides outside source code.
 
 The companion example env files are:
 
@@ -48,7 +48,7 @@ At runtime, JANUS materializes explicit roots for:
 - Iceberg warehouse
 - the local Ivy cache when configured
 
-`janus.utils.runtime.prepare_runtime(...)` creates those paths before the CLI continues, and `janus.utils.storage.StorageLayout` resolves configured source outputs against the active environment.
+`janus.utils.environment.prepare_runtime(...)` creates those paths before the CLI continues, and `janus.utils.storage.StorageLayout` resolves configured source outputs against the active environment.
 
 That means:
 

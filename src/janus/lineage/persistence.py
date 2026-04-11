@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from janus.models import ExecutionPlan
-from janus.utils.runtime import resolve_project_path
+from janus.utils.environment import resolve_project_path
 
 
 @dataclass(frozen=True, slots=True)

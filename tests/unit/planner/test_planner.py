@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -277,6 +278,27 @@ def test_planner_reports_missing_hook_binding(tmp_path):
         )
 
 
+def test_planner_can_include_disabled_source_when_requested(tmp_path):
+    project_root = _create_project(
+        tmp_path,
+        _source_yaml("disabled_cli_source", variant="page_number_api", enabled=False),
+        include_environment=True,
+    )
+
+    planned_run = Planner().plan(
+        PlanningRequest.create(
+            source_id="disabled_cli_source",
+            environment="local",
+            project_root=project_root,
+            run_id="run-disabled-001",
+            started_at=datetime(2026, 4, 8, 14, 30, tzinfo=UTC),
+            include_disabled=True,
+        )
+    )
+
+    assert planned_run.plan.source.source_id == "disabled_cli_source"
+
+
 def test_main_prints_planned_run_summary_for_one_source(tmp_path, capsys):
     project_root = _create_project(
         tmp_path,
@@ -309,6 +331,67 @@ def test_main_prints_planned_run_summary_for_one_source(tmp_path, capsys):
     assert payload["planned_run"]["strategy"]["dispatch_path"] == "api.page_number_api"
     assert payload["planned_run"]["source"]["source_id"] == "cli_source"
     assert payload["paths"]["raw_dir"] == str(project_root / "data" / "raw")
+
+
+def test_main_executes_source_through_framework_runtime(tmp_path, capsys, monkeypatch):
+    project_root = _create_project(
+        tmp_path,
+        _source_yaml("cli_source", variant="page_number_api"),
+        include_environment=True,
+    )
+    stopped = []
+
+    class FakeSparkSession:
+        sparkContext = SimpleNamespace(appName="janus-exec-test", master="local[1]")
+
+        def stop(self):
+            stopped.append(True)
+
+    class FakeExecutedRun:
+        is_successful = True
+
+        def to_summary(self):
+            return {
+                "status": "succeeded",
+                "artifact_count": 1,
+                "validation": {"is_successful": True},
+            }
+
+    class FakeSourceExecutor:
+        def execute(self, planned_run, spark, environment_config):
+            assert planned_run.plan.source.source_id == "cli_source"
+            assert spark.sparkContext.appName == "janus-exec-test"
+            assert environment_config["name"] == "local"
+            return FakeExecutedRun()
+
+    monkeypatch.setattr("janus.main.build_spark_session", lambda config, paths: FakeSparkSession())
+    monkeypatch.setattr("janus.main.SourceExecutor", FakeSourceExecutor)
+
+    exit_code = main(
+        [
+            "--environment",
+            "local",
+            "--project-root",
+            str(project_root),
+            "--source-id",
+            "cli_source",
+            "--run-id",
+            "run-cli-exec-001",
+            "--started-at",
+            "2026-04-08T16:00:00+00:00",
+            "--execute",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert payload["planned_run"]["run"]["run_id"] == "run-cli-exec-001"
+    assert payload["executed_run"]["status"] == "succeeded"
+    assert payload["spark_session"]["app_name"] == "janus-exec-test"
+    assert stopped == [True]
 
 
 def _create_project(
@@ -359,13 +442,15 @@ def _source_yaml(
     *,
     variant: str,
     source_hook: str | None = None,
+    enabled: bool = True,
 ) -> str:
     source_hook_line = f"source_hook: {source_hook}\n" if source_hook else ""
+    enabled_line = "true" if enabled else "false"
     return f"""
 source_id: {source_id}
 name: {source_id}
 owner: janus
-enabled: true
+enabled: {enabled_line}
 source_type: api
 strategy: api
 strategy_variant: {variant}

@@ -37,6 +37,7 @@ class PlanningRequest:
     run_id: str | None = None
     started_at: datetime | None = None
     attributes: tuple[tuple[str, str], ...] = ()
+    include_disabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.source_id.strip():
@@ -60,6 +61,7 @@ class PlanningRequest:
         run_id: str | None = None,
         started_at: datetime | None = None,
         attributes: Mapping[str, str] | None = None,
+        include_disabled: bool = False,
     ) -> Self:
         return cls(
             source_id=source_id,
@@ -68,6 +70,7 @@ class PlanningRequest:
             run_id=run_id,
             started_at=started_at,
             attributes=_freeze_string_mapping(attributes),
+            include_disabled=include_disabled,
         )
 
     def attributes_as_dict(self) -> dict[str, str]:
@@ -269,7 +272,10 @@ class Planner:
 
     def plan(self, request: PlanningRequest) -> PlannedRun:
         registry = load_registry(request.project_root)
-        source_config = registry.get_source(request.source_id)
+        source_config = registry.get_source(
+            request.source_id,
+            include_disabled=request.include_disabled,
+        )
         strategy_binding = self.strategy_catalog.resolve(source_config)
         hook = self.hook_catalog.resolve(
             source_config.source_hook,

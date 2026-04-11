@@ -10,7 +10,7 @@ from janus.models import ExecutionPlan, QualityConfig, WriteResult
 from janus.normalizers import NORMALIZATION_METADATA_COLUMNS
 from janus.quality.models import QualityValidationError, ValidationCheck, ValidationReport
 from janus.quality.store import PersistedValidationReport, ValidationReportStore
-from janus.utils.runtime import resolve_project_path
+from janus.utils.environment import resolve_project_path
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame

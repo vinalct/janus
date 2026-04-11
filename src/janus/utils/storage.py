@@ -7,7 +7,7 @@ from typing import Any, Self
 
 from janus.models import ExecutionPlan
 from janus.models.source_config import OutputTarget
-from janus.utils.runtime import resolve_project_path
+from janus.utils.environment import resolve_project_path
 
 SUPPORTED_STORAGE_ZONES = frozenset({"bronze", "metadata", "raw"})
 _CANONICAL_ZONE_PREFIXES = {

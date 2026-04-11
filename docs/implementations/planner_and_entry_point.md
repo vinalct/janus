@@ -1,27 +1,30 @@
-# Planner and Entry Point
+# Planner, Executor, and Entry Point
 
-The short version is: JANUS now has a real planning layer.
+The short version is: JANUS now has a real framework execution path.
 
-The registry no longer hands its validated source objects straight into whatever comes next. There is now one explicit place that turns “this source is configured” into “this is the run we are about to execute, through this dispatch path, with these output targets, under this run id.”
+The registry no longer hands validated source objects straight into ad hoc code, and the CLI no longer stops at a planning summary. There is now one explicit flow that turns “this source is configured” into “this source was planned and, when requested, executed through the framework runtime with explicit outputs and metadata.”
 
-That sounds small, but it matters. This is the step where the project stops being a set of contracts and starts behaving like a framework with an execution boundary.
+That matters because it keeps JANUS aligned with the foundation and PRD principles: metadata-driven where possible, strategy-based by family, extension by pattern instead of script copy, and reproducible by design.
 
 ## What was added
 
-- `src/janus/planner/core.py` now defines the planner flow and the small objects that support it.
-- `src/janus/planner/__init__.py` exposes the planner API for downstream imports.
-- `src/janus/main.py` can now build a deterministic plan for one configured source from the command line.
-- `tests/unit/planner/test_planner.py` covers the main planning path, strategy resolution, hook resolution, planner failures, and the CLI flow.
+- `src/janus/planner/core.py` defines the planning flow and the small planner-facing objects.
+- `src/janus/runtime/executor.py` defines the runtime orchestration layer through `SourceExecutor` and the execution result contract through `ExecutedRun`.
+- `src/janus/runtime/__init__.py` exposes the runtime API for CLI and tests.
+- `src/janus/main.py` now supports both deterministic planning and full framework execution from the command line.
+- `tests/unit/planner/test_planner.py` covers planning, disabled-source handling, and CLI wiring.
+- `tests/unit/runtime/test_executor.py` covers the runtime orchestration path, quality failures, and execution summaries.
 
 ## What the planner is responsible for
 
-The planner takes a few inputs:
+The planner takes a small set of explicit inputs:
 
 - a `source_id`;
 - an environment name;
 - a project root;
 - an optional explicit run id;
-- an optional explicit start timestamp.
+- an optional explicit start timestamp;
+- an optional `include_disabled` flag for protected operational cases.
 
 From there it does five things, in order:
 
@@ -29,25 +32,44 @@ From there it does five things, in order:
 2. fetches the validated `SourceConfig` for the requested source;
 3. resolves the strategy family and strategy variant through metadata;
 4. resolves an optional source hook if one is configured;
-5. builds a runtime `ExecutionPlan` plus a pre-run metadata payload.
+5. builds a runtime `ExecutionPlan` plus pre-run metadata.
 
-That means the planner now owns orchestration, but it still does not own extraction logic.
+That means the planner owns deterministic dispatch, but it does not own extraction mechanics.
+
+## What the runtime executor is responsible for
+
+`SourceExecutor` is the framework-native orchestration layer that takes a `PlannedRun` and executes it through the existing JANUS building blocks.
+
+For one selected source it performs the following steps:
+
+1. starts run observation;
+2. calls the resolved strategy extraction flow;
+3. projects raw extracted artifacts into runtime-visible `WriteResult` objects;
+4. builds the normalization handoff from the strategy;
+5. reads the handoff into Spark;
+6. runs the base normalizer;
+7. writes the bronze dataset through the configured storage layout;
+8. emits strategy-level metadata;
+9. validates and persists quality results;
+10. records success or failure, including lineage and checkpoint metadata.
+
+This keeps execution inside the framework boundary instead of pushing contributors toward one-off scripts for each source.
 
 ## The planner-facing objects
 
-A few small objects were introduced so this layer can stay explicit without getting noisy.
+A few small objects keep this layer explicit without getting noisy.
 
 ### `PlanningRequest`
 
 This is the narrow input object for planning.
 
-It keeps the planner API from growing into a loose pile of function arguments, and it validates the things that really should be validated here, such as a non-empty source id and a timezone-aware explicit start timestamp.
+It prevents the planning API from turning into a loose pile of parameters and validates what really belongs here, such as a non-empty source id and a timezone-aware explicit start timestamp. It also carries `include_disabled`, which lets operators intentionally run a configured but protected source without weakening the default registry behavior.
 
 ### `StrategyBinding` and `StrategyCatalog`
 
 These objects are the dispatch registry for the planner.
 
-A binding says, in effect, “for this family and this variant, use this strategy implementation.” The catalog is then responsible for resolving the right binding from `SourceConfig.strategy` and `SourceConfig.strategy_variant`.
+A binding says, effectively, “for this family and this variant, use this strategy implementation.” The catalog resolves the right binding from `SourceConfig.strategy` and `SourceConfig.strategy_variant`.
 
 That resolution is metadata-driven on purpose. There is no branching by source name.
 
@@ -55,68 +77,59 @@ That resolution is metadata-driven on purpose. There is no branching by source n
 
 This is the planner-side lookup for optional source hooks.
 
-If a source declares a hook id and no matching hook is registered, the planner fails with a direct error instead of quietly continuing in a half-configured state.
+If a source declares a hook id and no matching hook is registered, the planner fails with a direct error instead of continuing in a half-configured state.
 
 ### `PlannedRun`
 
-This is the full output of the planner.
+This is the planner output.
 
-It carries:
+It carries the `ExecutionPlan`, the resolved strategy instance, the resolved hook when present, and pre-run metadata that can later feed lineage, logging, or run tracking.
 
-- the `ExecutionPlan`;
-- the resolved strategy instance;
-- the resolved hook, when present;
-- a pre-run metadata payload that can later feed logging, lineage, or run tracking.
+### `ExecutedRun`
 
-It also exposes a small summary shape so the CLI can print the planned run in a stable JSON form.
+This is the runtime execution result.
 
-## One design choice worth calling out
-
-The default strategy catalog currently wires every supported family and variant to a planning-only strategy implementation.
-
-That is deliberate.
-
-This task needed to prove that JANUS can resolve the right dispatch path and produce a clean runtime plan before the concrete API, file, and catalog strategy modules are implemented in later steps.
-
-So the planner can already answer:
-
-- which source is being run;
-- which family and variant were selected;
-- which hook was selected;
-- which outputs and checkpoint settings apply;
-- which run id and start time identify the run.
-
-What it does not do yet is perform extraction. Later strategy tasks will replace those planning-only defaults with real implementations behind the same contract.
+It carries execution status, extracted artifacts, materialized outputs, persisted validation metadata, lineage/checkpoint paths, strategy metadata, and failure details when a run does not succeed. The CLI prints it as `executed_run` so operators get a stable machine-readable summary of what happened.
 
 ## The command-line flow
 
-`janus` still supports the runtime-baseline behavior, but it can now also plan one source deterministically.
+`janus` now supports three useful modes.
 
-Example:
+### 1. Runtime validation only
 
 ```bash
-janus \
-  --environment local \
-  --source-id federal_open_data_example \
-  --run-id run-20260408-001 \
-  --started-at 2026-04-08T12:00:00+00:00
+janus --environment local
 ```
 
-That command now:
+This validates the environment profile, prepares runtime paths, and prints the resolved runtime summary.
 
-- loads the selected environment profile;
-- prepares the runtime paths;
-- loads the requested source from the registry;
-- resolves the dispatch path;
-- prints a JSON summary of the planned run.
+### 2. Deterministic planning for one source
 
-If the environment config is missing, the source does not exist, the source is disabled, the hook is missing, or the strategy variant is not registered, the command exits with a direct error instead of falling through into vague behavior.
+```bash
+janus       --environment local       --source-id federal_open_data_example       --run-id run-20260409-001       --started-at 2026-04-09T12:00:00+00:00
+```
+
+That command loads the source from the registry, resolves the dispatch path, and prints a `planned_run` summary.
+
+### 3. Full framework execution for one source
+
+```bash
+janus       --environment local       --source-id federal_open_data_example       --run-id run-20260409-001       --started-at 2026-04-09T12:00:00+00:00       --execute
+```
+
+That command performs planning plus extraction, Spark normalization, bronze writing, validation persistence, and lineage/checkpoint recording. The resulting JSON contains both `planned_run` and `executed_run`.
+
+If a source is intentionally disabled in the registry, the operator must opt in explicitly:
+
+```bash
+janus       --environment local       --source-id transparencia_servidores_por_orgao       --include-disabled       --execute
+```
+
+That keeps the default behavior safe while still supporting controlled operational runs.
 
 ## What the tests lock down
 
-The planner tests are not pretending to be end-to-end ingestion tests.
-
-They are there to protect the orchestration boundary.
+The planner and runtime tests protect the orchestration boundary rather than pretending to be source-specific business tests.
 
 They cover:
 
@@ -124,27 +137,15 @@ They cover:
 - selecting a strategy implementation from metadata rather than source name;
 - surfacing clear errors when a variant is not registered;
 - surfacing clear errors when a configured hook is missing;
-- printing a stable CLI planning summary for one configured source.
+- allowing disabled sources only when explicitly requested;
+- printing a stable CLI planning summary;
+- wiring the CLI execution path to `SourceExecutor`;
+- returning failed execution status when quality validation fails.
 
-The broader unit suite still passes with these changes, which matters because `main.py` is shared with the earlier runtime-baseline work.
+## Why this matters architecturally
 
-## What this step does not do yet
+This step is the point where JANUS starts behaving like a framework instead of a collection of helper modules.
 
-This step still does not:
+The foundation and PRD both require the project to be modular by strategy, reproducible, safe by default, and extensible by pattern rather than by duplicated scripts. A real CLI execution path is part of that promise. It gives contributors one shared control plane for running sources through the framework contracts that already exist, instead of inventing a new runner for each dataset.
 
-- call an external API;
-- download a file;
-- build a Spark DataFrame;
-- persist checkpoints;
-- emit lineage records;
-- run normalization;
-- implement real source hooks;
-- implement the concrete API, file, or catalog strategy cores.
-
-Those pieces belong to the next layers.
-
-The important part here is that they now have a clean handoff point. The control flow described in the foundation is no longer only aspirational. JANUS can now move from:
-
-`validated source config -> planner -> execution plan and dispatch path`
-
-without inventing orchestration on the fly in each later strategy module.
+That does not mean every future source will be zero-code. It means any source-specific differences must now enter through the expected seams: configuration, strategy variants, and isolated hooks.

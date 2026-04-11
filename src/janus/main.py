@@ -10,7 +10,8 @@ from pathlib import Path
 
 from janus.planner import Planner, PlannerError, PlanningRequest
 from janus.registry import SourceNotFoundError
-from janus.utils.runtime import build_spark_session, load_environment_config, prepare_runtime
+from janus.runtime import SourceExecutor
+from janus.utils.environment import build_spark_session, load_environment_config, prepare_runtime
 
 
 def default_project_root() -> Path:
@@ -43,11 +44,27 @@ def parse_started_at(value: str) -> datetime:
     return parsed
 
 
+def format_runtime_permission_error(exc: PermissionError) -> str:
+    path = exc.filename or "<unknown>"
+    message = (
+        f"JANUS could not prepare the runtime path {path!r}. "
+        "The active environment needs write access to the configured storage "
+        "and Spark cache directories."
+    )
+    if str(path).startswith("/workspace/"):
+        message += (
+            " If you are running inside the local container, recreate it with "
+            "`make down && make up` so the Docker/Podman user mapping is "
+            "applied correctly."
+        )
+    return message
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate the JANUS runtime baseline and optionally build a deterministic "
-            "source execution plan."
+            "Validate JANUS runtime configuration, plan one source, or execute one "
+            "configured source through the framework runtime."
         )
     )
     parser.add_argument(
@@ -79,7 +96,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=parse_started_at,
         help="Optional timezone-aware ISO-8601 timestamp used to make planning deterministic.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Execute the selected source through planning, extraction, Spark normalization, "
+            "bronze writes, validation, and metadata persistence."
+        ),
+    )
+    parser.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="Allow planning or executing a source that is configured but disabled.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.execute and not args.source_id:
+        parser.error("--execute requires --source-id")
+    if args.include_disabled and not args.source_id:
+        parser.error("--include-disabled requires --source-id")
+
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -91,6 +128,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolved_paths = prepare_runtime(config, project_root)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except PermissionError as exc:
+        print(format_runtime_permission_error(exc), file=sys.stderr)
         return 2
 
     summary = {
@@ -104,6 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "paths": {name: str(path) for name, path in resolved_paths.items()},
     }
 
+    planned_run = None
     if args.source_id:
         try:
             planned_run = Planner().plan(
@@ -113,6 +154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     project_root=project_root,
                     run_id=args.run_id,
                     started_at=args.started_at,
+                    include_disabled=args.include_disabled,
                     attributes={"trigger": "cli"},
                 )
             )
@@ -120,6 +162,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
         summary["planned_run"] = planned_run.to_summary()
+
+    if args.execute:
+        assert planned_run is not None
+        try:
+            spark = build_spark_session(config, resolved_paths)
+        except Exception as exc:  # pragma: no cover - defensive entrypoint guard
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        try:
+            summary["spark_session"] = {
+                "app_name": spark.sparkContext.appName,
+                "master": spark.sparkContext.master,
+            }
+            executed_run = SourceExecutor().execute(planned_run, spark, config)
+            summary["executed_run"] = executed_run.to_summary()
+        finally:
+            spark.stop()
+
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if executed_run.is_successful else 1
 
     print(json.dumps(summary, indent=2, sort_keys=True))
 
