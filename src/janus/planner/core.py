@@ -89,8 +89,7 @@ class StrategyBinding:
             raise ValueError("variant must not be empty")
         if self.strategy.strategy_family != self.family:
             raise ValueError(
-                "strategy.strategy_family must match the bound family "
-                f"{self.family!r}"
+                f"strategy.strategy_family must match the bound family {self.family!r}"
             )
 
     @property
@@ -123,11 +122,12 @@ class StrategyCatalog:
     @classmethod
     def with_defaults(cls) -> Self:
         from janus.strategies.api import ApiStrategy
+        from janus.strategies.catalog import CatalogStrategy
         from janus.strategies.files import FileStrategy
 
         strategies: dict[str, BaseStrategy] = {
             "api": ApiStrategy(),
-            "catalog": PlanningStrategy("catalog"),
+            "catalog": CatalogStrategy(),
             "file": FileStrategy(),
         }
         bindings = tuple(
@@ -163,9 +163,7 @@ class StrategyCatalog:
     def registered_variants_for_family(self, family: str) -> tuple[str, ...]:
         return tuple(
             sorted(
-                variant
-                for bound_family, variant in self._bindings_by_key
-                if bound_family == family
+                variant for bound_family, variant in self._bindings_by_key if bound_family == family
             )
         )
 
@@ -184,9 +182,7 @@ class HookCatalog:
             if not normalized_hook_id:
                 raise ValueError("hook id must not be empty")
             if normalized_hook_id in hooks_by_id:
-                raise ValueError(
-                    f"Duplicate source hook registered for id {normalized_hook_id!r}"
-                )
+                raise ValueError(f"Duplicate source hook registered for id {normalized_hook_id!r}")
             hooks_by_id[normalized_hook_id] = hook
         object.__setattr__(self, "_hooks_by_id", hooks_by_id)
 
@@ -197,8 +193,7 @@ class HookCatalog:
         hook = self._hooks_by_id.get(hook_id)
         if hook is None:
             raise HookResolutionError(
-                f"Source {source_id!r} requires hook {hook_id!r}, "
-                "but no hook binding is registered"
+                f"Source {source_id!r} requires hook {hook_id!r}, but no hook binding is registered"
             )
         return hook
 
