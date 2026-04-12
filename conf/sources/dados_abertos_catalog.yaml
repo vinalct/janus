@@ -36,8 +36,8 @@ access:
     size_param: tamanhoPagina
     page_size: 15
   rate_limit:
-    requests_per_minute: 30
-    concurrency: 1
+    requests_per_minute: 100
+    concurrency: 5
     backoff_seconds: 10
 
 extraction:

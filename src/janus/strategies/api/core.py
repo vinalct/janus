@@ -3,16 +3,24 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urljoin
 
 from janus.checkpoints import CheckpointState, CheckpointStore
-from janus.models import ExecutionPlan, ExtractionResult, SourceConfig, WriteResult
+from janus.models import (
+    ExecutionPlan,
+    ExtractedArtifact,
+    ExtractionResult,
+    SourceConfig,
+    WriteResult,
+)
 from janus.strategies.base import BaseStrategy, SourceHook
 from janus.utils.environment import load_environment_config, prepare_runtime
 from janus.utils.logging import StructuredLogger, redact_url
@@ -29,7 +37,7 @@ from .http import (
     UrllibApiTransport,
     inject_auth,
 )
-from .pagination import PaginationState, build_paginator
+from .pagination import OffsetPaginator, PageNumberPaginator, PaginationState, build_paginator
 
 SUPPORTED_API_PAYLOAD_FORMATS = frozenset({"binary", "json", "jsonl", "text"})
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
@@ -138,23 +146,44 @@ class ApiHook(SourceHook):
 
 @dataclass(slots=True)
 class ApiRequestThrottle:
-    """Simple single-threaded rate limiter aligned with JANUS safe defaults."""
+    """Thread-safe request pacing aligned with JANUS safe defaults."""
 
     requests_per_minute: int | None
     clock: Callable[[], float]
     sleeper: Callable[[float], None]
     _next_allowed_at: float | None = None
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def wait_for_turn(self) -> None:
         if self.requests_per_minute is None:
             return
 
         interval_seconds = 60 / self.requests_per_minute
-        now = self.clock()
-        if self._next_allowed_at is not None and now < self._next_allowed_at:
-            self.sleeper(self._next_allowed_at - now)
-            now = self._next_allowed_at
-        self._next_allowed_at = now + interval_seconds
+        with self._lock:
+            now = self.clock()
+            scheduled_at = now
+            if self._next_allowed_at is not None and now < self._next_allowed_at:
+                scheduled_at = self._next_allowed_at
+            self._next_allowed_at = scheduled_at + interval_seconds
+
+        delay = scheduled_at - now
+        if delay > 0:
+            self.sleeper(delay)
+
+
+@dataclass(frozen=True, slots=True)
+class SubmittedApiRequest:
+    pagination_state: PaginationState
+    request: ApiRequest
+    future: Future[tuple[ApiResponse, int]]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessedApiRequest:
+    artifact: ExtractedArtifact
+    records_extracted: int
+    checkpoint_value: str | None
+    next_pagination_state: PaginationState | None
 
 
 @dataclass(slots=True)
@@ -219,101 +248,45 @@ class ApiStrategy(BaseStrategy):
                 timeout_seconds=base_request.timeout_seconds,
             )
 
-        artifacts = []
-        total_records = 0
-        successful_requests = 0
-        total_attempts = 0
-        checkpoint_value: str | None = None
-
-        with ApiClient(self.transport_factory()) as client:
-            while pagination_state is not None:
-                request = paginator.apply(base_request, pagination_state)
-                if api_hook is not None:
-                    request = api_hook.prepare_request(
-                        plan,
-                        request,
-                        checkpoint_state=checkpoint_state,
-                        pagination_state=pagination_state,
-                    )
-
-                if logger is not None:
-                    logger.info(
-                        "api_request_started",
-                        request_index=pagination_state.request_index,
-                        page_number=pagination_state.page_number,
-                        offset=pagination_state.offset,
-                        cursor=pagination_state.cursor,
-                        request_url=request.full_url(),
-                    )
-
-                response, attempts_used = self._send_with_retries(
-                    plan,
-                    client,
-                    request,
-                    throttle,
-                    logger,
-                )
-                total_attempts += attempts_used
-                successful_requests += 1
-
-                if api_hook is not None:
-                    response = api_hook.handle_response(plan, request, response)
-
-                payload = self._decode_payload(plan, response)
-                if api_hook is not None:
-                    payload = api_hook.transform_payload(plan, request, response, payload)
-
-                records = self._extract_records(plan, request, response, payload, api_hook)
-                total_records += len(records)
-                checkpoint_value = self._resolve_checkpoint_value(
-                    checkpoint_value,
-                    records,
-                    checkpoint_field=plan.checkpoint_field,
-                )
-
-                persisted = self._persist_raw_payload(
-                    plan,
-                    raw_writer,
-                    response=response,
-                    payload=payload,
-                    pagination_state=pagination_state,
-                )
-                artifacts.append(persisted.artifact)
-
-                next_cursor = None
-                if api_hook is not None:
-                    next_cursor = api_hook.resolve_next_cursor(plan, request, response, payload)
-                next_pagination_state = paginator.next_state(
-                    pagination_state,
-                    records_extracted=len(records),
-                    payload=payload,
-                    next_cursor=next_cursor,
-                )
-                if logger is not None:
-                    logger.info(
-                        "api_request_finished",
-                        request_index=pagination_state.request_index,
-                        page_number=pagination_state.page_number,
-                        offset=pagination_state.offset,
-                        cursor=pagination_state.cursor,
-                        status_code=response.status_code,
-                        attempts_used=attempts_used,
-                        records_extracted=len(records),
-                        total_records=total_records,
-                        artifact_path=persisted.artifact.path,
-                        has_next_page=next_pagination_state is not None,
-                        next_page_number=(
-                            next_pagination_state.page_number
-                            if next_pagination_state is not None
-                            else None
-                        ),
-                        next_offset=(
-                            next_pagination_state.offset
-                            if next_pagination_state is not None
-                            else None
-                        ),
-                    )
-                pagination_state = next_pagination_state
+        if _supports_concurrent_pagination(
+            paginator,
+            plan.source_config.access.rate_limit.concurrency,
+        ):
+            (
+                artifacts,
+                total_records,
+                successful_requests,
+                total_attempts,
+                checkpoint_value,
+            ) = self._extract_concurrent_pages(
+                plan,
+                api_hook=api_hook,
+                base_request=base_request,
+                paginator=paginator,
+                pagination_state=pagination_state,
+                checkpoint_state=checkpoint_state,
+                raw_writer=raw_writer,
+                throttle=throttle,
+                logger=logger,
+            )
+        else:
+            (
+                artifacts,
+                total_records,
+                successful_requests,
+                total_attempts,
+                checkpoint_value,
+            ) = self._extract_sequential_pages(
+                plan,
+                api_hook=api_hook,
+                base_request=base_request,
+                paginator=paginator,
+                pagination_state=pagination_state,
+                checkpoint_state=checkpoint_state,
+                raw_writer=raw_writer,
+                throttle=throttle,
+                logger=logger,
+            )
 
         if logger is not None:
             logger.info(
@@ -344,6 +317,172 @@ class ApiStrategy(BaseStrategy):
         if hook is not None:
             return hook.on_extraction_result(plan, extraction_result)
         return extraction_result
+
+    def _extract_sequential_pages(
+        self,
+        plan: ExecutionPlan,
+        *,
+        api_hook: ApiHook | None,
+        base_request: ApiRequest,
+        paginator,
+        pagination_state: PaginationState | None,
+        checkpoint_state: CheckpointState | None,
+        raw_writer: RawArtifactWriter,
+        throttle: ApiRequestThrottle,
+        logger: StructuredLogger | None,
+    ) -> tuple[list[ExtractedArtifact], int, int, int, str | None]:
+        artifacts: list[ExtractedArtifact] = []
+        total_records = 0
+        successful_requests = 0
+        total_attempts = 0
+        checkpoint_value: str | None = None
+
+        with ApiClient(self.transport_factory()) as client:
+            while pagination_state is not None:
+                request = self._prepare_request(
+                    plan,
+                    base_request,
+                    pagination_state,
+                    paginator,
+                    api_hook=api_hook,
+                    checkpoint_state=checkpoint_state,
+                    logger=logger,
+                )
+                response, attempts_used = self._send_with_retries(
+                    plan,
+                    client,
+                    request,
+                    throttle,
+                    logger,
+                )
+                successful_requests += 1
+                total_attempts += attempts_used
+                processed = self._process_response(
+                    plan,
+                    raw_writer,
+                    paginator,
+                    pagination_state,
+                    request,
+                    response,
+                    attempts_used,
+                    checkpoint_value,
+                    api_hook=api_hook,
+                    logger=logger,
+                    total_records=total_records,
+                )
+                artifacts.append(processed.artifact)
+                total_records += processed.records_extracted
+                checkpoint_value = processed.checkpoint_value
+                pagination_state = processed.next_pagination_state
+
+        return (
+            artifacts,
+            total_records,
+            successful_requests,
+            total_attempts,
+            checkpoint_value,
+        )
+
+    def _extract_concurrent_pages(
+        self,
+        plan: ExecutionPlan,
+        *,
+        api_hook: ApiHook | None,
+        base_request: ApiRequest,
+        paginator: PageNumberPaginator | OffsetPaginator,
+        pagination_state: PaginationState | None,
+        checkpoint_state: CheckpointState | None,
+        raw_writer: RawArtifactWriter,
+        throttle: ApiRequestThrottle,
+        logger: StructuredLogger | None,
+    ) -> tuple[list[ExtractedArtifact], int, int, int, str | None]:
+        concurrency = plan.source_config.access.rate_limit.concurrency
+        artifacts: list[ExtractedArtifact] = []
+        total_records = 0
+        successful_requests = 0
+        total_attempts = 0
+        checkpoint_value: str | None = None
+        next_request_index = pagination_state.request_index if pagination_state is not None else 1
+        predicted_state = pagination_state
+        pending: dict[int, SubmittedApiRequest] = {}
+        stop_submitting = False
+
+        executor = ThreadPoolExecutor(
+            max_workers=concurrency,
+            thread_name_prefix="janus-api",
+        )
+        try:
+            while predicted_state is not None or pending:
+                while (
+                    predicted_state is not None
+                    and not stop_submitting
+                    and len(pending) < concurrency
+                ):
+                    request = self._prepare_request(
+                        plan,
+                        base_request,
+                        predicted_state,
+                        paginator,
+                        api_hook=api_hook,
+                        checkpoint_state=checkpoint_state,
+                        logger=logger,
+                    )
+                    future = executor.submit(
+                        self._fetch_with_dedicated_client,
+                        plan,
+                        request,
+                        throttle,
+                        logger,
+                    )
+                    pending[predicted_state.request_index] = SubmittedApiRequest(
+                        pagination_state=predicted_state,
+                        request=request,
+                        future=future,
+                    )
+                    predicted_state = _predicted_next_pagination_state(
+                        paginator,
+                        predicted_state,
+                    )
+
+                if next_request_index not in pending:
+                    break
+
+                submitted = pending.pop(next_request_index)
+                response, attempts_used = submitted.future.result()
+                successful_requests += 1
+                total_attempts += attempts_used
+                processed = self._process_response(
+                    plan,
+                    raw_writer,
+                    paginator,
+                    submitted.pagination_state,
+                    submitted.request,
+                    response,
+                    attempts_used,
+                    checkpoint_value,
+                    api_hook=api_hook,
+                    logger=logger,
+                    total_records=total_records,
+                )
+                artifacts.append(processed.artifact)
+                total_records += processed.records_extracted
+                checkpoint_value = processed.checkpoint_value
+                next_request_index += 1
+                if processed.next_pagination_state is None:
+                    stop_submitting = True
+                    for pending_request in pending.values():
+                        pending_request.future.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        return (
+            artifacts,
+            total_records,
+            successful_requests,
+            total_attempts,
+            checkpoint_value,
+        )
 
     def build_normalization_handoff(
         self,
@@ -426,6 +565,53 @@ class ApiStrategy(BaseStrategy):
             request = request.with_params(checkpoint_params)
         return request
 
+    def _prepare_request(
+        self,
+        plan: ExecutionPlan,
+        base_request: ApiRequest,
+        pagination_state: PaginationState,
+        paginator,
+        *,
+        api_hook: ApiHook | None,
+        checkpoint_state: CheckpointState | None,
+        logger: StructuredLogger | None,
+    ) -> ApiRequest:
+        request = paginator.apply(base_request, pagination_state)
+        if api_hook is not None:
+            request = api_hook.prepare_request(
+                plan,
+                request,
+                checkpoint_state=checkpoint_state,
+                pagination_state=pagination_state,
+            )
+
+        if logger is not None:
+            logger.info(
+                "api_request_started",
+                request_index=pagination_state.request_index,
+                page_number=pagination_state.page_number,
+                offset=pagination_state.offset,
+                cursor=pagination_state.cursor,
+                request_url=request.full_url(),
+            )
+        return request
+
+    def _fetch_with_dedicated_client(
+        self,
+        plan: ExecutionPlan,
+        request: ApiRequest,
+        throttle: ApiRequestThrottle,
+        logger: StructuredLogger | None,
+    ) -> tuple[ApiResponse, int]:
+        with ApiClient(self.transport_factory()) as client:
+            return self._send_with_retries(
+                plan,
+                client,
+                request,
+                throttle,
+                logger,
+            )
+
     def _send_with_retries(
         self,
         plan: ExecutionPlan,
@@ -462,6 +648,84 @@ class ApiStrategy(BaseStrategy):
         if last_transport_error is not None:
             raise ApiStrategyError(str(last_transport_error)) from last_transport_error
         raise AssertionError("Retry loop exited without a response or error")
+
+    def _process_response(
+        self,
+        plan: ExecutionPlan,
+        raw_writer: RawArtifactWriter,
+        paginator,
+        pagination_state: PaginationState,
+        request: ApiRequest,
+        response: ApiResponse,
+        attempts_used: int,
+        checkpoint_value: str | None,
+        *,
+        api_hook: ApiHook | None,
+        logger: StructuredLogger | None,
+        total_records: int,
+    ) -> ProcessedApiRequest:
+        if api_hook is not None:
+            response = api_hook.handle_response(plan, request, response)
+
+        payload = self._decode_payload(plan, response)
+        if api_hook is not None:
+            payload = api_hook.transform_payload(plan, request, response, payload)
+
+        records = self._extract_records(plan, request, response, payload, api_hook)
+        resolved_checkpoint_value = self._resolve_checkpoint_value(
+            checkpoint_value,
+            records,
+            checkpoint_field=plan.checkpoint_field,
+        )
+
+        persisted = self._persist_raw_payload(
+            plan,
+            raw_writer,
+            response=response,
+            payload=payload,
+            pagination_state=pagination_state,
+        )
+
+        next_cursor = None
+        if api_hook is not None:
+            next_cursor = api_hook.resolve_next_cursor(plan, request, response, payload)
+        next_pagination_state = paginator.next_state(
+            pagination_state,
+            records_extracted=len(records),
+            payload=payload,
+            next_cursor=next_cursor,
+        )
+        if logger is not None:
+            logger.info(
+                "api_request_finished",
+                request_index=pagination_state.request_index,
+                page_number=pagination_state.page_number,
+                offset=pagination_state.offset,
+                cursor=pagination_state.cursor,
+                status_code=response.status_code,
+                attempts_used=attempts_used,
+                records_extracted=len(records),
+                total_records=total_records + len(records),
+                artifact_path=persisted.artifact.path,
+                has_next_page=next_pagination_state is not None,
+                next_page_number=(
+                    next_pagination_state.page_number
+                    if next_pagination_state is not None
+                    else None
+                ),
+                next_offset=(
+                    next_pagination_state.offset
+                    if next_pagination_state is not None
+                    else None
+                ),
+            )
+
+        return ProcessedApiRequest(
+            artifact=persisted.artifact,
+            records_extracted=len(records),
+            checkpoint_value=resolved_checkpoint_value,
+            next_pagination_state=next_pagination_state,
+        )
 
     def _sleep_for_retry(
         self,
@@ -677,6 +941,24 @@ def _retry_delay_seconds(
         except ValueError:
             pass
     return float(min(delay, maximum_delay))
+
+
+def _supports_concurrent_pagination(
+    paginator: Any,
+    concurrency: int,
+) -> bool:
+    return concurrency > 1 and isinstance(paginator, PageNumberPaginator | OffsetPaginator)
+
+
+def _predicted_next_pagination_state(
+    paginator: PageNumberPaginator | OffsetPaginator,
+    pagination_state: PaginationState,
+) -> PaginationState | None:
+    return paginator.next_state(
+        pagination_state,
+        records_extracted=paginator.page_size,
+        payload=None,
+    )
 
 
 def _raw_relative_path(raw_format: str, pagination_state: PaginationState) -> Path:

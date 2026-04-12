@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from io import StringIO
@@ -76,6 +78,63 @@ class WindowHook(ApiHook):
         del request
         del response
         return payload["payload"]["rows"]
+
+
+@dataclass(slots=True)
+class ConcurrentPageState:
+    payloads: dict[int, list[dict[str, str]]]
+    requests: list = field(default_factory=list)
+    start_times: dict[int, float] = field(default_factory=dict)
+    active_requests: int = 0
+    max_active_requests: int = 0
+    first_page_started: threading.Event = field(default_factory=threading.Event)
+    second_page_started: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class ConcurrentPageTransport:
+    def __init__(self, state: ConcurrentPageState) -> None:
+        self.state = state
+
+    def open(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def send(self, request):
+        query = parse_qs(urlsplit(request.full_url()).query)
+        page_number = int(query["page"][0])
+        started_at = time.monotonic()
+        with self.state.lock:
+            self.state.requests.append(request)
+            self.state.start_times[page_number] = started_at
+            self.state.active_requests += 1
+            self.state.max_active_requests = max(
+                self.state.max_active_requests,
+                self.state.active_requests,
+            )
+
+        try:
+            if page_number == 1:
+                self.state.first_page_started.set()
+                assert self.state.second_page_started.wait(timeout=1)
+                time.sleep(0.2)
+            elif page_number == 2:
+                self.state.second_page_started.set()
+                time.sleep(0.15)
+            else:
+                time.sleep(0.02)
+
+            payload = {"records": self.state.payloads.get(page_number, [])}
+            return ApiResponse(
+                request=request,
+                status_code=200,
+                body=json.dumps(payload).encode("utf-8"),
+            )
+        finally:
+            with self.state.lock:
+                self.state.active_requests -= 1
 
 
 def test_urllib_transport_prefers_explicit_or_environment_ca_bundle(tmp_path, monkeypatch):
@@ -233,6 +292,41 @@ def test_api_strategy_offset_pagination_reuses_offset_parameters_from_config(tmp
     assert Path(result.artifacts[1].path).name == "offset-00000002.json"
 
 
+def test_api_strategy_page_number_supports_bounded_concurrency(tmp_path):
+    plan = _build_plan(
+        tmp_path,
+        source_id="concurrent_page_source",
+        page_size=2,
+        requests_per_minute=600,
+        concurrency=2,
+    )
+    state = ConcurrentPageState(
+        payloads={
+            1: [{"id": "1"}, {"id": "2"}],
+            2: [{"id": "3"}, {"id": "4"}],
+            3: [{"id": "5"}],
+            4: [],
+        }
+    )
+    strategy = ApiStrategy(
+        transport_factory=lambda: ConcurrentPageTransport(state),
+        storage_layout_factory=lambda plan: _storage_layout(tmp_path),
+    )
+
+    result = strategy.extract(plan)
+
+    assert state.max_active_requests >= 2
+    assert state.start_times[2] > state.start_times[1]
+    assert state.start_times[2] - state.start_times[1] >= 0.08
+    assert len(result.artifacts) == 3
+    assert [Path(artifact.path).name for artifact in result.artifacts] == [
+        "page-0001.json",
+        "page-0002.json",
+        "page-0003.json",
+    ]
+    assert result.records_extracted == 5
+
+
 def test_api_strategy_retries_transient_failures_with_bounded_backoff(tmp_path):
     plan = _build_plan(
         tmp_path,
@@ -336,6 +430,7 @@ def _build_plan(
     retry_backoff_strategy: str = "fixed",
     rate_limit_backoff_seconds: int | None = 5,
     requests_per_minute: int | None = 10,
+    concurrency: int = 1,
 ) -> ExecutionPlan:
     source_config = _build_source_config(
         tmp_path,
@@ -352,6 +447,7 @@ def _build_plan(
         retry_backoff_strategy=retry_backoff_strategy,
         rate_limit_backoff_seconds=rate_limit_backoff_seconds,
         requests_per_minute=requests_per_minute,
+        concurrency=concurrency,
     )
     run_context = RunContext.create(
         run_id=f"run-{source_id}",
@@ -378,6 +474,7 @@ def _build_source_config(
     retry_backoff_strategy: str = "fixed",
     rate_limit_backoff_seconds: int | None = 5,
     requests_per_minute: int | None = 10,
+    concurrency: int = 1,
 ) -> SourceConfig:
     return SourceConfig.from_mapping(
         {
@@ -401,7 +498,7 @@ def _build_source_config(
                 "pagination": _pagination_block(pagination_type, page_size),
                 "rate_limit": {
                     "requests_per_minute": requests_per_minute,
-                    "concurrency": 1,
+                    "concurrency": concurrency,
                     "backoff_seconds": rate_limit_backoff_seconds,
                 },
             },
