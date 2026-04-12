@@ -178,6 +178,12 @@ class HookCatalog:
     hooks: tuple[tuple[str, SourceHook], ...] = ()
     _hooks_by_id: dict[str, SourceHook] = field(init=False, repr=False)
 
+    @classmethod
+    def with_defaults(cls) -> Self:
+        from janus.hooks import built_in_hooks
+
+        return cls(hooks=built_in_hooks())
+
     def __post_init__(self) -> None:
         hooks_by_id: dict[str, SourceHook] = {}
         for hook_id, hook in self.hooks:
@@ -268,7 +274,7 @@ class Planner:
     """Thin orchestration layer that converts one source config into a dispatchable plan."""
 
     strategy_catalog: StrategyCatalog = field(default_factory=StrategyCatalog.with_defaults)
-    hook_catalog: HookCatalog = field(default_factory=HookCatalog)
+    hook_catalog: HookCatalog = field(default_factory=HookCatalog.with_defaults)
 
     def plan(self, request: PlanningRequest) -> PlannedRun:
         registry = load_registry(request.project_root)

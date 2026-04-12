@@ -1,0 +1,24 @@
+[
+  {
+    "V": "Valor",
+    "D1C": "Território (Código)",
+    "D1N": "Território",
+    "D2C": "Ano (Código)",
+    "D2N": "Ano",
+    "D3C": "Indicador (Código)",
+    "D3N": "Indicador",
+    "D4C": "Sexo (Código)",
+    "D4N": "Sexo"
+  },
+  {
+    "V": "123456",
+    "D1C": "3550308",
+    "D1N": "São Paulo",
+    "D2C": "2024",
+    "D2N": "2024",
+    "D3C": "93",
+    "D3N": "População residente",
+    "D4C": "1",
+    "D4N": "Homens"
+  }
+]

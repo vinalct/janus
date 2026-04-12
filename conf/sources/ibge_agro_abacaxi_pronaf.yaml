@@ -1,0 +1,78 @@
+source_id: ibge_agro_abacaxi_pronaf
+name: IBGE - Quantidade produzida de abacaxi em estabelecimentos agropecuarios
+description: Pineapple production series from IBGE SIDRA aggregate 1712 with additional agricultural classification dimensions through the public IBGE Aggregates API.
+owner: janus
+enabled: false
+source_type: api
+strategy: api
+strategy_variant: date_window_api
+source_hook: ibge.sidra_flat
+federation_level: federal
+domain: estatisticas
+public_access: true
+tags:
+  - ibge
+  - sidra
+  - agropecuaria
+  - pronaf
+  - api
+  - federal
+
+access:
+  base_url: https://servicodados.ibge.gov.br
+  path: /api/v3/agregados/1712/periodos/2006/variaveis/214
+  method: GET
+  format: json
+  timeout_seconds: 60
+  headers:
+    Accept: application/json
+  params:
+    localidades: "N1[all]"
+    classificacao: "226[4844]|218[4780]"
+    view: flat
+  auth:
+    type: none
+  pagination:
+    type: none
+  rate_limit:
+    requests_per_minute: 30
+    concurrency: 1
+    backoff_seconds: 10
+
+extraction:
+  mode: incremental
+  checkpoint_field: sidra_period_code
+  checkpoint_strategy: max_value
+  retry:
+    max_attempts: 4
+    backoff_strategy: exponential
+    backoff_seconds: 2
+
+schema:
+  mode: infer
+
+spark:
+  input_format: jsonl
+  write_mode: overwrite
+  repartition: 1
+  partition_by:
+    - ingestion_date
+
+outputs:
+  raw:
+    path: data/raw/ibge/agro_abacaxi_pronaf
+    format: json
+  bronze:
+    path: data/bronze/ibge/agro_abacaxi_pronaf
+    format: parquet
+  metadata:
+    path: data/metadata/ibge/agro_abacaxi_pronaf
+    format: json
+
+quality:
+  required_fields:
+    - aggregate_id
+    - value
+    - sidra_dimension_count
+    - sidra_attribute_count
+  allow_schema_evolution: true

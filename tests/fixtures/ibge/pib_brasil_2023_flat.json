@@ -1,0 +1,28 @@
+[
+  {
+    "NC": "Nível Territorial (Código)",
+    "NN": "Nível Territorial",
+    "MC": "Unidade de Medida (Código)",
+    "MN": "Unidade de Medida",
+    "V": "Valor",
+    "D1C": "Brasil (Código)",
+    "D1N": "Brasil",
+    "D2C": "Ano (Código)",
+    "D2N": "Ano",
+    "D3C": "Variável (Código)",
+    "D3N": "Variável"
+  },
+  {
+    "NC": "1",
+    "NN": "Brasil",
+    "MC": "40",
+    "MN": "Mil Reais",
+    "V": "10943345439",
+    "D1C": "1",
+    "D1N": "Brasil",
+    "D2C": "2023",
+    "D2N": "2023",
+    "D3C": "37",
+    "D3N": "Produto Interno Bruto a preços correntes"
+  }
+]
