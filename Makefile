@@ -18,7 +18,7 @@ define RUN_COMPOSE
 	JANUS_CONTAINER_USER=$$container_user JANUS_UID=$(JANUS_UID) JANUS_GID=$(JANUS_GID) JANUS_PROJECT_ROOT=$(JANUS_PROJECT_ROOT) $$compose_cmd $$compose_files $(1)
 endef
 
-.PHONY: bootstrap check-compose up down status logs shell lint test run-local run-local-config docker-build docker-run clean
+.PHONY: bootstrap check-compose up down status logs shell pyspark-local lint test run-local run-local-config docker-build docker-run clean
 
 check-compose:
 	@compose_cmd="$$( $(DETECT_COMPOSE) )" || { \
@@ -45,6 +45,29 @@ logs: check-compose
 
 shell: up
 	$(call RUN_COMPOSE,exec $(SERVICE) sh)
+
+pyspark-local: up
+	$(call RUN_COMPOSE,exec $(SERVICE) sh -lc '\
+	ivy_dir="$${JANUS_SPARK_IVY_DIR:-data/metadata/ivy}"; \
+	if [ "$$ivy_dir" = "$${ivy_dir#/}" ]; then ivy_dir="/workspace/$$ivy_dir"; fi; \
+	iceberg_warehouse="$${JANUS_ICEBERG_WAREHOUSE_DIR:-data/metadata/iceberg}"; \
+	if [ "$$iceberg_warehouse" = "$${iceberg_warehouse#/}" ]; then iceberg_warehouse="/workspace/$$iceberg_warehouse"; fi; \
+	spark_warehouse="$${JANUS_SPARK_WAREHOUSE_DIR:-data/metadata/spark-warehouse}"; \
+	if [ "$$spark_warehouse" = "$${spark_warehouse#/}" ]; then spark_warehouse="/workspace/$$spark_warehouse"; fi; \
+	pyspark \
+		--packages "$${JANUS_ICEBERG_RUNTIME_PACKAGE:-org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.1}" \
+		--conf spark.jars.ivy="$$ivy_dir" \
+		--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+		--conf spark.sql.defaultCatalog="$${JANUS_ICEBERG_CATALOG_NAME:-janus}" \
+		--conf spark.sql.catalog.$${JANUS_ICEBERG_CATALOG_NAME:-janus}=org.apache.iceberg.spark.SparkCatalog \
+--conf spark.sql.catalog.$${JANUS_ICEBERG_CATALOG_NAME:-janus}.type=hadoop \
+--conf spark.sql.catalog.$${JANUS_ICEBERG_CATALOG_NAME:-janus}.warehouse="$$iceberg_warehouse" \
+--conf spark.sql.catalog.$${JANUS_ICEBERG_CATALOG_NAME:-janus}.default-namespace="$${JANUS_ICEBERG_DEFAULT_NAMESPACE:-bronze}" \
+--conf spark.sql.warehouse.dir="$$spark_warehouse" \
+--conf spark.driver.bindAddress="$${JANUS_SPARK_DRIVER_BIND_ADDRESS:-127.0.0.1}" \
+--conf spark.driver.host="$${JANUS_SPARK_DRIVER_HOST:-127.0.0.1}" \
+--conf spark.sql.session.timeZone=UTC \
+	--conf spark.ui.enabled=false')
 
 lint: up
 	$(call RUN_COMPOSE,exec -T $(SERVICE) python -m ruff check src tests)
