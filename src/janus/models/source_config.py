@@ -123,6 +123,7 @@ class SparkConfig:
     write_mode: str
     repartition: int | None = None
     partition_by: tuple[str, ...] = ()
+    read_options: dict[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,12 +562,14 @@ def _build_spark_config(raw_value: Any, issues: list[ValidationIssue]) -> SparkC
     write_mode = _require_enum(data, "write_mode", SUPPORTED_WRITE_MODES, issues, "spark")
     repartition = _optional_int(data, "repartition", issues, "spark", minimum=1)
     partition_by = tuple(_optional_string_list(data, "partition_by", issues, "spark"))
+    read_options = _optional_string_mapping(data, "read_options", issues, "spark")
 
     return SparkConfig(
         input_format=input_format,
         write_mode=write_mode,
         repartition=repartition,
         partition_by=partition_by,
+        read_options=read_options,
     )
 
 

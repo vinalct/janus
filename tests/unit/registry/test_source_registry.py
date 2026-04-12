@@ -50,6 +50,30 @@ def test_registry_excludes_disabled_sources_by_default(tmp_path):
         registry.get_source("disabled_source")
 
 
+def test_registry_parses_spark_read_options_mapping(tmp_path):
+    source_yaml = _valid_source_yaml("csv_source", enabled=True).replace(
+        "  write_mode: append\n",
+        "  write_mode: append\n"
+        "  read_options:\n"
+        "    header: \"true\"\n"
+        "    sep: \";\"\n"
+        "    encoding: \"ISO-8859-1\"\n",
+        1,
+    )
+    project_root = _create_project(
+        tmp_path,
+        {"csv.yaml": source_yaml},
+    )
+
+    source = load_registry(project_root).get_source("csv_source")
+
+    assert source.spark.read_options == {
+        "header": "true",
+        "sep": ";",
+        "encoding": "ISO-8859-1",
+    }
+
+
 def test_invalid_source_yaml_has_actionable_validation_errors(tmp_path):
     project_root = _create_project(
         tmp_path,

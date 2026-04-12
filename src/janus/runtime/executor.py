@@ -193,7 +193,12 @@ class SourceExecutor:
             normalized_dataframe = None
             if not handoff.is_empty:
                 _log_info(logger, "spark_read_started", artifact_count=len(handoff.artifacts))
-                raw_dataframe = self.reader.read_extraction_result(spark, handoff)
+                raw_dataframe = self.reader.read_extraction_result(
+                    spark,
+                    handoff,
+                    format_name=plan.source_config.spark.input_format,
+                    options=plan.source_config.spark.read_options,
+                )
                 _log_info(logger, "spark_read_finished")
 
                 _log_info(logger, "normalization_started")

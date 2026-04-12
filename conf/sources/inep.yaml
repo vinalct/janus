@@ -51,6 +51,11 @@ spark:
   repartition: 1
   partition_by:
     - ingestion_date
+  read_options:
+    header: "true"
+    sep: ";"
+    encoding: "ISO-8859-1"
+    inferSchema: "true"
 
 outputs:
   raw:

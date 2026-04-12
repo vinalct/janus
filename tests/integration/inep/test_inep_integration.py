@@ -73,6 +73,12 @@ def test_inep_source_contract_uses_generic_archive_file_strategy():
     assert source_config.extraction.mode == "snapshot"
     assert source_config.extraction.checkpoint_strategy == "none"
     assert source_config.spark.input_format == "csv"
+    assert source_config.spark.read_options == {
+        "header": "true",
+        "sep": ";",
+        "encoding": "ISO-8859-1",
+        "inferSchema": "true",
+    }
     assert source_config.outputs.raw.format == "binary"
     assert source_config.outputs.bronze.path == "data/bronze/inep/censo_escolar_microdados"
     assert load_expected_fields_from_schema_path(schema_path) == SCHEMA_FIELDS
@@ -146,7 +152,7 @@ def test_inep_archive_extracts_microdata_csv_and_materializes_bronze_and_metadat
     raw_dataframe = reader.read_extraction_result(
         spark,
         handoff,
-        options={"header": "true", "sep": ";", "inferSchema": "true"},
+        options=plan.source_config.spark.read_options,
     )
     normalized_dataframe = BaseNormalizer().normalize(raw_dataframe, plan)
     bronze_result = SparkDatasetWriter(storage_layout).write(

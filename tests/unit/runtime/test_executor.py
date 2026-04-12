@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -72,6 +72,7 @@ class FakeStrategy:
 @dataclass(slots=True)
 class FakeReader:
     calls: list[str]
+    seen_options: dict[str, str] | None = None
 
     def read_extraction_result(
         self,
@@ -85,7 +86,7 @@ class FakeReader:
         del extraction_result
         del format_name
         del schema
-        del options
+        self.seen_options = None if options is None else dict(options)
         self.calls.append("read")
         return object()
 
@@ -243,6 +244,41 @@ def test_source_executor_runs_framework_pipeline_and_returns_summary(tmp_path):
     assert "source_execution_succeeded" in log_events
 
 
+def test_source_executor_passes_spark_read_options_from_source_config(tmp_path):
+    calls: list[str] = []
+    read_options = {
+        "header": "true",
+        "sep": ";",
+        "encoding": "ISO-8859-1",
+    }
+    planned_run = _planned_run(tmp_path, calls, read_options=read_options)
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "example" / "federal_open_data_example"
+    bronze_path = tmp_path / "data" / "bronze" / "example" / "federal_open_data_example"
+    reader = FakeReader(calls)
+
+    executor = SourceExecutor(
+        reader=reader,
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(calls, bronze_path),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    )
+
+    executed_run = executor.execute(planned_run, spark=object(), environment_config={})
+
+    assert executed_run.is_successful is True
+    assert reader.seen_options == read_options
+
+
 def test_source_executor_records_failed_status_when_quality_validation_fails(tmp_path):
     calls: list[str] = []
     planned_run = _planned_run(tmp_path, calls)
@@ -274,8 +310,18 @@ def test_source_executor_records_failed_status_when_quality_validation_fails(tmp
     assert calls[-1] == "failure"
 
 
-def _planned_run(tmp_path: Path, calls: list[str]) -> PlannedRun:
+def _planned_run(
+    tmp_path: Path,
+    calls: list[str],
+    *,
+    read_options: dict[str, str] | None = None,
+) -> PlannedRun:
     source_config = load_registry(PROJECT_ROOT).get_source("federal_open_data_example")
+    if read_options is not None:
+        source_config = replace(
+            source_config,
+            spark=replace(source_config.spark, read_options=read_options),
+        )
     run_context = RunContext.create(
         run_id="run-001",
         environment="local",
