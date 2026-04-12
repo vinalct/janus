@@ -192,6 +192,31 @@ def test_quality_gate_detects_output_paths_outside_the_configured_zone(tmp_path)
     assert "must match configured iceberg table" in report.failed_checks[0].message
 
 
+def test_quality_gate_uses_configured_bronze_iceberg_namespace_and_table(tmp_path):
+    source_config = replace(
+        _base_source_config(),
+        outputs=replace(
+            _base_source_config().outputs,
+            bronze=replace(
+                _base_source_config().outputs.bronze,
+                namespace="curated",
+                table_name="named_bronze_table",
+            ),
+        ),
+    )
+    plan = _build_plan(
+        tmp_path,
+        run_id="run-quality-005-named",
+        started_at=datetime(2026, 4, 9, 14, 5, tzinfo=UTC),
+        source_config=source_config,
+    )
+    write_result = _bronze_write_result(plan, records_written=10)
+
+    report = QualityGate().validate(plan, write_results=(write_result,))
+
+    assert report.is_successful is True
+
+
 def test_schema_field_loader_supports_spark_style_schema_json(tmp_path):
     schema_path = tmp_path / "schema.json"
     schema_path.write_text(
@@ -253,6 +278,8 @@ def _bronze_write_result(
         else bronze_table_identifier(
             plan.bronze_output.path,
             fallback_name=plan.source.source_id,
+            namespace=plan.bronze_output.namespace,
+            table_name=plan.bronze_output.table_name,
         )
     )
     return WriteResult.from_plan(

@@ -66,6 +66,8 @@ outputs:
   bronze:
     path: data/bronze/example/federal_open_data_example
     format: iceberg
+    namespace: bronze_example
+    table_name: federal_open_data_example
   metadata:
     path: data/metadata/example/federal_open_data_example
     format: json

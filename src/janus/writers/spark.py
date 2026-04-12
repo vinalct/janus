@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from janus.models import ExecutionPlan, WriteResult
-from janus.utils.storage import ICEBERG_BRONZE_NAMESPACE, StorageLayout, bronze_table_identifier
+from janus.utils.storage import StorageLayout, bronze_table_identifier
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame
@@ -115,14 +115,17 @@ class SparkDatasetWriter:
         table_identifier = bronze_table_identifier(
             plan.bronze_output.path,
             fallback_name=plan.source.source_id,
+            namespace=plan.bronze_output.namespace,
+            table_name=plan.bronze_output.table_name,
         )
+        namespace_identifier = table_identifier.rsplit(".", 1)[0]
         spark = prepared_frame.sparkSession
         temp_view_name = f"janus_bronze_{plan.source.source_id}_{uuid4().hex}"
 
         prepared_frame.createOrReplaceTempView(temp_view_name)
         try:
             spark.sql(
-                f"CREATE NAMESPACE IF NOT EXISTS {_quote_identifier(ICEBERG_BRONZE_NAMESPACE)}"
+                f"CREATE NAMESPACE IF NOT EXISTS {_quote_identifier(namespace_identifier)}"
             )
 
             quoted_table = _quote_identifier(table_identifier)

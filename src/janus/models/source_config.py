@@ -130,6 +130,8 @@ class SparkConfig:
 class OutputTarget:
     path: str
     format: str
+    namespace: str | None = None
+    table_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -590,7 +592,55 @@ def _build_output_target(
     data = _require_mapping(raw_value, field_path, issues)
     path = _require_string(data, "path", issues, field_path)
     format_name = _require_enum(data, "format", SUPPORTED_DATA_FORMATS, issues, field_path)
-    return OutputTarget(path=path, format=format_name)
+    namespace = _optional_string(data, "namespace", issues, field_path)
+    table_name = _optional_string(data, "table_name", issues, field_path)
+
+    if "table" in data and data["table"] is not None:
+        issues.append(
+            ValidationIssue(
+                f"{field_path}.table",
+                "is not supported; use table_name",
+            )
+        )
+
+    if field_path != "outputs.bronze":
+        if namespace is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{field_path}.namespace",
+                    "is only supported for outputs.bronze",
+                )
+            )
+        if table_name is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{field_path}.table_name",
+                    "is only supported for outputs.bronze",
+                )
+            )
+
+    if format_name != "iceberg":
+        if namespace is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{field_path}.namespace",
+                    "requires format='iceberg'",
+                )
+            )
+        if table_name is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{field_path}.table_name",
+                    "requires format='iceberg'",
+                )
+            )
+
+    return OutputTarget(
+        path=path,
+        format=format_name,
+        namespace=namespace,
+        table_name=table_name,
+    )
 
 
 def _build_quality_config(raw_value: Any, issues: list[ValidationIssue]) -> QualityConfig:

@@ -367,14 +367,23 @@ def _plan_with_storage_layout_outputs(
     metadata_target = storage_layout.resolve_output(plan, "metadata")
     return replace(
         plan,
-        raw_output=OutputTarget(path=str(raw_target.resolved_path), format=raw_target.format),
+        raw_output=OutputTarget(
+            path=str(raw_target.resolved_path),
+            format=raw_target.format,
+            namespace=plan.raw_output.namespace,
+            table_name=plan.raw_output.table_name,
+        ),
         bronze_output=OutputTarget(
             path=str(bronze_target.resolved_path),
             format=bronze_target.format,
+            namespace=plan.bronze_output.namespace,
+            table_name=plan.bronze_output.table_name,
         ),
         metadata_output=OutputTarget(
             path=str(metadata_target.resolved_path),
             format=metadata_target.format,
+            namespace=plan.metadata_output.namespace,
+            table_name=plan.metadata_output.table_name,
         ),
     )
 

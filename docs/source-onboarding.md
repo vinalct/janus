@@ -99,7 +99,7 @@ Examples of behavior that should stay in config:
 - auth mode and env var names;
 - page size or offset parameter names;
 - checkpoint field and checkpoint strategy;
-- output formats and paths;
+- output formats and paths, plus optional `outputs.bronze.namespace` and `outputs.bronze.table_name` for Iceberg bronze targets;
 - quality rules such as required fields and uniqueness keys.
 
 ## Step 4: choose the lightest extension point
@@ -164,6 +164,8 @@ Each source must define:
 - a bronze path for minimally standardized structured data;
 - a metadata path for run records, checkpoints, lineage, and validations.
 
+If `outputs.bronze.format` is `iceberg`, the source may also define `outputs.bronze.namespace` and `outputs.bronze.table_name` when the default path-derived Iceberg identifier is not the desired bronze table name.
+
 Checkpoint choices should match the family:
 
 - API sources usually checkpoint by record timestamp or field value;
@@ -206,6 +208,7 @@ Use this checklist before considering a source "added":
 - The YAML contract is complete and validated.
 - Secrets are referenced by env var name only.
 - Output paths land in raw, bronze, and metadata zones.
+- If bronze uses Iceberg, any explicit `namespace` and `table_name` are intentional and documented.
 - Checkpoint semantics are intentional, or incremental mode is disabled.
 - Existing strategy behavior was reused wherever possible.
 - Any hook is narrow, source-local, and tested.

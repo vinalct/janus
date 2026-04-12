@@ -39,7 +39,7 @@ A source definition is expected to carry these sections:
 - An `extraction` block for mode, checkpoint semantics, and retry behavior.
 - A `schema` block for infer-vs-explicit schema handling.
 - A `spark` block for input format and write behavior.
-- An `outputs` block for `raw`, `bronze`, and `metadata` targets.
+- An `outputs` block for `raw`, `bronze`, and `metadata` targets. Each target declares `path` and `format`, and Iceberg bronze targets may optionally declare `namespace` and `table_name`.
 - A `quality` block for required fields, uniqueness hints, and schema evolution behavior.
 
 Two choices are worth calling out:
@@ -58,6 +58,7 @@ The loader fails fast when it sees problems like:
 - incomplete pagination blocks;
 - incremental extraction without checkpoint details;
 - malformed output targets;
+- invalid Iceberg bronze naming fields such as `namespace` or `table_name` outside `outputs.bronze` or outside `format: iceberg`;
 - duplicate `source_id` values across files.
 
 Errors come back with dotted field paths such as `access.auth.env_var` or `outputs.raw.path`, so the fix is usually obvious from the message itself.
@@ -102,7 +103,7 @@ Start with `conf/sources/example_source.yaml`.
 Keep these rules in mind:
 
 - stay inside an existing strategy family and variant if the source really fits it;
-- keep auth, pagination, checkpointing, and outputs declarative when possible;
+- keep auth, pagination, checkpointing, and outputs declarative when possible, including Iceberg bronze naming when a source needs an explicit namespace or table name;
 - do not teach the registry about one special source;
 - if the contract feels wrong for a real source, stop and raise the design gap instead of papering over it.
 

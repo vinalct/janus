@@ -671,6 +671,8 @@ Using YAML for source onboarding gives the project:
 - easier review of source definitions;
 - a path to future automation.
 
+In the current JANUS source contract, output settings live under `outputs`, with one target each for `raw`, `bronze`, and `metadata`. Each target defines its own `path` and `format`. When `outputs.bronze.format` is `iceberg`, the bronze target may also define `namespace` and `table_name` to override the default path-derived Iceberg identifier.
+
 ### What YAML should and should not do
 YAML **should** define:
 
@@ -678,7 +680,7 @@ YAML **should** define:
 - which variant to use;
 - configurable request or file parameters;
 - checkpoint semantics;
-- output contracts;
+- output contracts, including per-zone paths and formats and optional `outputs.bronze.namespace` plus `outputs.bronze.table_name` for Iceberg bronze outputs;
 - quality rules.
 
 YAML **should not** try to encode all business logic or every custom behavior. If the source requires special treatment, that logic belongs in a strategy extension or source hook.

@@ -129,23 +129,37 @@ class StorageLayout:
         return self.resolve_target(zone, _output_target_for_zone(plan, zone))
 
 
-def bronze_table_identifier(configured_path: str, *, fallback_name: str) -> str:
+def bronze_table_identifier(
+    configured_path: str,
+    *,
+    fallback_name: str,
+    namespace: str | None = None,
+    table_name: str | None = None,
+) -> str:
     """Return the deterministic Iceberg table identifier for one bronze target."""
-    raw_parts = [part for part in Path(configured_path).parts if part not in {"", ".", "/"}]
-    normalized_parts = [_sanitize_identifier_segment(part) for part in raw_parts]
-    normalized_parts = [part for part in normalized_parts if part]
+    resolved_namespace = _sanitize_identifier_segment(namespace or ICEBERG_BRONZE_NAMESPACE)
+    if not resolved_namespace:
+        resolved_namespace = ICEBERG_BRONZE_NAMESPACE
 
-    bronze_indexes = [
-        index for index, part in enumerate(normalized_parts) if part == ICEBERG_BRONZE_NAMESPACE
-    ]
-    if bronze_indexes:
-        normalized_parts = normalized_parts[bronze_indexes[-1] + 1 :]
+    resolved_table = _sanitize_identifier_segment(table_name) if table_name else ""
+    if not resolved_table:
+        raw_parts = [part for part in Path(configured_path).parts if part not in {"", ".", "/"}]
+        normalized_parts = [_sanitize_identifier_segment(part) for part in raw_parts]
+        normalized_parts = [part for part in normalized_parts if part]
 
-    if not normalized_parts:
-        fallback = _sanitize_identifier_segment(fallback_name)
-        normalized_parts = [fallback or "dataset"]
+        bronze_indexes = [
+            index for index, part in enumerate(normalized_parts) if part == ICEBERG_BRONZE_NAMESPACE
+        ]
+        if bronze_indexes:
+            normalized_parts = normalized_parts[bronze_indexes[-1] + 1 :]
 
-    return f"{ICEBERG_BRONZE_NAMESPACE}.{ '__'.join(normalized_parts) }"
+        if not normalized_parts:
+            fallback = _sanitize_identifier_segment(fallback_name)
+            normalized_parts = [fallback or "dataset"]
+
+        resolved_table = "__".join(normalized_parts)
+
+    return f"{resolved_namespace}.{resolved_table}"
 
 
 def _output_target_for_zone(plan: ExecutionPlan, zone: str) -> OutputTarget:

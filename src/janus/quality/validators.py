@@ -407,6 +407,8 @@ def validate_materialized_outputs(
             expected_identifier = bronze_table_identifier(
                 plan.bronze_output.path,
                 fallback_name=plan.source.source_id,
+                namespace=plan.bronze_output.namespace,
+                table_name=plan.bronze_output.table_name,
             )
             if write_result.path != expected_identifier:
                 violations.append(

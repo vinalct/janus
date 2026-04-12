@@ -214,6 +214,53 @@ def test_spark_dataset_writer_preserves_path_based_parquet_bronze_when_configure
     assert NORMALIZED_COLUMNS.issubset(set(persisted.columns))
 
 
+def test_spark_dataset_writer_uses_configured_bronze_iceberg_namespace_and_table(
+    spark: SparkSession,
+    tmp_path,
+):
+    from janus.normalizers import BaseNormalizer
+
+    base_source_config = load_registry(PROJECT_ROOT).get_source("federal_open_data_example")
+    source_config = replace(
+        base_source_config,
+        outputs=replace(
+            base_source_config.outputs,
+            bronze=replace(
+                base_source_config.outputs.bronze,
+                namespace="curated",
+                table_name="named_bronze_table",
+            ),
+        ),
+    )
+    run_context = RunContext.create(
+        run_id="run-writer-bronze-named-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 9, 12, 45, tzinfo=UTC),
+    )
+    plan = ExecutionPlan.from_source_config(source_config, run_context)
+    storage_layout = _build_storage_layout(tmp_path)
+    normalizer = BaseNormalizer()
+    writer = SparkDatasetWriter(storage_layout)
+
+    dataframe = spark.createDataFrame([
+        {"id": "1", "name": "alpha"},
+        {"id": "2", "name": "beta"},
+    ])
+    normalized = normalizer.normalize(dataframe, plan)
+
+    result = writer.write(normalized, plan, "bronze", count_records=True)
+
+    assert result.zone == "bronze"
+    assert result.format == "iceberg"
+    assert result.records_written == 2
+    assert result.path == "curated.named_bronze_table"
+
+    persisted = spark.table(result.path)
+    assert persisted.count() == 2
+    assert NORMALIZED_COLUMNS.issubset(set(persisted.columns))
+
+
 def _build_plan(tmp_path: Path, *, run_id: str, started_at: datetime) -> ExecutionPlan:
     source_config = load_registry(PROJECT_ROOT).get_source("federal_open_data_example")
     run_context = RunContext.create(

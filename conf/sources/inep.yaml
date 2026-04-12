@@ -64,6 +64,8 @@ outputs:
   bronze:
     path: data/bronze/inep/censo_escolar_microdados
     format: iceberg
+    namespace: bronze_inep
+    table_name: censo_escolar_microdados
   metadata:
     path: data/metadata/inep/censo_escolar_microdados
     format: json

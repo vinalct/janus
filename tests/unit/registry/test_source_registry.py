@@ -30,6 +30,43 @@ def test_checked_in_registry_returns_typed_source_config():
     assert source.quality.required_fields == ("id", "updated_at")
 
 
+def test_registry_parses_optional_bronze_iceberg_namespace_and_table(tmp_path):
+    source_yaml = _valid_source_yaml("named_bronze_source", enabled=True).replace(
+        "  bronze:\n"
+        "    path: data/bronze/example/named_bronze_source\n"
+        "    format: iceberg\n",
+        "  bronze:\n"
+        "    path: data/bronze/example/named_bronze_source\n"
+        "    format: iceberg\n"
+        "    namespace: curated\n"
+        "    table_name: named_bronze_table\n",
+    )
+    project_root = _create_project(tmp_path, {"named.yaml": source_yaml})
+
+    source = load_registry(project_root).get_source("named_bronze_source")
+
+    assert source.outputs.bronze.namespace == "curated"
+    assert source.outputs.bronze.table_name == "named_bronze_table"
+
+
+def test_registry_rejects_legacy_bronze_table_key(tmp_path):
+    source_yaml = _valid_source_yaml("legacy_table_source", enabled=True).replace(
+        "  bronze:\n"
+        "    path: data/bronze/example/legacy_table_source\n"
+        "    format: iceberg\n",
+        "  bronze:\n"
+        "    path: data/bronze/example/legacy_table_source\n"
+        "    format: iceberg\n"
+        "    table: old_name\n",
+    )
+    project_root = _create_project(tmp_path, {"legacy.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert "outputs.bronze.table: is not supported; use table_name" in str(exc_info.value)
+
+
 def test_registry_excludes_disabled_sources_by_default(tmp_path):
     project_root = _create_project(
         tmp_path,

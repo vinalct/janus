@@ -196,7 +196,7 @@ The framework must provide a YAML-based source registry that defines, at minimum
 - access details such as URL, method, file path, or discovery pattern;
 - authentication mode when applicable;
 - extraction mode and checkpoint semantics;
-- output destinations;
+- output destinations, including optional `outputs.bronze.namespace` and `outputs.bronze.table_name` when bronze is written as Iceberg;
 - quality and schema settings;
 - operational settings such as rate limits and retries.
 

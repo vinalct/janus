@@ -12,6 +12,7 @@ from janus.planner import PlannedRun
 from janus.quality import PersistedValidationReport, ValidationCheck, ValidationReport
 from janus.registry import load_registry
 from janus.runtime import SourceExecutor
+from janus.runtime.executor import _plan_with_storage_layout_outputs
 from janus.utils.logging import build_structured_logger
 from janus.utils.storage import StorageLayout
 
@@ -308,6 +309,36 @@ def test_source_executor_records_failed_status_when_quality_validation_fails(tmp
     assert executed_run.failure_reason == "Quality validation failed: data.required_fields"
     assert executed_run.error_type == "RuntimeError"
     assert calls[-1] == "failure"
+
+
+def test_plan_with_storage_layout_outputs_preserves_bronze_namespace_and_table(tmp_path):
+    source_config = load_registry(PROJECT_ROOT).get_source("federal_open_data_example")
+    source_config = replace(
+        source_config,
+        outputs=replace(
+            source_config.outputs,
+            bronze=replace(
+                source_config.outputs.bronze,
+                namespace="curated",
+                table_name="named_bronze_table",
+            ),
+        ),
+    )
+    run_context = RunContext.create(
+        run_id="run-namespace-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 9, 12, 15, tzinfo=UTC),
+    )
+    plan = ExecutionPlan.from_source_config(source_config, run_context)
+
+    resolved_plan = _plan_with_storage_layout_outputs(plan, _storage_layout(tmp_path))
+
+    assert resolved_plan.bronze_output.path == str(
+        tmp_path / "data" / "bronze" / "example" / "federal_open_data_example"
+    )
+    assert resolved_plan.bronze_output.namespace == "curated"
+    assert resolved_plan.bronze_output.table_name == "named_bronze_table"
 
 
 def _planned_run(
