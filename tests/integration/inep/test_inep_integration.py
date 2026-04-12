@@ -16,7 +16,8 @@ from janus.quality import QualityGate, load_expected_fields_from_schema_path
 from janus.readers import SparkDatasetReader
 from janus.registry import load_registry
 from janus.strategies.files import FileStrategy
-from janus.utils.storage import StorageLayout
+from janus.utils.environment import ICEBERG_CATALOG_IMPL, ICEBERG_SESSION_EXTENSIONS
+from janus.utils.storage import StorageLayout, bronze_table_identifier
 from janus.writers import SparkDatasetWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -24,6 +25,14 @@ FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "inep"
 SOURCE_ID = "inep_censo_escolar_microdados"
 ARCHIVE_NAME = "microdados_censo_escolar_2024.zip"
 ARCHIVE_MEMBER = "microdados_censo_escolar_2024/dados/microdados_ed_basica_2024.csv"
+ICEBERG_RUNTIME_JAR = (
+    PROJECT_ROOT
+    / "data"
+    / "metadata"
+    / "ivy"
+    / "jars"
+    / "org.apache.iceberg_iceberg-spark-runtime-4.0_2.13-1.10.1.jar"
+)
 SCHEMA_FIELDS = (
     "NU_ANO_CENSO",
     "CO_ENTIDADE",
@@ -40,15 +49,27 @@ SCHEMA_FIELDS = (
 
 
 @pytest.fixture(scope="module")
-def spark():
+def spark(tmp_path_factory):
     pyspark_sql = pytest.importorskip("pyspark.sql")
+    if not ICEBERG_RUNTIME_JAR.exists():
+        pytest.skip("Iceberg runtime jar is not available in the local Ivy cache")
+    warehouse_root = tmp_path_factory.mktemp("janus-inep-iceberg")
     session = (
         pyspark_sql.SparkSession.builder.appName("janus-inep-integration")
         .master("local[1]")
+        .config("spark.jars", str(ICEBERG_RUNTIME_JAR))
+        .config("spark.sql.extensions", ICEBERG_SESSION_EXTENSIONS)
+        .config("spark.sql.defaultCatalog", "janus")
+        .config("spark.sql.catalog.janus", ICEBERG_CATALOG_IMPL)
+        .config("spark.sql.catalog.janus.type", "hadoop")
+        .config("spark.sql.catalog.janus.warehouse", str(warehouse_root / "iceberg"))
+        .config("spark.sql.catalog.janus.default-namespace", "bronze")
+        .config("spark.sql.warehouse.dir", str(warehouse_root / "spark-warehouse"))
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
+    session.sparkContext.setLogLevel("WARN")
     yield session
     session.stop()
 
@@ -80,6 +101,7 @@ def test_inep_source_contract_uses_generic_archive_file_strategy():
         "inferSchema": "true",
     }
     assert source_config.outputs.raw.format == "binary"
+    assert source_config.outputs.bronze.format == "iceberg"
     assert source_config.outputs.bronze.path == "data/bronze/inep/censo_escolar_microdados"
     assert load_expected_fields_from_schema_path(schema_path) == SCHEMA_FIELDS
 
@@ -186,7 +208,7 @@ def test_inep_archive_extracts_microdata_csv_and_materializes_bronze_and_metadat
         finished_at=datetime(2026, 4, 10, 13, 5, tzinfo=UTC),
     )
 
-    bronze_dataframe = spark.read.parquet(bronze_result.path)
+    bronze_dataframe = spark.table(bronze_result.path)
     dependency_counts = {
         row["TP_DEPENDENCIA"]: row["count"]
         for row in bronze_dataframe.groupBy("TP_DEPENDENCIA").count().collect()
@@ -194,8 +216,9 @@ def test_inep_archive_extracts_microdata_csv_and_materializes_bronze_and_metadat
 
     assert bronze_result.records_written == 3
     assert dependency_counts == {1: 1, 2: 1, 3: 1}
-    assert Path(bronze_result.path) == (
-        tmp_path / "data" / "bronze" / "inep" / "censo_escolar_microdados"
+    assert bronze_result.path == bronze_table_identifier(
+        plan.bronze_output.path,
+        fallback_name=plan.source.source_id,
     )
 
     run_payload = json.loads(started.run_metadata_path.read_text(encoding="utf-8"))

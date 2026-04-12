@@ -62,7 +62,7 @@ outputs:
     format: json
   bronze:
     path: data/bronze/transparencia/servidores_por_orgao
-    format: parquet
+    format: iceberg
   metadata:
     path: data/metadata/transparencia/servidores_por_orgao
     format: json

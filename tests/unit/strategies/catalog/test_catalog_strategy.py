@@ -510,7 +510,7 @@ def _build_source_config(
             },
             "outputs": {
                 "raw": {"path": f"data/raw/example/{source_id}", "format": "json"},
-                "bronze": {"path": f"data/bronze/example/{source_id}", "format": "parquet"},
+                "bronze": {"path": f"data/bronze/example/{source_id}", "format": "iceberg"},
                 "metadata": {"path": f"data/metadata/example/{source_id}", "format": "json"},
             },
             "quality": {"allow_schema_evolution": True},

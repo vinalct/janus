@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from janus.models.source_config import OutputTarget
 from janus.utils.environment import resolve_project_path
 
 SUPPORTED_STORAGE_ZONES = frozenset({"bronze", "metadata", "raw"})
+ICEBERG_BRONZE_NAMESPACE = "bronze"
 _CANONICAL_ZONE_PREFIXES = {
     "raw": Path("data") / "raw",
     "bronze": Path("data") / "bronze",
@@ -127,6 +129,25 @@ class StorageLayout:
         return self.resolve_target(zone, _output_target_for_zone(plan, zone))
 
 
+def bronze_table_identifier(configured_path: str, *, fallback_name: str) -> str:
+    """Return the deterministic Iceberg table identifier for one bronze target."""
+    raw_parts = [part for part in Path(configured_path).parts if part not in {"", ".", "/"}]
+    normalized_parts = [_sanitize_identifier_segment(part) for part in raw_parts]
+    normalized_parts = [part for part in normalized_parts if part]
+
+    bronze_indexes = [
+        index for index, part in enumerate(normalized_parts) if part == ICEBERG_BRONZE_NAMESPACE
+    ]
+    if bronze_indexes:
+        normalized_parts = normalized_parts[bronze_indexes[-1] + 1 :]
+
+    if not normalized_parts:
+        fallback = _sanitize_identifier_segment(fallback_name)
+        normalized_parts = [fallback or "dataset"]
+
+    return f"{ICEBERG_BRONZE_NAMESPACE}.{ '__'.join(normalized_parts) }"
+
+
 def _output_target_for_zone(plan: ExecutionPlan, zone: str) -> OutputTarget:
     if zone == "raw":
         return plan.raw_output
@@ -182,3 +203,12 @@ def _validate_zone(zone: str) -> None:
     if zone not in SUPPORTED_STORAGE_ZONES:
         allowed = ", ".join(sorted(SUPPORTED_STORAGE_ZONES))
         raise ValueError(f"zone must be one of: {allowed}")
+
+
+def _sanitize_identifier_segment(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower()).strip("_")
+    if not normalized:
+        return ""
+    if normalized[0].isdigit():
+        return f"t_{normalized}"
+    return normalized

@@ -11,6 +11,7 @@ from janus.normalizers import NORMALIZATION_METADATA_COLUMNS
 from janus.quality.models import QualityValidationError, ValidationCheck, ValidationReport
 from janus.quality.store import PersistedValidationReport, ValidationReportStore
 from janus.utils.environment import resolve_project_path
+from janus.utils.storage import bronze_table_identifier
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame
@@ -401,25 +402,35 @@ def validate_materialized_outputs(
 
     violations: list[str] = []
     for write_result in write_results:
-        expected_root = resolve_project_path(
-            plan.run_context.project_root,
-            _expected_zone_path(plan, write_result.zone),
-        )
-        materialized_path = resolve_project_path(plan.run_context.project_root, write_result.path)
-        if not materialized_path.is_relative_to(expected_root):
-            violations.append(
-                f"{write_result.zone}: path {materialized_path} must stay under {expected_root}"
+        expected_format = _expected_zone_format(plan, write_result.zone)
+        if write_result.zone == "bronze" and expected_format == "iceberg":
+            expected_identifier = bronze_table_identifier(
+                plan.bronze_output.path,
+                fallback_name=plan.source.source_id,
             )
+            if write_result.path != expected_identifier:
+                violations.append(
+                    f"{write_result.zone}: table {write_result.path!r} "
+                    f"must match configured iceberg table {expected_identifier!r}"
+                )
+        else:
+            expected_root = resolve_project_path(
+                plan.run_context.project_root,
+                _expected_zone_path(plan, write_result.zone),
+            )
+            materialized_path = resolve_project_path(plan.run_context.project_root, write_result.path)
+            if not materialized_path.is_relative_to(expected_root):
+                violations.append(
+                    f"{write_result.zone}: path {materialized_path} must stay under {expected_root}"
+                )
 
         if write_result.records_written is not None and write_result.records_written < 0:
             violations.append(f"{write_result.zone}: records_written must not be negative")
 
-        if write_result.zone != "raw" and write_result.format != _expected_zone_format(
-            plan, write_result.zone
-        ):
+        if write_result.zone != "raw" and write_result.format != expected_format:
             violations.append(
                 f"{write_result.zone}: format {write_result.format!r} "
-                f"must match configured format {_expected_zone_format(plan, write_result.zone)!r}"
+                f"must match configured format {expected_format!r}"
             )
 
     if violations:

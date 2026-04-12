@@ -64,7 +64,7 @@ outputs:
     format: json
   bronze:
     path: data/bronze/ibge/agro_abacaxi_pronaf
-    format: parquet
+    format: iceberg
   metadata:
     path: data/metadata/ibge/agro_abacaxi_pronaf
     format: json

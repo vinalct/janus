@@ -501,7 +501,7 @@ outputs:
     format: json
   bronze:
     path: data/bronze/example/{source_id}
-    format: parquet
+    format: iceberg
   metadata:
     path: data/metadata/example/{source_id}
     format: json

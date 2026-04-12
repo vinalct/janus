@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,13 +10,22 @@ import pytest
 
 from janus.models import ExecutionPlan, RunContext
 from janus.registry import load_registry
-from janus.utils.storage import StorageLayout
+from janus.utils.environment import ICEBERG_CATALOG_IMPL, ICEBERG_SESSION_EXTENSIONS
+from janus.utils.storage import StorageLayout, bronze_table_identifier
 from janus.writers import RawArtifactWriter, SparkDatasetWriter
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+ICEBERG_RUNTIME_JAR = (
+    PROJECT_ROOT
+    / "data"
+    / "metadata"
+    / "ivy"
+    / "jars"
+    / "org.apache.iceberg_iceberg-spark-runtime-4.0_2.13-1.10.1.jar"
+)
 
 NORMALIZED_COLUMNS = {
     "janus_run_id",
@@ -30,15 +40,27 @@ NORMALIZED_COLUMNS = {
 
 
 @pytest.fixture(scope="module")
-def spark():
+def spark(tmp_path_factory):
     pyspark_sql = pytest.importorskip("pyspark.sql")
+    if not ICEBERG_RUNTIME_JAR.exists():
+        pytest.skip("Iceberg runtime jar is not available in the local Ivy cache")
+    warehouse_root = tmp_path_factory.mktemp("janus-writer-iceberg")
     session = (
         pyspark_sql.SparkSession.builder.appName("janus-writer-tests")
         .master("local[1]")
+        .config("spark.jars", str(ICEBERG_RUNTIME_JAR))
+        .config("spark.sql.extensions", ICEBERG_SESSION_EXTENSIONS)
+        .config("spark.sql.defaultCatalog", "janus")
+        .config("spark.sql.catalog.janus", ICEBERG_CATALOG_IMPL)
+        .config("spark.sql.catalog.janus.type", "hadoop")
+        .config("spark.sql.catalog.janus.warehouse", str(warehouse_root / "iceberg"))
+        .config("spark.sql.catalog.janus.default-namespace", "bronze")
+        .config("spark.sql.warehouse.dir", str(warehouse_root / "spark-warehouse"))
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
+    session.sparkContext.setLogLevel("WARN")
     yield session
     session.stop()
 
@@ -128,6 +150,59 @@ def test_spark_dataset_writer_persists_bronze_output_with_normalization_columns(
     result = writer.write(normalized, plan, "bronze", count_records=True)
 
     assert result.zone == "bronze"
+    assert result.format == "iceberg"
+    assert result.records_written == 2
+    assert result.partition_by == ("ingestion_date",)
+    assert result.path == bronze_table_identifier(
+        plan.bronze_output.path,
+        fallback_name=plan.source.source_id,
+    )
+
+    persisted = spark.table(result.path)
+    assert persisted.count() == 2
+    assert NORMALIZED_COLUMNS.issubset(set(persisted.columns))
+
+    first_row = persisted.select("janus_run_id", "janus_source_id", "ingestion_date").first()
+    assert first_row.janus_run_id == "run-writer-bronze-001"
+    assert first_row.janus_source_id == "federal_open_data_example"
+    assert str(first_row.ingestion_date) == "2026-04-09"
+
+
+def test_spark_dataset_writer_preserves_path_based_parquet_bronze_when_configured(
+    spark: SparkSession,
+    tmp_path,
+):
+    from janus.normalizers import BaseNormalizer
+
+    base_source_config = load_registry(PROJECT_ROOT).get_source("federal_open_data_example")
+    source_config = replace(
+        base_source_config,
+        outputs=replace(
+            base_source_config.outputs,
+            bronze=replace(base_source_config.outputs.bronze, format="parquet"),
+        ),
+    )
+    run_context = RunContext.create(
+        run_id="run-writer-bronze-parquet-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 9, 12, 30, tzinfo=UTC),
+    )
+    plan = ExecutionPlan.from_source_config(source_config, run_context)
+    storage_layout = _build_storage_layout(tmp_path)
+    normalizer = BaseNormalizer()
+    writer = SparkDatasetWriter(storage_layout)
+
+    dataframe = spark.createDataFrame([
+        {"id": "1", "name": "alpha"},
+        {"id": "2", "name": "beta"},
+    ])
+    normalized = normalizer.normalize(dataframe, plan)
+
+    result = writer.write(normalized, plan, "bronze", count_records=True)
+
+    assert result.zone == "bronze"
+    assert result.format == "parquet"
     assert result.records_written == 2
     assert result.partition_by == ("ingestion_date",)
     assert Path(result.path) == (
@@ -137,11 +212,6 @@ def test_spark_dataset_writer_persists_bronze_output_with_normalization_columns(
     persisted = spark.read.parquet(result.path)
     assert persisted.count() == 2
     assert NORMALIZED_COLUMNS.issubset(set(persisted.columns))
-
-    first_row = persisted.select("janus_run_id", "janus_source_id", "ingestion_date").first()
-    assert first_row.janus_run_id == "run-writer-bronze-001"
-    assert first_row.janus_source_id == "federal_open_data_example"
-    assert str(first_row.ingestion_date) == "2026-04-09"
 
 
 def _build_plan(tmp_path: Path, *, run_id: str, started_at: datetime) -> ExecutionPlan:

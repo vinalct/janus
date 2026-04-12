@@ -17,7 +17,7 @@ from janus.quality import (
     load_expected_fields_from_schema_path,
 )
 from janus.registry import load_registry
-from janus.utils.environment import resolve_project_path
+from janus.utils.storage import bronze_table_identifier
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -61,7 +61,7 @@ def test_quality_gate_persists_successful_validation_report(spark: SparkSession,
         ),
         plan,
     )
-    write_result = _bronze_write_result(plan, tmp_path, records_written=2)
+    write_result = _bronze_write_result(plan, records_written=2)
 
     persisted = QualityGate(ValidationReportStore()).validate_and_store(
         plan,
@@ -181,16 +181,15 @@ def test_quality_gate_detects_output_paths_outside_the_configured_zone(tmp_path)
     )
     bad_write_result = _bronze_write_result(
         plan,
-        tmp_path,
         records_written=10,
-        path=tmp_path / "outside" / "bronze-dataset",
+        path="bronze.outside__bronze_dataset",
     )
 
     report = QualityGate().validate(plan, write_results=(bad_write_result,))
 
     assert report.is_successful is False
     assert report.failed_checks[0].name == "materialized_outputs"
-    assert "must stay under" in report.failed_checks[0].message
+    assert "must match configured iceberg table" in report.failed_checks[0].message
 
 
 def test_schema_field_loader_supports_spark_style_schema_json(tmp_path):
@@ -244,16 +243,22 @@ def _build_plan(
 
 def _bronze_write_result(
     plan: ExecutionPlan,
-    tmp_path: Path,
     *,
     records_written: int,
-    path: Path | None = None,
+    path: str | Path | None = None,
 ) -> WriteResult:
-    target_path = path or resolve_project_path(tmp_path, plan.bronze_output.path)
+    target_path = (
+        str(path)
+        if path is not None
+        else bronze_table_identifier(
+            plan.bronze_output.path,
+            fallback_name=plan.source.source_id,
+        )
+    )
     return WriteResult.from_plan(
         plan,
         "bronze",
-        path=str(target_path),
+        path=target_path,
         format_name=plan.bronze_output.format,
         mode="append",
         partition_by=("ingestion_date",),

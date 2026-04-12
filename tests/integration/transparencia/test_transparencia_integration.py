@@ -16,12 +16,21 @@ from janus.quality import QualityGate, load_expected_fields_from_schema_path
 from janus.readers import SparkDatasetReader
 from janus.registry import load_registry
 from janus.strategies.api import ApiResponse, ApiStrategy
-from janus.utils.storage import StorageLayout
+from janus.utils.environment import ICEBERG_CATALOG_IMPL, ICEBERG_SESSION_EXTENSIONS
+from janus.utils.storage import StorageLayout, bronze_table_identifier
 from janus.writers import SparkDatasetWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "transparencia"
 SOURCE_ID = "transparencia_servidores_por_orgao"
+ICEBERG_RUNTIME_JAR = (
+    PROJECT_ROOT
+    / "data"
+    / "metadata"
+    / "ivy"
+    / "jars"
+    / "org.apache.iceberg_iceberg-spark-runtime-4.0_2.13-1.10.1.jar"
+)
 
 
 @dataclass(slots=True)
@@ -51,15 +60,27 @@ class FixtureTransport:
 
 
 @pytest.fixture(scope="module")
-def spark():
+def spark(tmp_path_factory):
     pyspark_sql = pytest.importorskip("pyspark.sql")
+    if not ICEBERG_RUNTIME_JAR.exists():
+        pytest.skip("Iceberg runtime jar is not available in the local Ivy cache")
+    warehouse_root = tmp_path_factory.mktemp("janus-transparencia-iceberg")
     session = (
         pyspark_sql.SparkSession.builder.appName("janus-transparencia-integration")
         .master("local[1]")
+        .config("spark.jars", str(ICEBERG_RUNTIME_JAR))
+        .config("spark.sql.extensions", ICEBERG_SESSION_EXTENSIONS)
+        .config("spark.sql.defaultCatalog", "janus")
+        .config("spark.sql.catalog.janus", ICEBERG_CATALOG_IMPL)
+        .config("spark.sql.catalog.janus.type", "hadoop")
+        .config("spark.sql.catalog.janus.warehouse", str(warehouse_root / "iceberg"))
+        .config("spark.sql.catalog.janus.default-namespace", "bronze")
+        .config("spark.sql.warehouse.dir", str(warehouse_root / "spark-warehouse"))
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
+    session.sparkContext.setLogLevel("WARN")
     yield session
     session.stop()
 
@@ -81,6 +102,7 @@ def test_transparencia_source_contract_uses_safe_api_settings():
     assert source_config.access.rate_limit.concurrency == 1
     assert source_config.extraction.mode == "snapshot"
     assert source_config.extraction.checkpoint_strategy == "none"
+    assert source_config.outputs.bronze.format == "iceberg"
     assert load_expected_fields_from_schema_path(schema_path) == (
         "qntPessoas",
         "qntVinculos",
@@ -209,10 +231,11 @@ def test_transparencia_source_extracts_raw_pages_and_materializes_bronze_and_met
         finished_at=datetime(2026, 4, 9, 15, 5, tzinfo=UTC),
     )
 
-    bronze_dataframe = spark.read.parquet(bronze_result.path)
+    bronze_dataframe = spark.table(bronze_result.path)
     assert bronze_dataframe.count() == 3
-    assert Path(bronze_result.path) == (
-        tmp_path / "data" / "bronze" / "transparencia" / "servidores_por_orgao"
+    assert bronze_result.path == bronze_table_identifier(
+        plan.bronze_output.path,
+        fallback_name=plan.source.source_id,
     )
 
     run_payload = json.loads(started.run_metadata_path.read_text(encoding="utf-8"))

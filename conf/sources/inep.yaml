@@ -63,7 +63,7 @@ outputs:
     format: binary
   bronze:
     path: data/bronze/inep/censo_escolar_microdados
-    format: parquet
+    format: iceberg
   metadata:
     path: data/metadata/inep/censo_escolar_microdados
     format: json

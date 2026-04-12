@@ -62,7 +62,7 @@ outputs:
     format: json
   bronze:
     path: data/bronze/ibge/pib_brasil
-    format: parquet
+    format: iceberg
   metadata:
     path: data/metadata/ibge/pib_brasil
     format: json
