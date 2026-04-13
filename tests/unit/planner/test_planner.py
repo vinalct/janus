@@ -120,7 +120,7 @@ def test_planner_builds_execution_plan_from_checked_in_source():
         "trigger": "unit-test",
     }
     assert planned_run.pre_run_metadata_as_dict()["source_config_path"].endswith(
-        "conf/sources/example_source.yaml"
+        "conf/sources/example/example_source.yaml"
     )
     assert planned_run.pre_run_metadata_as_dict()["raw_output_path"] == (
         "data/raw/example/federal_open_data_example"

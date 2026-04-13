@@ -32,9 +32,9 @@ from janus.writers import SparkDatasetWriter
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "ibge"
 PIB_SOURCE_ID = "ibge_pib_brasil"
-PIB_CONFIG_FILE = "ibge.yaml"
+PIB_CONFIG_FILE = "ibge/sidra.yaml"
 AGRO_SOURCE_ID = "ibge_agro_abacaxi_pronaf"
-AGRO_CONFIG_FILE = "ibge_agro_abacaxi_pronaf.yaml"
+AGRO_CONFIG_FILE = "ibge/sidra.yaml"
 ICEBERG_RUNTIME_JAR = (
     PROJECT_ROOT
     / "data"
@@ -657,6 +657,12 @@ def _cloned_source_config(tmp_path: Path, source_id: str, config_file_name: str)
     copied_config_path.parent.mkdir(parents=True, exist_ok=True)
 
     config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if "sources" in config_payload:
+        config_payload = next(
+            entry
+            for entry in config_payload["sources"]
+            if entry.get("source_id") == source_id
+        )
     copied_config_path.write_text(
         yaml.safe_dump(config_payload, sort_keys=False),
         encoding="utf-8",

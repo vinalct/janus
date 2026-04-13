@@ -1,0 +1,78 @@
+sources:
+
+  - source_id: transparencia__emendas_parlamentares__emendas
+    name: Portal da Transparencia - Emendas parlamentares - Emendas
+    description: 
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - servidores
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/emendas
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 120
+        concurrency: 4
+        backoff_seconds: 10
+
+    extraction:
+      mode: snapshot
+      checkpoint_strategy: none
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 2
+
+    schema:
+      mode: infer
+
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/emendas_parlamentares__emendas
+        format: json
+      bronze:
+        path: data/bronze/transparencia/emendas_parlamentares__emendas
+        format: iceberg
+        namespace: bronze_transparencia
+        table_name: emendas_parlamentares__emendas
+      metadata:
+        path: data/metadata/transparencia/emendas_parlamentares__emendas
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true

@@ -6,7 +6,7 @@ The source itself is simple on paper: INEP publishes the Censo Escolar microdata
 
 ## What was delivered
 
-The new source is defined in `conf/sources/inep.yaml` as `inep_censo_escolar_microdados`.
+The new source is defined in `conf/sources/inep/inep.yaml` as `inep_censo_escolar_microdados`.
 
 It is intentionally modeled as:
 

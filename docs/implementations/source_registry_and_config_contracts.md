@@ -12,7 +12,7 @@ This is the point where source onboarding starts to look like framework work ins
 - `src/janus/registry/loader.py` loads the app config, discovers source files, validates them, and returns typed objects.
 - `tests/unit/registry/` covers the main happy path and the failure cases that matter for onboarding.
 
-There is also one checked-in example source file at `conf/sources/example_source.yaml`.
+There is also one checked-in example source file at `conf/sources/example/example_source.yaml`.
 
 That file is intentionally not a live integration. It points to `example.invalid` on purpose. The goal here was to lock down the contract shape first, not to sneak source-specific behavior into the registry.
 
@@ -22,8 +22,8 @@ The registry flow is small by design:
 
 1. Load `conf/app.yaml`.
 2. Read the `registry.sources_dir` setting.
-3. Discover matching YAML files under that directory.
-4. Parse each file into a `SourceConfig`.
+3. Discover matching YAML files under that directory recursively.
+4. Parse each file into one `SourceConfig` or a grouped `sources:` list of `SourceConfig` entries.
 5. Reject the load immediately if any file is malformed.
 6. Expose a typed registry API to the next layer.
 
@@ -98,7 +98,7 @@ From there, downstream code works with typed objects instead of raw dictionaries
 
 ## If you are adding the next source
 
-Start with `conf/sources/example_source.yaml`.
+Start with `conf/sources/example/example_source.yaml`.
 
 Keep these rules in mind:
 

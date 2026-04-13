@@ -8,8 +8,8 @@ The IBGE integration fits the JANUS API strategy family, but it also introduces 
 
 The delivery includes two IBGE sources:
 
-- `ibge_pib_brasil` in `conf/sources/ibge.yaml`
-- `ibge_agro_abacaxi_pronaf` in `conf/sources/ibge_agro_abacaxi_pronaf.yaml`
+- `ibge_pib_brasil` in `conf/sources/ibge/sidra.yaml`
+- `ibge_agro_abacaxi_pronaf` in `conf/sources/ibge/sidra.yaml`
 
 Both sources are modeled as:
 

@@ -29,7 +29,7 @@ JANUS is not:
 The source registry starts with two checked-in configuration roots:
 
 - `conf/app.yaml` points JANUS at the source-definition directory.
-- `conf/sources/*.yaml` holds one source contract per file.
+- `conf/sources/**/*.yaml` holds domain-organized source files; each file may contain one source contract or a top-level `sources:` list.
 
 `janus.registry.loader` reads those files, validates them, and returns typed `SourceConfig` objects. Validation happens here on purpose so later layers do not have to parse raw YAML or guess at nested config structure.
 

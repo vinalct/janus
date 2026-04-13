@@ -28,6 +28,66 @@ def test_checked_in_registry_returns_typed_source_config():
     assert source.access.auth.type == "header_token"
     assert source.outputs.bronze.path == "data/bronze/example/federal_open_data_example"
     assert source.quality.required_fields == ("id", "updated_at")
+    assert str(source.config_path).endswith("conf/sources/example/example_source.yaml")
+
+
+def test_registry_discovers_sources_in_nested_domain_directories(tmp_path):
+    project_root = _create_project(
+        tmp_path,
+        {
+            "ibge/pib.yaml": _valid_source_yaml("ibge_pib_brasil", enabled=True),
+            "inep/censo.yaml": _valid_source_yaml("inep_censo_escolar", enabled=True),
+        },
+    )
+
+    registry = load_registry(project_root)
+
+    assert [source.source_id for source in registry.list_sources()] == [
+        "ibge_pib_brasil",
+        "inep_censo_escolar",
+    ]
+
+
+def test_registry_loads_multiple_sources_from_one_grouped_yaml_file(tmp_path):
+    project_root = _create_project(
+        tmp_path,
+        {
+            "ibge/sidra.yaml": _grouped_sources_yaml(
+                _valid_source_yaml("ibge_pib_brasil", enabled=True),
+                _valid_source_yaml("ibge_agro_abacaxi_pronaf", enabled=True),
+            )
+        },
+    )
+
+    registry = load_registry(project_root)
+
+    assert [source.source_id for source in registry.list_sources()] == [
+        "ibge_pib_brasil",
+        "ibge_agro_abacaxi_pronaf",
+    ]
+
+
+def test_grouped_source_yaml_prefixes_validation_errors_with_entry_index(tmp_path):
+    broken_yaml = _valid_source_yaml("broken_grouped_source", enabled=True).replace(
+        "strategy_variant: page_number_api\n",
+        "strategy_variant: not_real\n",
+        1,
+    )
+    project_root = _create_project(
+        tmp_path,
+        {
+            "ibge/sidra.yaml": _grouped_sources_yaml(
+                _valid_source_yaml("valid_grouped_source", enabled=True),
+                broken_yaml,
+            )
+        },
+    )
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    message = str(exc_info.value)
+    assert "sources[1].strategy_variant: must be one of" in message
 
 
 def test_registry_parses_optional_bronze_iceberg_namespace_and_table(tmp_path):
@@ -213,8 +273,25 @@ def _create_project(tmp_path: Path, sources: dict[str, str]) -> Path:
         encoding="utf-8",
     )
     for file_name, content in sources.items():
-        (sources_dir / file_name).write_text(content.lstrip(), encoding="utf-8")
+        file_path = sources_dir / file_name
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content.lstrip(), encoding="utf-8")
     return tmp_path
+
+
+def _grouped_sources_yaml(*source_yamls: str) -> str:
+    entries = "\n".join(_as_grouped_entry(source_yaml) for source_yaml in source_yamls)
+    return f"sources:\n{entries}\n"
+
+
+def _as_grouped_entry(source_yaml: str) -> str:
+    lines = source_yaml.strip().splitlines()
+    if not lines:
+        return "  - {}"
+
+    rendered = [f"  - {lines[0]}"]
+    rendered.extend(f"    {line}" if line else "" for line in lines[1:])
+    return "\n".join(rendered)
 
 
 def _valid_source_yaml(source_id: str, *, enabled: bool) -> str:

@@ -261,7 +261,7 @@ def test_transparencia_source_extracts_raw_pages_and_materializes_bronze_and_met
 
 def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
     source_config = load_registry(PROJECT_ROOT).get_source(SOURCE_ID, include_disabled=True)
-    config_path = PROJECT_ROOT / "conf" / "sources" / "transparencia.yaml"
+    config_path = PROJECT_ROOT / "conf" / "sources" / "transparencia" / "transparencia.yaml"
     schema_path = (
         PROJECT_ROOT
         / "conf"
@@ -270,7 +270,7 @@ def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
         / "servidores_por_orgao_schema.json"
     )
 
-    copied_config_path = tmp_path / "conf" / "sources" / "transparencia.yaml"
+    copied_config_path = tmp_path / "conf" / "sources" / "transparencia" / "transparencia.yaml"
     copied_schema_path = (
         tmp_path
         / "conf"

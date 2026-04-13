@@ -284,12 +284,12 @@ def _build_fixture_archive(tmp_path: Path) -> Path:
 
 def _cloned_source_config(tmp_path: Path, *, archive_path: Path) -> SourceConfig:
     source_config = load_registry(PROJECT_ROOT).get_source(SOURCE_ID, include_disabled=True)
-    config_path = PROJECT_ROOT / "conf" / "sources" / "inep.yaml"
+    config_path = PROJECT_ROOT / "conf" / "sources" / "inep" / "inep.yaml"
     schema_path = (
         PROJECT_ROOT / "conf" / "schemas" / "inep" / "censo_escolar_microdados_schema.json"
     )
 
-    copied_config_path = tmp_path / "conf" / "sources" / "inep.yaml"
+    copied_config_path = tmp_path / "conf" / "sources" / "inep" / "inep.yaml"
     copied_schema_path = (
         tmp_path / "conf" / "schemas" / "inep" / "censo_escolar_microdados_schema.json"
     )

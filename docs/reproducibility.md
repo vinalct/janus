@@ -35,7 +35,7 @@ The companion example env files are:
 - `conf/environments/local.env.example`
 - `conf/environments/cluster.env.example`
 
-The source registry path is configured separately in `conf/app.yaml`, and the example source contract lives in `conf/sources/example_source.yaml`.
+The source registry path is configured separately in `conf/app.yaml`, and the example source contract lives in `conf/sources/example/example_source.yaml`. The registry scans that tree recursively, so provider folders under `conf/sources/` are part of the supported layout.
 
 ## Data layout and runtime paths
 
@@ -258,7 +258,7 @@ If you are comparing runs across environments, compare:
 
 A few facts are important for anyone reproducing the project today:
 
-- `conf/sources/example_source.yaml` is a contract example, not a live integration. Its URL points to `example.invalid` on purpose.
+- `conf/sources/example/example_source.yaml` is a contract example, not a live integration. Its URL points to `example.invalid` on purpose.
 - Some Spark-backed tests are skipped automatically when `pyspark` is not available outside the container runtime.
 - The containerized workflow is the most stable path because it already pins Python, Java, and dependency installation in one place.
 

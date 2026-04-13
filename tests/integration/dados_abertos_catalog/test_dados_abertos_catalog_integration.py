@@ -345,7 +345,7 @@ def test_dados_abertos_catalog_extracts_catalog_entities_and_materializes_bronze
 
 def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
     source_config = load_registry(PROJECT_ROOT).get_source(SOURCE_ID, include_disabled=True)
-    config_path = PROJECT_ROOT / "conf" / "sources" / "dados_abertos_catalog.yaml"
+    config_path = PROJECT_ROOT / "conf" / "sources" / "dados_abertos_catalog" / "dados_abertos_catalog.yaml"
     schema_path = (
         PROJECT_ROOT
         / "conf"
@@ -354,7 +354,7 @@ def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
         / "catalog_metadata_schema.json"
     )
 
-    copied_config_path = tmp_path / "conf" / "sources" / "dados_abertos_catalog.yaml"
+    copied_config_path = tmp_path / "conf" / "sources" / "dados_abertos_catalog" / "dados_abertos_catalog.yaml"
     copied_schema_path = (
         tmp_path
         / "conf"

@@ -25,7 +25,7 @@ Deeper context: [PRD](docs/PRD.md), [foundation](docs/foundation.md), and [archi
 
 ## How It Works
 
-1. A source is declared in `conf/sources/*.yaml`.
+1. A source is declared in a YAML file under `conf/sources/`, optionally grouped by domain folders and a top-level `sources:` list.
 2. The registry validates the contract and loads a typed configuration.
 3. The planner resolves the strategy family, variant, and optional hook.
 4. The strategy extracts the source and preserves raw artifacts.

@@ -1,0 +1,156 @@
+sources:
+
+  - source_id: transparencia__poder_executivo_federal__servidores_por_orgao
+    name: Portal da Transparencia - Servidores agregados por orgao
+    description: Snapshot ingestion of aggregated federal executive servidor counts by orgao from the Portal da Transparencia API.
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - servidores
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/servidores/por-orgao
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 120
+        concurrency: 4
+        backoff_seconds: 10
+
+    extraction:
+      mode: snapshot
+      checkpoint_strategy: none
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 2
+
+    schema:
+      mode: explicit
+      path: conf/schemas/transparencia/servidores_por_orgao_schema.json
+
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/poder_executivo_federal__servidores_por_orgao
+        format: json
+      bronze:
+        path: data/bronze/transparencia/poder_executivo_federal__servidores_por_orgao
+        format: iceberg
+        namespace: bronze_transparencia
+        table_name: poder_executivo_federal__servidores_por_orgao
+      metadata:
+        path: data/metadata/transparencia/poder_executivo_federal__servidores_por_orgao
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true
+
+  - source_id: transparencia__poder_executivo_federal__servidores 
+    name: Portal da Transparencia - Servidores do Poder Executivo Federal
+    description: 
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - servidores
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/servidores
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 120
+        concurrency: 2
+        backoff_seconds: 10
+
+    extraction:
+      mode: snapshot
+      checkpoint_strategy: none
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 2
+
+    schema:
+      mode: infer
+      
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/poder_executivo_federal__servidores
+        format: json
+      bronze:
+        path: data/bronze/transparencia/poder_executivo_federal__servidores
+        format: iceberg
+        namespace: bronze_transparencia
+        table_name: poder_executivo_federal__servidores
+      metadata:
+        path: data/metadata/transparencia/poder_executivo_federal__servidores
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true
