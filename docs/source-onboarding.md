@@ -67,7 +67,33 @@ If you cannot classify the source cleanly, stop there. Do not start coding until
 
 ## Step 2: start from the existing contract
 
-Use `conf/sources/example_source.yaml` as the template for new source definitions.
+Use `conf/sources/example/example_source.yaml` as the template for new source definitions.
+
+Registry discovery is recursive, so files like `conf/sources/ibge/sidra.yaml` are valid. When one provider file needs several endpoint-backed source contracts, declare them under a top-level `sources:` list.
+
+There are two valid top-level shapes:
+
+1. One source per file.
+
+```yaml
+source_id: transparencia_servidores_por_orgao
+name: Portal da Transparencia - Servidores agregados por orgao
+...
+```
+
+2. Several source entries in one provider file.
+
+```yaml
+sources:
+  - source_id: ibge_pib_brasil
+    name: IBGE - PIB nacional a precos correntes
+    ...
+  - source_id: ibge_agro_abacaxi_pronaf
+    name: IBGE - Quantidade produzida de abacaxi
+    ...
+```
+
+Important detail: `sources:` must contain a YAML list. Each entry starts with `-`. If you repeat keys like `source_id`, `access`, or `outputs` under one mapping instead of using a list item, the file is invalid YAML.
 
 Every source should define:
 
@@ -81,6 +107,80 @@ Every source should define:
 - the `quality` block.
 
 Keep `source_type` and `strategy` aligned. In the current JANUS design, family and strategy are the same concept.
+
+### What The Main Blocks Currently Support
+
+The registry contract is intentionally small. The most important current options are:
+
+### `access`
+
+- API and catalog sources require `access.base_url` or `access.url`.
+- File sources require `access.url`, `access.path`, or `access.discovery_pattern`.
+- `access.format` must match the payload you expect JANUS to fetch, such as `json`, `jsonl`, `csv`, `parquet`, `text`, or `binary`.
+- `access.method` must be a supported HTTP method such as `GET` or `POST`.
+- `access.auth.type` controls auth shape. Supported values today are `none`, `header_token`, `bearer_token`, `query_token`, and `basic`.
+- `access.pagination.type` must match the chosen family variant when pagination is used: `page_number`, `offset`, `cursor`, or `none`.
+- `access.rate_limit` carries `requests_per_minute`, optional `backoff_seconds`, and optional `concurrency`.
+
+### `extraction`
+
+- `extraction.mode` is one of `full_refresh`, `snapshot`, or `incremental`.
+- `extraction.retry` currently supports `max_attempts`, `backoff_strategy`, and `backoff_seconds`.
+- `extraction.checkpoint_field` and `extraction.checkpoint_strategy` matter only when the source is incremental.
+- `extraction.checkpoint_strategy` is one of `none`, `max_value`, or `date_window`.
+- `extraction.lookback_days` is optional and only matters when incremental checkpoint values are time-based.
+
+Practical rule: if `extraction.mode` is `incremental`, define a real `checkpoint_field` and use a checkpoint strategy other than `none`.
+
+### `schema`
+
+The `schema` block is narrower than it may look at first glance. Today it supports only:
+
+- `mode`
+- `path`
+
+Supported values are:
+
+- `mode: infer`
+- `mode: explicit`
+
+Examples:
+
+```yaml
+schema:
+  mode: infer
+```
+
+```yaml
+schema:
+  mode: explicit
+  path: conf/schemas/transparencia/servidores_por_orgao_schema.json
+```
+
+If `mode` is `explicit`, `path` is required. JANUS does not currently support inline field definitions, inline types, or other schema metadata in the source YAML.
+
+### `spark`
+
+- `spark.input_format` tells JANUS how the normalization handoff should be read.
+- `spark.write_mode` is one of `append`, `overwrite`, or `ignore`.
+- `spark.repartition` is optional.
+- `spark.partition_by` is an optional list of partition columns.
+- `spark.read_options` is an optional string-to-string mapping for reader options such as CSV header, separator, or encoding.
+
+### `outputs`
+
+- Each source defines `outputs.raw`, `outputs.bronze`, and `outputs.metadata`.
+- Each output target must define `path` and `format`.
+- Only `outputs.bronze` may define `namespace` and `table_name`.
+- `namespace` and `table_name` are only valid when `outputs.bronze.format` is `iceberg`.
+
+### `quality`
+
+- `quality.required_fields` is an optional list of fields that must be present.
+- `quality.unique_fields` is an optional list of uniqueness hints.
+- `quality.allow_schema_evolution` is a boolean flag.
+
+If you are unsure whether a field belongs in config, check the example source and the typed contract before inventing a new key.
 
 ## Step 3: prefer config reuse over code
 
