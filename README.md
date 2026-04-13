@@ -1,3 +1,6 @@
+
+![alt text](janus.png)
+
 # JANUS
 
 JANUS is a metadata-driven Apache Spark framework for ingesting Brazilian federal open data in a reproducible, safe, and extensible way.
