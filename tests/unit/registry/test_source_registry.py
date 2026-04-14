@@ -5,7 +5,6 @@ import pytest
 from janus.models.source_config import SourceConfig, SourceConfigValidationError
 from janus.registry import SourceNotFoundError, load_registry
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -349,7 +348,7 @@ def test_registry_rejects_request_input_bindings_without_request_inputs(tmp_path
         load_registry(project_root)
 
     assert (
-        "access.parameter_bindings.mesAno.from: requires access.request_inputs to declare a non-'none' type"
+        "access.parameter_bindings.mesAno.from: requires access.request_inputs to declare a non-'none' type"  # noqa: E501
         in str(exc_info.value)
     )
 
@@ -379,7 +378,7 @@ def test_registry_rejects_duplicate_static_and_bound_request_params(tmp_path):
         load_registry(project_root)
 
     assert (
-        "access.parameter_bindings.id: duplicates access.params.id; declare the parameter in only one place"
+        "access.parameter_bindings.id: duplicates access.params.id; declare the parameter in only one place"  # noqa: E501
         in str(exc_info.value)
     )
 
@@ -473,3 +472,96 @@ outputs:
 quality:
   allow_schema_evolution: true
 """
+
+
+def test_registry_rejects_invalid_date_window_request_inputs(tmp_path):
+    source_yaml = _valid_source_yaml("broken_window_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: date_window\n"
+        "    start: not-a-date\n"
+        "    step: year\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"broken_window.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    message = str(exc_info.value)
+    assert "access.request_inputs.start: must be a YYYY-MM-DD date" in message
+    assert "access.request_inputs.end: is required" in message
+    assert "access.request_inputs.step: must be one of: day, month" in message
+
+
+def test_registry_rejects_invalid_iceberg_request_inputs(tmp_path):
+    source_yaml = _valid_source_yaml("broken_iceberg_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: iceberg_rows\n"
+        "    namespace: bronze_transparencia\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"broken_iceberg.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    message = str(exc_info.value)
+    assert "access.request_inputs.table_name: is required" in message
+    assert "access.request_inputs.columns: is required" in message
+
+
+def test_registry_rejects_unsupported_parameter_binding_source(tmp_path):
+    source_yaml = _valid_source_yaml("unsupported_binding_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  parameter_bindings:\n"
+        "    id:\n"
+        "      from: runtime.identifier\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"unsupported_binding.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert (
+        "access.parameter_bindings.id.from: must be 'checkpoint_value', "
+        "'request_input.window_start', 'request_input.window_end', or "
+        "'request_input.<field>'" in str(exc_info.value)
+    )
+
+
+def test_registry_rejects_request_input_bindings_when_request_inputs_are_invalid(tmp_path):
+    source_yaml = _valid_source_yaml("invalid_request_input_type_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: unsupported\n"
+        "  parameter_bindings:\n"
+        "    id:\n"
+        "      from: request_input.emenda_id\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"invalid_request_inputs.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    message = str(exc_info.value)
+    assert "access.request_inputs.type: must be one of: date_window, iceberg_rows, none" in message
+    assert (
+        "access.parameter_bindings.id.from: requires access.request_inputs to declare a non-'none' type"  # noqa: E501
+        in message
+    )
