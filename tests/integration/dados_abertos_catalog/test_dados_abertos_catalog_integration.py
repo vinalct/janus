@@ -320,6 +320,8 @@ def test_dados_abertos_catalog_extracts_catalog_entities_and_materializes_bronze
     assert bronze_result.path == bronze_table_identifier(
         plan.bronze_output.path,
         fallback_name=plan.source.source_id,
+        namespace=plan.bronze_output.namespace,
+        table_name=plan.bronze_output.table_name,
     )
 
     run_payload = json.loads(started.run_metadata_path.read_text(encoding="utf-8"))

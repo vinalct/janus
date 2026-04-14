@@ -329,6 +329,8 @@ def test_ibge_pib_source_extracts_raw_response_and_normalizes_dynamic_dimensions
     assert bronze_result.path == bronze_table_identifier(
         run["plan"].bronze_output.path,
         fallback_name=run["plan"].source.source_id,
+        namespace=run["plan"].bronze_output.namespace,
+        table_name=run["plan"].bronze_output.table_name,
     )
 
     run_payload = json.loads(started.run_metadata_path.read_text(encoding="utf-8"))

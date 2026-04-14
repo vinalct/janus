@@ -278,6 +278,51 @@ def test_planner_reports_missing_hook_binding(tmp_path):
         )
 
 
+def test_planner_carries_request_input_contract_forward_without_changing_dispatch(tmp_path):
+    source_yaml = _source_yaml("parameterized_source", variant="page_number_api").replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: date_window\n"
+        "    start: 2025-01-01\n"
+        "    end: 2025-03-31\n"
+        "    step: month\n"
+        "  parameter_bindings:\n"
+        "    mesAno:\n"
+        "      from: request_input.window_end\n"
+        "      format: \"%Y%m\"\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, source_yaml)
+
+    planned_run = Planner().plan(
+        PlanningRequest.create(
+            source_id="parameterized_source",
+            environment="local",
+            project_root=project_root,
+            run_id="run-parameterized-001",
+            started_at=datetime(2026, 4, 8, 14, 15, tzinfo=UTC),
+        )
+    )
+
+    assert planned_run.dispatch_path == "api.page_number_api"
+    assert planned_run.plan.source_config.access.request_inputs.type == "date_window"
+    assert planned_run.plan.source_config.access.request_inputs.start.isoformat() == "2025-01-01"
+    assert planned_run.plan.source_config.access.request_inputs.end.isoformat() == "2025-03-31"
+    assert planned_run.plan.source_config.access.parameter_bindings is not None
+    assert (
+        planned_run.plan.source_config.access.parameter_bindings["mesAno"].from_
+        == "request_input.window_end"
+    )
+    assert planned_run.plan.notes == (
+        "strategy_family:api",
+        "strategy_variant:page_number_api",
+        "dispatch:api.page_number_api",
+    )
+
+
 def test_planner_can_include_disabled_source_when_requested(tmp_path):
     project_root = _create_project(
         tmp_path,

@@ -63,29 +63,15 @@ class IbgeSidraFlatHook(ApiHook):
         plan: ExecutionPlan,
         extraction_result: ExtractionResult,
     ) -> ExtractionResult:
-        normalized_records: list[Mapping[str, Any]] = []
-        attribute_keys: set[str] = set()
-        dimension_ids: set[str] = set()
-        for artifact in extraction_result.artifacts:
-            payload = _load_json_artifact(artifact)
-            page_records = normalize_sidra_flat_payload(payload, aggregate_id=_aggregate_id(plan))
-            normalized_records.extend(page_records)
-            for record in page_records:
-                for attribute in record.get("sidra_attributes", ()):  # type: ignore[arg-type]
-                    attribute_key = str(attribute.get("key", "")).strip()
-                    if attribute_key:
-                        attribute_keys.add(attribute_key)
-                for dimension in record.get("sidra_dimensions", ()):  # type: ignore[arg-type]
-                    dimension_id = str(dimension.get("id", "")).strip()
-                    if dimension_id:
-                        dimension_ids.add(dimension_id)
+        normalized_records, attribute_keys, dimension_ids = _collect_sidra_projection_details(
+            plan,
+            extraction_result.artifacts,
+        )
 
         metadata = extraction_result.metadata_as_dict()
         metadata["ibge_normalized_record_count"] = str(len(normalized_records))
-        metadata["ibge_sidra_attribute_keys"] = ",".join(sorted(attribute_keys))
-        metadata["ibge_sidra_dimension_ids"] = ",".join(
-            sorted(dimension_ids, key=_dimension_sort_key)
-        )
+        metadata["ibge_sidra_attribute_keys"] = attribute_keys
+        metadata["ibge_sidra_dimension_ids"] = dimension_ids
 
         if not normalized_records:
             metadata["ibge_normalized_artifact_count"] = "0"
@@ -115,6 +101,18 @@ class IbgeSidraFlatHook(ApiHook):
     ) -> Mapping[str, Any]:
         del write_results
         metadata = extraction_result.metadata_as_dict()
+        attribute_keys = metadata.get("ibge_sidra_attribute_keys", "")
+        dimension_ids = metadata.get("ibge_sidra_dimension_ids", "")
+        if not attribute_keys or not dimension_ids:
+            _, derived_attribute_keys, derived_dimension_ids = _collect_sidra_projection_details(
+                plan,
+                extraction_result.artifacts,
+            )
+            if not attribute_keys:
+                attribute_keys = derived_attribute_keys
+            if not dimension_ids:
+                dimension_ids = derived_dimension_ids
+
         return {
             "ibge_hook": _configured_hook_id(plan),
             "ibge_aggregate_id": _aggregate_id(plan),
@@ -126,9 +124,41 @@ class IbgeSidraFlatHook(ApiHook):
             "ibge_reused_api_features": (
                 "http_client,retries,rate_limit,raw_writer,checkpointing"
             ),
-            "ibge_sidra_attribute_keys": metadata.get("ibge_sidra_attribute_keys", ""),
-            "ibge_sidra_dimension_ids": metadata.get("ibge_sidra_dimension_ids", ""),
+            "ibge_sidra_attribute_keys": attribute_keys,
+            "ibge_sidra_dimension_ids": dimension_ids,
         }
+
+
+def _collect_sidra_projection_details(
+    plan: ExecutionPlan,
+    artifacts: Sequence[ExtractedArtifact],
+) -> tuple[list[Mapping[str, Any]], str, str]:
+    normalized_records: list[Mapping[str, Any]] = []
+    attribute_keys: set[str] = set()
+    dimension_ids: set[str] = set()
+
+    for artifact in artifacts:
+        if artifact.format != "json":
+            continue
+
+        payload = _load_json_artifact(artifact)
+        page_records = normalize_sidra_flat_payload(payload, aggregate_id=_aggregate_id(plan))
+        normalized_records.extend(page_records)
+        for record in page_records:
+            for attribute in record.get("sidra_attributes", ()):  # type: ignore[arg-type]
+                attribute_key = str(attribute.get("key", "")).strip()
+                if attribute_key:
+                    attribute_keys.add(attribute_key)
+            for dimension in record.get("sidra_dimensions", ()):  # type: ignore[arg-type]
+                dimension_id = str(dimension.get("id", "")).strip()
+                if dimension_id:
+                    dimension_ids.add(dimension_id)
+
+    return (
+        normalized_records,
+        ",".join(sorted(attribute_keys)),
+        ",".join(sorted(dimension_ids, key=_dimension_sort_key)),
+    )
 
 
 IbgePibBrasilHook = IbgeSidraFlatHook

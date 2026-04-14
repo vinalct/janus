@@ -26,6 +26,8 @@ def test_checked_in_registry_returns_typed_source_config():
     assert source.strategy == "api"
     assert source.strategy_variant == "page_number_api"
     assert source.access.auth.type == "header_token"
+    assert source.access.request_inputs.type == "none"
+    assert source.access.parameter_bindings is None
     assert source.outputs.bronze.path == "data/bronze/example/federal_open_data_example"
     assert source.quality.required_fields == ("id", "updated_at")
     assert str(source.config_path).endswith("conf/sources/example/example_source.yaml")
@@ -262,6 +264,124 @@ def test_duplicate_source_ids_fail_fast(tmp_path):
 
     with pytest.raises(ValueError, match="Duplicate source_id 'duplicate_source'"):
         load_registry(project_root)
+
+
+def test_registry_parses_date_window_request_inputs_and_parameter_bindings(tmp_path):
+    source_yaml = _valid_source_yaml("windowed_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  params:\n"
+        "    situacao: TODAS\n"
+        "  request_inputs:\n"
+        "    type: date_window\n"
+        "    start: 2025-01-01\n"
+        "    end: 2025-12-31\n"
+        "    step: month\n"
+        "  parameter_bindings:\n"
+        "    mesAno:\n"
+        "      from: request_input.window_end\n"
+        "      format: \"%Y%m\"\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"windowed.yaml": source_yaml})
+
+    source = load_registry(project_root).get_source("windowed_source")
+
+    assert source.access.params == {"situacao": "TODAS"}
+    assert source.access.request_inputs.type == "date_window"
+    assert source.access.request_inputs.start.isoformat() == "2025-01-01"
+    assert source.access.request_inputs.end.isoformat() == "2025-12-31"
+    assert source.access.request_inputs.step == "month"
+    assert source.access.parameter_bindings is not None
+    assert source.access.parameter_bindings["mesAno"].from_ == "request_input.window_end"
+    assert source.access.parameter_bindings["mesAno"].format == "%Y%m"
+
+
+def test_registry_parses_iceberg_rows_request_inputs_and_parameter_bindings(tmp_path):
+    source_yaml = _valid_source_yaml("detail_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: iceberg_rows\n"
+        "    namespace: bronze_transparencia\n"
+        "    table_name: emendas_parlamentares__emendas\n"
+        "    columns:\n"
+        "      emenda_id: id\n"
+        "    distinct: true\n"
+        "  parameter_bindings:\n"
+        "    id:\n"
+        "      from: request_input.emenda_id\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"detail.yaml": source_yaml})
+
+    source = load_registry(project_root).get_source("detail_source")
+
+    assert source.access.request_inputs.type == "iceberg_rows"
+    assert source.access.request_inputs.namespace == "bronze_transparencia"
+    assert source.access.request_inputs.table_name == "emendas_parlamentares__emendas"
+    assert source.access.request_inputs.columns == {"emenda_id": "id"}
+    assert source.access.request_inputs.distinct is True
+    assert source.access.parameter_bindings is not None
+    assert source.access.parameter_bindings["id"].from_ == "request_input.emenda_id"
+    assert source.access.parameter_bindings["id"].format is None
+
+
+def test_registry_rejects_request_input_bindings_without_request_inputs(tmp_path):
+    source_yaml = _valid_source_yaml("broken_binding_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  parameter_bindings:\n"
+        "    mesAno:\n"
+        "      from: request_input.window_end\n"
+        "      format: \"%Y%m\"\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"broken_binding.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert (
+        "access.parameter_bindings.mesAno.from: requires access.request_inputs to declare a non-'none' type"
+        in str(exc_info.value)
+    )
+
+
+def test_registry_rejects_duplicate_static_and_bound_request_params(tmp_path):
+    source_yaml = _valid_source_yaml("duplicate_param_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  params:\n"
+        "    id: fixed\n"
+        "  request_inputs:\n"
+        "    type: iceberg_rows\n"
+        "    namespace: bronze_transparencia\n"
+        "    table_name: emendas_parlamentares__emendas\n"
+        "    columns:\n"
+        "      emenda_id: id\n"
+        "  parameter_bindings:\n"
+        "    id:\n"
+        "      from: request_input.emenda_id\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"duplicate_param.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert (
+        "access.parameter_bindings.id: duplicates access.params.id; declare the parameter in only one place"
+        in str(exc_info.value)
+    )
 
 
 def _create_project(tmp_path: Path, sources: dict[str, str]) -> Path:

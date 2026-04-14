@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Self
 
@@ -27,6 +28,12 @@ SUPPORTED_WRITE_MODES = frozenset({"append", "ignore", "overwrite"})
 SUPPORTED_BACKOFF_STRATEGIES = frozenset({"exponential", "fixed"})
 SUPPORTED_HTTP_METHODS = frozenset({"DELETE", "GET", "PATCH", "POST", "PUT"})
 SUPPORTED_FEDERATION_LEVELS = frozenset({"federal"})
+SUPPORTED_REQUEST_INPUT_TYPES = frozenset({"date_window", "iceberg_rows", "none"})
+SUPPORTED_REQUEST_INPUT_STEPS = frozenset({"day", "month"})
+SUPPORTED_PARAMETER_BINDING_WINDOW_SOURCES = frozenset(
+    {"request_input.window_end", "request_input.window_start"}
+)
+REQUEST_INPUT_BINDING_PREFIX = "request_input."
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +86,32 @@ class RateLimitConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestInputsConfig:
+    type: str
+
+
+@dataclass(frozen=True, slots=True)
+class DateWindowRequestInputsConfig(RequestInputsConfig):
+    start: date
+    end: date
+    step: str
+
+
+@dataclass(frozen=True, slots=True)
+class IcebergRowsRequestInputsConfig(RequestInputsConfig):
+    namespace: str
+    table_name: str
+    columns: dict[str, str]
+    distinct: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterBinding:
+    from_: str
+    format: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AccessConfig:
     format: str
     method: str
@@ -86,6 +119,7 @@ class AccessConfig:
     auth: AuthConfig
     pagination: PaginationConfig
     rate_limit: RateLimitConfig
+    request_inputs: RequestInputsConfig
     base_url: str | None = None
     path: str | None = None
     url: str | None = None
@@ -93,6 +127,7 @@ class AccessConfig:
     file_pattern: str | None = None
     headers: dict[str, str] | None = None
     params: dict[str, str] | None = None
+    parameter_bindings: dict[str, ParameterBinding] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +309,17 @@ def _build_access_config(
     file_pattern = _optional_string(data, "file_pattern", issues, "access")
     headers = _optional_string_mapping(data, "headers", issues, "access")
     params = _optional_string_mapping(data, "params", issues, "access")
+    request_inputs = _build_request_inputs_config(
+        data.get("request_inputs"),
+        source_type,
+        issues,
+    )
+    parameter_bindings = _build_parameter_bindings_config(
+        data.get("parameter_bindings"),
+        source_type,
+        request_inputs,
+        issues,
+    )
 
     if source_type in {"api", "catalog"} and not (base_url or url):
         issues.append(
@@ -295,6 +341,19 @@ def _build_access_config(
     pagination = _build_pagination_config(data.get("pagination"), issues)
     rate_limit = _build_rate_limit_config(data.get("rate_limit"), issues)
 
+    if params and parameter_bindings:
+        duplicate_keys = sorted(set(params).intersection(parameter_bindings))
+        for key in duplicate_keys:
+            issues.append(
+                ValidationIssue(
+                    f"access.parameter_bindings.{key}",
+                    (
+                        f"duplicates access.params.{key}; declare the parameter in "
+                        "only one place"
+                    ),
+                )
+            )
+
     return AccessConfig(
         format=format_name,
         method=method,
@@ -306,9 +365,11 @@ def _build_access_config(
         file_pattern=file_pattern,
         headers=headers,
         params=params,
+        parameter_bindings=parameter_bindings,
         auth=auth,
         pagination=pagination,
         rate_limit=rate_limit,
+        request_inputs=request_inputs,
     )
 
 
@@ -472,6 +533,226 @@ def _build_rate_limit_config(raw_value: Any, issues: list[ValidationIssue]) -> R
         concurrency=concurrency,
         backoff_seconds=backoff_seconds,
     )
+
+
+def _build_request_inputs_config(
+    raw_value: Any,
+    source_type: str,
+    issues: list[ValidationIssue],
+) -> RequestInputsConfig:
+    """Validate and normalize API request-input configuration with a safe default."""
+    if raw_value is None:
+        return RequestInputsConfig(type="none")
+
+    if source_type != "api":
+        issues.append(
+            ValidationIssue(
+                "access.request_inputs",
+                "is only supported for api sources",
+            )
+        )
+        return RequestInputsConfig(type="none")
+
+    data = _require_mapping(raw_value, "access.request_inputs", issues)
+    request_input_type = _require_enum(
+        data,
+        "type",
+        SUPPORTED_REQUEST_INPUT_TYPES,
+        issues,
+        "access.request_inputs",
+    )
+
+    if request_input_type == "date_window":
+        start = _require_date(data, "start", issues, "access.request_inputs")
+        end = _require_date(data, "end", issues, "access.request_inputs")
+        step = _require_enum(
+            data,
+            "step",
+            SUPPORTED_REQUEST_INPUT_STEPS,
+            issues,
+            "access.request_inputs",
+        )
+
+        if start is not None and end is not None and start > end:
+            issues.append(
+                ValidationIssue(
+                    "access.request_inputs.end",
+                    "must be on or after access.request_inputs.start",
+                )
+            )
+
+        return DateWindowRequestInputsConfig(
+            type=request_input_type,
+            start=start or date.min,
+            end=end or date.min,
+            step=step,
+        )
+
+    if request_input_type == "iceberg_rows":
+        namespace = _require_string(data, "namespace", issues, "access.request_inputs")
+        table_name = _require_string(data, "table_name", issues, "access.request_inputs")
+        columns_value = data.get("columns")
+        columns = _require_non_empty_string_mapping(
+            columns_value,
+            "access.request_inputs.columns",
+            issues,
+        )
+        if isinstance(columns_value, Mapping) and not columns_value:
+            issues.append(
+                ValidationIssue(
+                    "access.request_inputs.columns",
+                    "must not be empty",
+                )
+            )
+        distinct = _optional_bool(
+            data,
+            "distinct",
+            issues,
+            "access.request_inputs",
+            default=False,
+        )
+
+        return IcebergRowsRequestInputsConfig(
+            type=request_input_type,
+            namespace=namespace,
+            table_name=table_name,
+            columns=columns,
+            distinct=distinct,
+        )
+
+    return RequestInputsConfig(type="none")
+
+
+def _build_parameter_bindings_config(
+    raw_value: Any,
+    source_type: str,
+    request_inputs: RequestInputsConfig,
+    issues: list[ValidationIssue],
+) -> dict[str, ParameterBinding] | None:
+    """Validate declarative runtime request-parameter bindings for API sources."""
+    if raw_value is None:
+        return None
+
+    if source_type != "api":
+        issues.append(
+            ValidationIssue(
+                "access.parameter_bindings",
+                "is only supported for api sources",
+            )
+        )
+        return None
+
+    data = _require_mapping(raw_value, "access.parameter_bindings", issues)
+    bindings: dict[str, ParameterBinding] = {}
+
+    for key, item in data.items():
+        binding_path = f"access.parameter_bindings.{key}"
+        if not isinstance(key, str):
+            issues.append(ValidationIssue(binding_path, "keys must be strings"))
+            continue
+
+        parameter_name = key.strip()
+        if not parameter_name:
+            issues.append(ValidationIssue(binding_path, "must not be empty"))
+            continue
+        if not isinstance(item, Mapping):
+            issues.append(ValidationIssue(binding_path, "must be a mapping"))
+            continue
+
+        from_source = _require_string(item, "from", issues, binding_path)
+        output_format = _optional_string(item, "format", issues, binding_path)
+        if from_source:
+            _validate_parameter_binding_source(
+                from_source,
+                request_inputs,
+                issues,
+                f"{binding_path}.from",
+            )
+
+        bindings[parameter_name] = ParameterBinding(
+            from_=from_source,
+            format=output_format,
+        )
+
+    return bindings
+
+
+def _validate_parameter_binding_source(
+    from_source: str,
+    request_inputs: RequestInputsConfig,
+    issues: list[ValidationIssue],
+    field_path: str,
+) -> None:
+    """Validate the limited phase-1 binding sources supported by the API contract."""
+    if from_source == "checkpoint_value":
+        return
+
+    if not from_source.startswith(REQUEST_INPUT_BINDING_PREFIX):
+        issues.append(
+            ValidationIssue(
+                field_path,
+                (
+                    "must be 'checkpoint_value', 'request_input.window_start', "
+                    "'request_input.window_end', or 'request_input.<field>'"
+                ),
+            )
+        )
+        return
+
+    request_input_field = from_source.removeprefix(REQUEST_INPUT_BINDING_PREFIX).strip()
+    if not request_input_field:
+        issues.append(
+            ValidationIssue(
+                field_path,
+                "request_input bindings must reference a field name",
+            )
+        )
+        return
+
+    if request_inputs.type == "none":
+        issues.append(
+            ValidationIssue(
+                field_path,
+                "requires access.request_inputs to declare a non-'none' type",
+            )
+        )
+        return
+
+    if request_inputs.type == "date_window":
+        if from_source not in SUPPORTED_PARAMETER_BINDING_WINDOW_SOURCES:
+            issues.append(
+                ValidationIssue(
+                    field_path,
+                    (
+                        "must be 'request_input.window_start' or "
+                        "'request_input.window_end' when "
+                        "access.request_inputs.type is 'date_window'"
+                    ),
+                )
+            )
+        return
+
+    if request_inputs.type == "iceberg_rows":
+        if not isinstance(request_inputs, IcebergRowsRequestInputsConfig):
+            return
+
+        if request_input_field in {"window_start", "window_end"}:
+            issues.append(
+                ValidationIssue(
+                    field_path,
+                    "must reference one of access.request_inputs.columns when access.request_inputs.type is 'iceberg_rows'",
+                )
+            )
+            return
+
+        if request_input_field not in request_inputs.columns:
+            allowed_fields = ", ".join(sorted(request_inputs.columns))
+            issues.append(
+                ValidationIssue(
+                    field_path,
+                    f"must reference one of access.request_inputs.columns: {allowed_fields}",
+                )
+            )
 
 
 def _build_extraction_config(raw_value: Any, issues: list[ValidationIssue]) -> ExtractionConfig:
@@ -792,6 +1073,37 @@ def _optional_int(
     return value
 
 
+def _require_date(
+    data: Mapping[str, Any],
+    field_name: str,
+    issues: list[ValidationIssue],
+    prefix: str | None = None,
+) -> date | None:
+    """Read a required ISO date field while accepting YAML-native date scalars."""
+    value = data.get(field_name)
+    field_path = _field_path(field_name, prefix)
+    if value is None:
+        issues.append(ValidationIssue(field_path, "is required"))
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        if not stripped_value:
+            issues.append(ValidationIssue(field_path, "must not be empty"))
+            return None
+        try:
+            return date.fromisoformat(stripped_value)
+        except ValueError:
+            issues.append(ValidationIssue(field_path, "must be a YYYY-MM-DD date"))
+            return None
+
+    issues.append(ValidationIssue(field_path, "must be a YYYY-MM-DD date"))
+    return None
+
+
 def _optional_string_mapping(
     data: Mapping[str, Any],
     field_name: str,
@@ -818,6 +1130,36 @@ def _optional_string_mapping(
             issues.append(ValidationIssue(child_path, "values must be strings"))
             continue
         result[key] = item
+    return result
+
+
+def _require_non_empty_string_mapping(
+    value: Any,
+    field_path: str,
+    issues: list[ValidationIssue],
+) -> dict[str, str]:
+    """Read a required mapping whose keys and values must be non-empty strings."""
+    data = _require_mapping(value, field_path, issues)
+    result: dict[str, str] = {}
+
+    for key, item in data.items():
+        child_path = f"{field_path}.{key}"
+        if not isinstance(key, str):
+            issues.append(ValidationIssue(child_path, "keys must be strings"))
+            continue
+        normalized_key = key.strip()
+        if not normalized_key:
+            issues.append(ValidationIssue(child_path, "keys must not be empty"))
+            continue
+        if not isinstance(item, str):
+            issues.append(ValidationIssue(child_path, "values must be strings"))
+            continue
+        normalized_item = item.strip()
+        if not normalized_item:
+            issues.append(ValidationIssue(child_path, "values must not be empty"))
+            continue
+        result[normalized_key] = normalized_item
+
     return result
 
 

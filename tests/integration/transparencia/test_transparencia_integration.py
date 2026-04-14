@@ -22,7 +22,7 @@ from janus.writers import SparkDatasetWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "transparencia"
-SOURCE_ID = "transparencia_servidores_por_orgao"
+SOURCE_ID = "transparencia__poder_executivo_federal__servidores_por_orgao"
 ICEBERG_RUNTIME_JAR = (
     PROJECT_ROOT
     / "data"
@@ -98,8 +98,8 @@ def test_transparencia_source_contract_uses_safe_api_settings():
     assert source_config.access.auth.type == "header_token"
     assert source_config.access.auth.header_name == "chave-api-dados"
     assert source_config.access.pagination.page_size == 15
-    assert source_config.access.rate_limit.requests_per_minute == 60
-    assert source_config.access.rate_limit.concurrency == 1
+    assert source_config.access.rate_limit.requests_per_minute == 120
+    assert source_config.access.rate_limit.concurrency == 4
     assert source_config.extraction.mode == "snapshot"
     assert source_config.extraction.checkpoint_strategy == "none"
     assert source_config.outputs.bronze.format == "iceberg"
@@ -171,26 +171,11 @@ def test_transparencia_source_extracts_raw_pages_and_materializes_bronze_and_met
     assert second_query["pagina"] == ["2"]
     assert second_query["tamanhoPagina"] == ["2"]
 
+    raw_target = storage_layout.resolve_output(plan, "raw")
     first_artifact = Path(extraction_result.artifacts[0].path)
     second_artifact = Path(extraction_result.artifacts[1].path)
-    assert first_artifact == (
-        tmp_path
-        / "data"
-        / "raw"
-        / "transparencia"
-        / "servidores_por_orgao"
-        / "pages"
-        / "page-0001.json"
-    )
-    assert second_artifact == (
-        tmp_path
-        / "data"
-        / "raw"
-        / "transparencia"
-        / "servidores_por_orgao"
-        / "pages"
-        / "page-0002.json"
-    )
+    assert first_artifact == raw_target.child("pages/page-0001.json")
+    assert second_artifact == raw_target.child("pages/page-0002.json")
     assert json.loads(first_artifact.read_text(encoding="utf-8")) == _load_fixture(
         "servidores_por_orgao_page_1.json"
     )
@@ -236,20 +221,15 @@ def test_transparencia_source_extracts_raw_pages_and_materializes_bronze_and_met
     assert bronze_result.path == bronze_table_identifier(
         plan.bronze_output.path,
         fallback_name=plan.source.source_id,
+        namespace=plan.bronze_output.namespace,
+        table_name=plan.bronze_output.table_name,
     )
 
     run_payload = json.loads(started.run_metadata_path.read_text(encoding="utf-8"))
     lineage_payload = json.loads(persisted.lineage_path.read_text(encoding="utf-8"))
 
-    assert started.run_metadata_path == (
-        tmp_path
-        / "data"
-        / "metadata"
-        / "transparencia"
-        / "servidores_por_orgao"
-        / "runs"
-        / "run-transparencia-001.json"
-    )
+    metadata_target = storage_layout.resolve_output(plan, "metadata")
+    assert started.run_metadata_path == metadata_target.child("runs/run-transparencia-001.json")
     assert run_payload["status"] == "succeeded"
     assert run_payload["records_extracted"] == 3
     assert lineage_payload["status"] == "succeeded"
@@ -261,28 +241,25 @@ def test_transparencia_source_extracts_raw_pages_and_materializes_bronze_and_met
 
 def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
     source_config = load_registry(PROJECT_ROOT).get_source(SOURCE_ID, include_disabled=True)
-    config_path = PROJECT_ROOT / "conf" / "sources" / "transparencia" / "transparencia.yaml"
-    schema_path = (
-        PROJECT_ROOT
-        / "conf"
-        / "schemas"
-        / "transparencia"
-        / "servidores_por_orgao_schema.json"
-    )
+    config_path = PROJECT_ROOT / source_config.config_path.relative_to(PROJECT_ROOT)
+    schema_path = PROJECT_ROOT / source_config.schema.path
 
-    copied_config_path = tmp_path / "conf" / "sources" / "transparencia" / "transparencia.yaml"
-    copied_schema_path = (
-        tmp_path
-        / "conf"
-        / "schemas"
-        / "transparencia"
-        / "servidores_por_orgao_schema.json"
-    )
+    copied_config_path = tmp_path / source_config.config_path.relative_to(PROJECT_ROOT)
+    copied_schema_path = tmp_path / source_config.schema.path
     copied_config_path.parent.mkdir(parents=True, exist_ok=True)
     copied_schema_path.parent.mkdir(parents=True, exist_ok=True)
 
     config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config_payload["access"]["pagination"]["page_size"] = page_size
+    if "sources" in config_payload:
+        for entry in config_payload["sources"]:
+            if entry.get("source_id") == SOURCE_ID:
+                entry["access"]["pagination"]["page_size"] = page_size
+                break
+        else:
+            raise AssertionError(f"Source {SOURCE_ID!r} was not found in the copied config")
+    else:
+        config_payload["access"]["pagination"]["page_size"] = page_size
+
     copied_config_path.write_text(
         yaml.safe_dump(config_payload, sort_keys=False),
         encoding="utf-8",
@@ -294,7 +271,7 @@ def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
         config_path=copied_config_path,
         schema=replace(
             source_config.schema,
-            path="conf/schemas/transparencia/servidores_por_orgao_schema.json",
+            path=str(source_config.schema.path),
         ),
         access=replace(
             source_config.access,

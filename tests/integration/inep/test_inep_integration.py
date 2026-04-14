@@ -219,6 +219,8 @@ def test_inep_archive_extracts_microdata_csv_and_materializes_bronze_and_metadat
     assert bronze_result.path == bronze_table_identifier(
         plan.bronze_output.path,
         fallback_name=plan.source.source_id,
+        namespace=plan.bronze_output.namespace,
+        table_name=plan.bronze_output.table_name,
     )
 
     run_payload = json.loads(started.run_metadata_path.read_text(encoding="utf-8"))

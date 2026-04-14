@@ -156,6 +156,8 @@ def test_spark_dataset_writer_persists_bronze_output_with_normalization_columns(
     assert result.path == bronze_table_identifier(
         plan.bronze_output.path,
         fallback_name=plan.source.source_id,
+        namespace=plan.bronze_output.namespace,
+        table_name=plan.bronze_output.table_name,
     )
 
     persisted = spark.table(result.path)
