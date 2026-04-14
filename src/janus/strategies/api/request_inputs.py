@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from janus.models import IcebergRowsRequestInputsConfig, ParameterBinding
+from janus.models import (
+    DateWindowRequestInputsConfig,
+    IcebergRowsRequestInputsConfig,
+    ParameterBinding,
+    RequestInputsConfig,
+)
 
 REQUEST_INPUT_BINDING_PREFIX = "request_input."
 _SUPPORTED_STRFTIME_DIRECTIVES = frozenset(
@@ -61,6 +66,53 @@ class ApiRequestInputLoadError(ApiRequestInputError):
 
 class ApiParameterBindingError(ApiRequestInputError):
     """Raised when declarative request-parameter bindings cannot be resolved safely."""
+
+
+def load_request_inputs(
+    request_inputs: RequestInputsConfig,
+) -> tuple[dict[str, Any] | None, ...]:
+    """Load or synthesize bounded request-input contexts for one API run."""
+    if request_inputs.type == "none":
+        return (None,)
+
+    if request_inputs.type == "date_window":
+        if not isinstance(request_inputs, DateWindowRequestInputsConfig):
+            raise ApiRequestInputLoadError(
+                "access.request_inputs: date_window inputs must use "
+                "DateWindowRequestInputsConfig"
+            )
+        return generate_date_window_request_inputs(request_inputs)
+
+    raise ApiRequestInputLoadError(
+        "access.request_inputs.type: unsupported runtime request-input "
+        f"type {request_inputs.type!r}"
+    )
+
+
+def generate_date_window_request_inputs(
+    request_inputs: DateWindowRequestInputsConfig,
+) -> tuple[dict[str, date], ...]:
+    """Build deterministic day- or month-sized request windows."""
+    if request_inputs.start > request_inputs.end:
+        raise ApiRequestInputLoadError(
+            "access.request_inputs.end: must be on or after "
+            "access.request_inputs.start"
+        )
+
+    if request_inputs.step == "day":
+        return _generate_daily_request_inputs(
+            start=request_inputs.start,
+            end=request_inputs.end,
+        )
+    if request_inputs.step == "month":
+        return _generate_monthly_request_inputs(
+            start=request_inputs.start,
+            end=request_inputs.end,
+        )
+
+    raise ApiRequestInputLoadError(
+        "access.request_inputs.step: must be 'day' or 'month'"
+    )
 
 
 def validate_iceberg_request_input_source(
@@ -222,7 +274,10 @@ def _validate_strftime_format(format_string: str, *, field_path: str) -> None:
                 f"{field_path}: contains an incomplete strftime directive"
             )
 
-        while index < len(format_string) and format_string[index] in _SUPPORTED_STRFTIME_MODIFIERS:
+        while (
+            index < len(format_string)
+            and format_string[index] in _SUPPORTED_STRFTIME_MODIFIERS
+        ):
             index += 1
         while index < len(format_string) and format_string[index].isdigit():
             index += 1
@@ -238,3 +293,48 @@ def _validate_strftime_format(format_string: str, *, field_path: str) -> None:
                 f"{field_path}: contains unsupported strftime directive '%{directive}'"
             )
         index += 1
+
+
+def _generate_daily_request_inputs(
+    *,
+    start: date,
+    end: date,
+) -> tuple[dict[str, date], ...]:
+    request_windows: list[dict[str, date]] = []
+    current_day = start
+    while current_day <= end:
+        request_windows.append(
+            {
+                "window_start": current_day,
+                "window_end": current_day,
+            }
+        )
+        current_day += timedelta(days=1)
+    return tuple(request_windows)
+
+
+def _generate_monthly_request_inputs(
+    *,
+    start: date,
+    end: date,
+) -> tuple[dict[str, date], ...]:
+    request_windows: list[dict[str, date]] = []
+    current_start = start
+    while current_start <= end:
+        current_end = min(_month_window_end(current_start), end)
+        request_windows.append(
+            {
+                "window_start": current_start,
+                "window_end": current_end,
+            }
+        )
+        current_start = current_end + timedelta(days=1)
+    return tuple(request_windows)
+
+
+def _month_window_end(value: date) -> date:
+    if value.month == 12:
+        next_month_start = date(value.year + 1, 1, 1)
+    else:
+        next_month_start = date(value.year, value.month + 1, 1)
+    return next_month_start - timedelta(days=1)
