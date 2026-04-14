@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from janus.models import (
     DateWindowRequestInputsConfig,
@@ -11,6 +11,9 @@ from janus.models import (
     ParameterBinding,
     RequestInputsConfig,
 )
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
 
 REQUEST_INPUT_BINDING_PREFIX = "request_input."
 _SUPPORTED_STRFTIME_DIRECTIVES = frozenset(
@@ -70,6 +73,8 @@ class ApiParameterBindingError(ApiRequestInputError):
 
 def load_request_inputs(
     request_inputs: RequestInputsConfig,
+    *,
+    spark: SparkSession | None = None,
 ) -> tuple[dict[str, Any] | None, ...]:
     """Load or synthesize bounded request-input contexts for one API run."""
     if request_inputs.type == "none":
@@ -78,10 +83,16 @@ def load_request_inputs(
     if request_inputs.type == "date_window":
         if not isinstance(request_inputs, DateWindowRequestInputsConfig):
             raise ApiRequestInputLoadError(
-                "access.request_inputs: date_window inputs must use "
-                "DateWindowRequestInputsConfig"
+                "access.request_inputs: date_window inputs must use DateWindowRequestInputsConfig"
             )
         return generate_date_window_request_inputs(request_inputs)
+
+    if request_inputs.type == "iceberg_rows":
+        if not isinstance(request_inputs, IcebergRowsRequestInputsConfig):
+            raise ApiRequestInputLoadError(
+                "access.request_inputs: iceberg_rows inputs must use IcebergRowsRequestInputsConfig"
+            )
+        return load_iceberg_rows_request_inputs(request_inputs, spark=spark)
 
     raise ApiRequestInputLoadError(
         "access.request_inputs.type: unsupported runtime request-input "
@@ -95,8 +106,7 @@ def generate_date_window_request_inputs(
     """Build deterministic day- or month-sized request windows."""
     if request_inputs.start > request_inputs.end:
         raise ApiRequestInputLoadError(
-            "access.request_inputs.end: must be on or after "
-            "access.request_inputs.start"
+            "access.request_inputs.end: must be on or after access.request_inputs.start"
         )
 
     if request_inputs.step == "day":
@@ -110,9 +120,7 @@ def generate_date_window_request_inputs(
             end=request_inputs.end,
         )
 
-    raise ApiRequestInputLoadError(
-        "access.request_inputs.step: must be 'day' or 'month'"
-    )
+    raise ApiRequestInputLoadError("access.request_inputs.step: must be 'day' or 'month'")
 
 
 def validate_iceberg_request_input_source(
@@ -121,7 +129,7 @@ def validate_iceberg_request_input_source(
     available_columns: Sequence[str] | None,
 ) -> None:
     """Validate that a configured Iceberg request-input source exists and exposes columns."""
-    table_identifier = f"{request_inputs.namespace}.{request_inputs.table_name}"
+    table_identifier = _iceberg_table_identifier(request_inputs)
     if available_columns is None:
         raise ApiRequestInputLoadError(
             f"access.request_inputs: configured Iceberg table {table_identifier!r} does not exist"
@@ -139,6 +147,35 @@ def validate_iceberg_request_input_source(
                 f"{source_column!r} was not found in Iceberg table {table_identifier!r}"
             )
             raise ApiRequestInputLoadError(message)
+
+
+def load_iceberg_rows_request_inputs(
+    request_inputs: IcebergRowsRequestInputsConfig,
+    *,
+    spark: SparkSession | None,
+) -> tuple[dict[str, Any], ...]:
+    """Load projected request-input rows from one configured Iceberg table."""
+    if spark is None:
+        raise ApiRequestInputLoadError(
+            "access.request_inputs: iceberg_rows inputs require an active SparkSession"
+        )
+
+    table_identifier = _iceberg_table_identifier(request_inputs)
+    if not spark.catalog.tableExists(table_identifier):
+        validate_iceberg_request_input_source(request_inputs, available_columns=None)
+
+    dataframe = spark.table(table_identifier)
+    validate_iceberg_request_input_source(
+        request_inputs,
+        available_columns=dataframe.columns,
+    )
+    projected_dataframe = _project_iceberg_request_input_columns(dataframe, request_inputs)
+    if request_inputs.distinct:
+        projected_dataframe = projected_dataframe.distinct()
+
+    ordered_binding_names = tuple(request_inputs.columns)
+    projected_rows = projected_dataframe.sort(*ordered_binding_names).collect()
+    return tuple(row.asDict(recursive=False) for row in projected_rows)
 
 
 def resolve_parameter_bindings(
@@ -231,9 +268,7 @@ def _render_bound_value(
             raise ApiParameterBindingError(message)
         rendered_value = value.strftime(output_format)
         if not rendered_value:
-            raise ApiParameterBindingError(
-                f"{binding_path}.format: resolved to an empty string"
-            )
+            raise ApiParameterBindingError(f"{binding_path}.format: resolved to an empty string")
         return rendered_value
 
     if value is None:
@@ -249,9 +284,7 @@ def _render_bound_value(
     if isinstance(value, str):
         normalized_value = value.strip()
         if not normalized_value:
-            raise ApiParameterBindingError(
-                f"{binding_path}.from: resolved to an empty string"
-            )
+            raise ApiParameterBindingError(f"{binding_path}.from: resolved to an empty string")
         return normalized_value
 
     message = (
@@ -274,10 +307,7 @@ def _validate_strftime_format(format_string: str, *, field_path: str) -> None:
                 f"{field_path}: contains an incomplete strftime directive"
             )
 
-        while (
-            index < len(format_string)
-            and format_string[index] in _SUPPORTED_STRFTIME_MODIFIERS
-        ):
+        while index < len(format_string) and format_string[index] in _SUPPORTED_STRFTIME_MODIFIERS:
             index += 1
         while index < len(format_string) and format_string[index].isdigit():
             index += 1
@@ -293,6 +323,21 @@ def _validate_strftime_format(format_string: str, *, field_path: str) -> None:
                 f"{field_path}: contains unsupported strftime directive '%{directive}'"
             )
         index += 1
+
+
+def _iceberg_table_identifier(request_inputs: IcebergRowsRequestInputsConfig) -> str:
+    return f"{request_inputs.namespace}.{request_inputs.table_name}"
+
+
+def _project_iceberg_request_input_columns(
+    dataframe: DataFrame,
+    request_inputs: IcebergRowsRequestInputsConfig,
+) -> DataFrame:
+    projected_columns = tuple(
+        dataframe[source_column].alias(binding_name)
+        for binding_name, source_column in request_inputs.columns.items()
+    )
+    return dataframe.select(*projected_columns)
 
 
 def _generate_daily_request_inputs(

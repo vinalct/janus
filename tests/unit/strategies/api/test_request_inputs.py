@@ -18,6 +18,95 @@ from janus.strategies.api.request_inputs import (
 )
 
 
+class FakeAliasedColumn:
+    def __init__(self, source_name: str, alias_name: str) -> None:
+        self.source_name = source_name
+        self.alias_name = alias_name
+
+
+class FakeColumn:
+    def __init__(self, source_name: str) -> None:
+        self.source_name = source_name
+
+    def alias(self, alias_name: str) -> FakeAliasedColumn:
+        return FakeAliasedColumn(self.source_name, alias_name)
+
+
+class FakeRow:
+    def __init__(self, values: dict[str, object]) -> None:
+        self._values = dict(values)
+
+    def asDict(self, recursive: bool = False) -> dict[str, object]:
+        del recursive
+        return dict(self._values)
+
+
+class FakeDataFrame:
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        columns: tuple[str, ...] | None = None,
+    ) -> None:
+        self._rows = [dict(row) for row in rows]
+        if columns is not None:
+            self.columns = columns
+        elif rows:
+            self.columns = tuple(rows[0])
+        else:
+            self.columns = ()
+
+    def __getitem__(self, key: str) -> FakeColumn:
+        return FakeColumn(key)
+
+    def select(self, *selected_columns: FakeAliasedColumn) -> "FakeDataFrame":
+        projected_rows = []
+        for row in self._rows:
+            projected_rows.append(
+                {selected.alias_name: row[selected.source_name] for selected in selected_columns}
+            )
+        projected_column_names = tuple(selected.alias_name for selected in selected_columns)
+        return FakeDataFrame(projected_rows, columns=projected_column_names)
+
+    def distinct(self) -> "FakeDataFrame":
+        seen = set()
+        unique_rows = []
+        for row in self._rows:
+            key = tuple((column_name, row[column_name]) for column_name in self.columns)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(row)
+        return FakeDataFrame(unique_rows, columns=self.columns)
+
+    def sort(self, *column_names: str) -> "FakeDataFrame":
+        sorted_rows = sorted(
+            self._rows,
+            key=lambda row: tuple(row[column_name] for column_name in column_names),
+        )
+        return FakeDataFrame(sorted_rows, columns=self.columns)
+
+    def collect(self) -> list[FakeRow]:
+        return [FakeRow(row) for row in self._rows]
+
+
+class FakeCatalog:
+    def __init__(self, tables: dict[str, FakeDataFrame]) -> None:
+        self._tables = dict(tables)
+
+    def tableExists(self, table_identifier: str) -> bool:
+        return table_identifier in self._tables
+
+
+class FakeSparkSession:
+    def __init__(self, tables: dict[str, FakeDataFrame]) -> None:
+        self._tables = dict(tables)
+        self.catalog = FakeCatalog(self._tables)
+
+    def table(self, table_identifier: str) -> FakeDataFrame:
+        return self._tables[table_identifier]
+
+
 def test_load_request_inputs_preserves_one_stream_behavior_for_none():
     assert load_request_inputs(RequestInputsConfig(type="none")) == (None,)
 
@@ -124,8 +213,7 @@ def test_resolve_parameter_bindings_rejects_invalid_date_formats():
         )
 
     assert str(exc_info.value) == (
-        "access.parameter_bindings.mesAno.format: contains unsupported strftime "
-        "directive '%Q'"
+        "access.parameter_bindings.mesAno.format: contains unsupported strftime directive '%Q'"
     )
 
 
@@ -142,8 +230,7 @@ def test_resolve_parameter_bindings_rejects_formatted_non_date_values():
         )
 
     assert str(exc_info.value) == (
-        "access.parameter_bindings.mesAno.format: requires a date or datetime value, "
-        "got str"
+        "access.parameter_bindings.mesAno.format: requires a date or datetime value, got str"
     )
 
 
@@ -204,4 +291,79 @@ def test_validate_iceberg_request_input_source_rejects_missing_columns():
     assert str(exc_info.value) == (
         "access.request_inputs.columns.emenda_id: source column 'id' was not found "
         "in Iceberg table 'bronze_transparencia.emendas_parlamentares__emendas'"
+    )
+
+
+def test_load_request_inputs_reads_projected_iceberg_rows_with_binding_field_names():
+    request_inputs = IcebergRowsRequestInputsConfig(
+        type="iceberg_rows",
+        namespace="bronze_transparencia",
+        table_name="emendas_parlamentares__emendas",
+        columns={
+            "autor": "parlamentar",
+            "emenda_id": "id",
+        },
+    )
+    spark = FakeSparkSession(
+        {
+            "bronze_transparencia.emendas_parlamentares__emendas": FakeDataFrame(
+                [
+                    {"id": "2", "parlamentar": "Bruno", "ignored": "x"},
+                    {"id": "1", "parlamentar": "Ana", "ignored": "y"},
+                ]
+            )
+        }
+    )
+
+    assert load_request_inputs(request_inputs, spark=spark) == (
+        {
+            "autor": "Ana",
+            "emenda_id": "1",
+        },
+        {
+            "autor": "Bruno",
+            "emenda_id": "2",
+        },
+    )
+
+
+def test_load_request_inputs_applies_distinct_to_projected_iceberg_rows_only():
+    request_inputs = IcebergRowsRequestInputsConfig(
+        type="iceberg_rows",
+        namespace="bronze_transparencia",
+        table_name="emendas_parlamentares__emendas",
+        columns={"emenda_id": "id"},
+        distinct=True,
+    )
+    spark = FakeSparkSession(
+        {
+            "bronze_transparencia.emendas_parlamentares__emendas": FakeDataFrame(
+                [
+                    {"id": "2", "parlamentar": "Bruno"},
+                    {"id": "1", "parlamentar": "Ana"},
+                    {"id": "1", "parlamentar": "Carla"},
+                ]
+            )
+        }
+    )
+
+    assert load_request_inputs(request_inputs, spark=spark) == (
+        {"emenda_id": "1"},
+        {"emenda_id": "2"},
+    )
+
+
+def test_load_request_inputs_rejects_iceberg_rows_without_spark():
+    request_inputs = IcebergRowsRequestInputsConfig(
+        type="iceberg_rows",
+        namespace="bronze_transparencia",
+        table_name="emendas_parlamentares__emendas",
+        columns={"emenda_id": "id"},
+    )
+
+    with pytest.raises(ApiRequestInputLoadError) as exc_info:
+        load_request_inputs(request_inputs)
+
+    assert str(exc_info.value) == (
+        "access.request_inputs: iceberg_rows inputs require an active SparkSession"
     )
