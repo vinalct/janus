@@ -209,7 +209,10 @@ class FileStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark=None,
     ) -> ExtractionResult:
+        del spark
         file_hook = hook if isinstance(hook, FileHook) else None
         storage_layout = self.storage_layout_factory(plan)
         raw_writer = self.raw_writer_factory(storage_layout)

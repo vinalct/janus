@@ -159,6 +159,15 @@ def test_load_request_inputs_generates_monthly_windows_bounded_by_interval():
     )
 
 
+def test_resolve_parameter_bindings_supports_checkpoint_value():
+    resolved = resolve_parameter_bindings(
+        {"updated_at": ParameterBinding(from_="checkpoint_value")},
+        checkpoint_value="2025-01-31T00:00:00Z",
+    )
+
+    assert resolved == {"updated_at": "2025-01-31T00:00:00Z"}
+
+
 def test_resolve_parameter_bindings_formats_generated_date_window_values():
     bindings = {
         "dataIdaDe": ParameterBinding(

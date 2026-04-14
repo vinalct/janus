@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -137,6 +137,95 @@ class ConcurrentPageTransport:
                 self.state.active_requests -= 1
 
 
+class FakeAliasedColumn:
+    def __init__(self, source_name: str, alias_name: str) -> None:
+        self.source_name = source_name
+        self.alias_name = alias_name
+
+
+class FakeColumn:
+    def __init__(self, source_name: str) -> None:
+        self.source_name = source_name
+
+    def alias(self, alias_name: str) -> FakeAliasedColumn:
+        return FakeAliasedColumn(self.source_name, alias_name)
+
+
+class FakeRow:
+    def __init__(self, values: dict[str, object]) -> None:
+        self._values = dict(values)
+
+    def asDict(self, recursive: bool = False) -> dict[str, object]:
+        del recursive
+        return dict(self._values)
+
+
+class FakeDataFrame:
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        columns: tuple[str, ...] | None = None,
+    ) -> None:
+        self._rows = [dict(row) for row in rows]
+        if columns is not None:
+            self.columns = columns
+        elif rows:
+            self.columns = tuple(rows[0])
+        else:
+            self.columns = ()
+
+    def __getitem__(self, key: str) -> FakeColumn:
+        return FakeColumn(key)
+
+    def select(self, *selected_columns: FakeAliasedColumn) -> FakeDataFrame:
+        projected_rows = []
+        for row in self._rows:
+            projected_rows.append(
+                {selected.alias_name: row[selected.source_name] for selected in selected_columns}
+            )
+        projected_column_names = tuple(selected.alias_name for selected in selected_columns)
+        return FakeDataFrame(projected_rows, columns=projected_column_names)
+
+    def distinct(self) -> FakeDataFrame:
+        seen = set()
+        unique_rows = []
+        for row in self._rows:
+            key = tuple((column_name, row[column_name]) for column_name in self.columns)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(row)
+        return FakeDataFrame(unique_rows, columns=self.columns)
+
+    def sort(self, *column_names: str) -> FakeDataFrame:
+        sorted_rows = sorted(
+            self._rows,
+            key=lambda row: tuple(row[column_name] for column_name in column_names),
+        )
+        return FakeDataFrame(sorted_rows, columns=self.columns)
+
+    def collect(self) -> list[FakeRow]:
+        return [FakeRow(row) for row in self._rows]
+
+
+class FakeCatalog:
+    def __init__(self, tables: dict[str, FakeDataFrame]) -> None:
+        self._tables = dict(tables)
+
+    def tableExists(self, table_identifier: str) -> bool:
+        return table_identifier in self._tables
+
+
+class FakeSparkSession:
+    def __init__(self, tables: dict[str, FakeDataFrame]) -> None:
+        self._tables = dict(tables)
+        self.catalog = FakeCatalog(self._tables)
+
+    def table(self, table_identifier: str) -> FakeDataFrame:
+        return self._tables[table_identifier]
+
+
 def test_urllib_transport_prefers_explicit_or_environment_ca_bundle(tmp_path, monkeypatch):
     explicit_bundle = tmp_path / "explicit-ca.pem"
     env_bundle = tmp_path / "env-ca.pem"
@@ -189,6 +278,77 @@ def test_api_strategy_logs_page_progress(tmp_path):
     assert finished_pages[0]["fields"]["next_page_number"] == 2
     assert finished_pages[1]["fields"]["records_extracted"] == 1
     assert finished_pages[1]["fields"]["has_next_page"] is False
+
+
+def test_api_strategy_request_inputs_bind_date_windows_and_partition_raw_outputs(tmp_path):
+    stream = StringIO()
+    logger = build_structured_logger("janus.tests.api.request_inputs", stream=stream)
+    plan = _build_plan(
+        tmp_path,
+        source_id="windowed_source",
+        request_inputs={
+            "type": "date_window",
+            "start": date(2025, 1, 1),
+            "end": date(2025, 2, 28),
+            "step": "month",
+        },
+        parameter_bindings={
+            "mesAno": {
+                "from": "request_input.window_end",
+                "format": "%Y%m",
+            }
+        },
+        page_size=2,
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"records": [{"id": "1"}]}),
+            ResponseSpec(200, {"records": [{"id": "2"}]}),
+        ],
+        logger=logger,
+    )
+
+    result = strategy.extract(plan)
+    metadata = result.metadata_as_dict()
+
+    queries = [parse_qs(urlsplit(request.full_url()).query) for request in transport.requests]
+    assert [query["mesAno"] for query in queries] == [["202501"], ["202502"]]
+    assert [query["page"] for query in queries] == [["1"], ["1"]]
+    assert [query["page_size"] for query in queries] == [["2"], ["2"]]
+
+    assert Path(result.artifacts[0].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "windowed_source"
+        / "request-input-000001"
+        / "page-0001.json"
+    )
+    assert Path(result.artifacts[1].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "windowed_source"
+        / "request-input-000002"
+        / "page-0001.json"
+    )
+
+    assert metadata["request_input_type"] == "date_window"
+    assert metadata["request_input_count"] == "2"
+    assert metadata["bound_parameter_names"] == "mesAno"
+
+    emitted_metadata = strategy.emit_metadata(plan, result)
+    assert emitted_metadata["request_input_type"] == "date_window"
+    assert emitted_metadata["request_input_count"] == "2"
+
+    payloads = [json.loads(line) for line in stream.getvalue().splitlines()]
+    finished_requests = [
+        payload for payload in payloads if payload["event"] == "api_request_finished"
+    ]
+    assert [payload["fields"]["request_input_index"] for payload in finished_requests] == [1, 2]
 
 
 def test_api_strategy_page_number_extracts_raw_pages_and_tracks_checkpoint(tmp_path):
@@ -359,6 +519,68 @@ def test_api_strategy_retries_transient_failures_with_bounded_backoff(tmp_path):
     assert metadata["request_count"] == "1"
 
 
+def test_api_strategy_request_inputs_bind_iceberg_rows_from_runtime_spark(tmp_path):
+    plan = _build_plan(
+        tmp_path,
+        source_id="iceberg_row_source",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze_transparencia",
+            "table_name": "emendas_parlamentares__emendas",
+            "columns": {"emenda_id": "id"},
+        },
+        parameter_bindings={"id": {"from": "request_input.emenda_id"}},
+        page_size=2,
+    )
+    spark = FakeSparkSession(
+        {
+            "bronze_transparencia.emendas_parlamentares__emendas": FakeDataFrame(
+                [
+                    {"id": "2"},
+                    {"id": "1"},
+                ]
+            )
+        }
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"records": [{"id": "1"}]}),
+            ResponseSpec(200, {"records": [{"id": "2"}]}),
+        ],
+    )
+
+    result = strategy.extract(plan, spark=spark)
+    metadata = result.metadata_as_dict()
+
+    queries = [parse_qs(urlsplit(request.full_url()).query) for request in transport.requests]
+    assert [query["id"] for query in queries] == [["1"], ["2"]]
+    assert metadata["request_input_type"] == "iceberg_rows"
+    assert metadata["request_input_count"] == "2"
+    assert metadata["upstream_namespace"] == "bronze_transparencia"
+    assert metadata["upstream_table_name"] == "emendas_parlamentares__emendas"
+    assert metadata["upstream_column_names"] == "id"
+
+    assert Path(result.artifacts[0].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "iceberg_row_source"
+        / "request-input-000001"
+        / "page-0001.json"
+    )
+    assert Path(result.artifacts[1].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "iceberg_row_source"
+        / "request-input-000002"
+        / "page-0001.json"
+    )
+
+
 def test_api_strategy_hook_can_override_checkpoint_params_and_record_extraction(tmp_path):
     plan = _build_plan(
         tmp_path,
@@ -431,6 +653,9 @@ def _build_plan(
     rate_limit_backoff_seconds: int | None = 5,
     requests_per_minute: int | None = 10,
     concurrency: int = 1,
+    params: dict[str, str] | None = None,
+    request_inputs: dict[str, Any] | None = None,
+    parameter_bindings: dict[str, Any] | None = None,
 ) -> ExecutionPlan:
     source_config = _build_source_config(
         tmp_path,
@@ -448,6 +673,9 @@ def _build_plan(
         rate_limit_backoff_seconds=rate_limit_backoff_seconds,
         requests_per_minute=requests_per_minute,
         concurrency=concurrency,
+        params=params,
+        request_inputs=request_inputs,
+        parameter_bindings=parameter_bindings,
     )
     run_context = RunContext.create(
         run_id=f"run-{source_id}",
@@ -475,6 +703,9 @@ def _build_source_config(
     rate_limit_backoff_seconds: int | None = 5,
     requests_per_minute: int | None = 10,
     concurrency: int = 1,
+    params: dict[str, str] | None = None,
+    request_inputs: dict[str, Any] | None = None,
+    parameter_bindings: dict[str, Any] | None = None,
 ) -> SourceConfig:
     return SourceConfig.from_mapping(
         {
@@ -495,6 +726,9 @@ def _build_source_config(
                 "format": "json",
                 "timeout_seconds": 30,
                 "auth": {"type": "none"},
+                "params": params,
+                "request_inputs": request_inputs,
+                "parameter_bindings": parameter_bindings,
                 "pagination": _pagination_block(pagination_type, page_size),
                 "rate_limit": {
                     "requests_per_minute": requests_per_minute,

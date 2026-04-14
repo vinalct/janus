@@ -161,7 +161,11 @@ class SourceExecutor:
                 pagination_type=plan.source_config.access.pagination.type,
                 auth_type=plan.source_config.access.auth.type,
             )
-            extraction_result = planned_run.strategy.extract(plan, hook=planned_run.hook)
+            extraction_result = planned_run.strategy.extract(
+                plan,
+                hook=planned_run.hook,
+                spark=spark,
+            )
             _log_info(
                 logger,
                 "source_extraction_finished",

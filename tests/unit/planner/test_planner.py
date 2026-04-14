@@ -53,9 +53,12 @@ class RecordingStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark=None,
     ) -> ExtractionResult:
         del plan
         del hook
+        del spark
         raise NotImplementedError
 
     def build_normalization_handoff(

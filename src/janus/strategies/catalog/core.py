@@ -253,7 +253,10 @@ class CatalogStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark=None,
     ) -> ExtractionResult:
+        del spark
         catalog_hook = hook if isinstance(hook, CatalogHook) else None
         storage_layout = self.storage_layout_factory(plan)
         raw_writer = self.raw_writer_factory(storage_layout)

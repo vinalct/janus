@@ -327,8 +327,11 @@ class PlanningStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark=None,
     ) -> ExtractionResult:
         del hook
+        del spark
         raise NotImplementedError(
             f"Dispatch {plan.source.strategy!r}/{plan.source.strategy_variant!r} is planned, "
             "but extraction is not implemented yet"

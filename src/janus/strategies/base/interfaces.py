@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from janus.models.contracts import ExecutionPlan, ExtractionResult, RunContext, WriteResult
 from janus.models.source_config import SourceConfig
+
+if TYPE_CHECKING:
+    from pyspark.sql import SparkSession
 
 
 class SourceHook:
@@ -58,6 +62,8 @@ class BaseStrategy(ABC):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark: SparkSession | None = None,
     ) -> ExtractionResult:
         """Perform source-family extraction and return the raw-artifact handoff contract."""
 

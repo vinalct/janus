@@ -31,8 +31,9 @@ class FakeStrategy:
     def plan(self, source_config, run_context, hook=None):
         raise NotImplementedError
 
-    def extract(self, plan, hook=None):
+    def extract(self, plan, hook=None, *, spark=None):
         del hook
+        del spark
         self.calls.append("extract")
         self.seen_metadata_output_path = plan.metadata_output.path
         return ExtractionResult.from_plan(

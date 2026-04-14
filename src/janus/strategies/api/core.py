@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -37,7 +37,19 @@ from .http import (
     UrllibApiTransport,
     inject_auth,
 )
-from .pagination import OffsetPaginator, PageNumberPaginator, PaginationState, build_paginator
+from .pagination import (
+    OffsetPaginator,
+    PageNumberPaginator,
+    PaginationState,
+    build_paginator,
+)
+from .request_inputs import (
+    ApiParameterBindingError,
+    ApiRequestInputLoadError,
+    load_request_inputs,
+    merge_request_params,
+    resolve_parameter_bindings,
+)
 
 SUPPORTED_API_PAYLOAD_FORMATS = frozenset({"binary", "json", "jsonl", "text"})
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
@@ -223,20 +235,41 @@ class ApiStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark=None,
     ) -> ExtractionResult:
         api_hook = hook if isinstance(hook, ApiHook) else None
         storage_layout = self.storage_layout_factory(plan)
         raw_writer = self.raw_writer_factory(storage_layout)
         checkpoint_state = self.checkpoint_store.load(plan)
+        checkpoint_request_value = _checkpoint_request_value(plan, checkpoint_state)
         base_request = self._build_base_request(plan, checkpoint_state, api_hook)
         paginator = build_paginator(plan.source_config.access.pagination)
-        pagination_state = paginator.initial_state(base_request)
         throttle = ApiRequestThrottle(
             requests_per_minute=plan.source_config.access.rate_limit.requests_per_minute,
             clock=self.clock,
             sleeper=self.sleeper,
         )
         logger = self._bind_logger(plan)
+        request_input_type = plan.source_config.access.request_inputs.type
+        parameter_bindings = plan.source_config.access.parameter_bindings
+
+        try:
+            request_inputs = load_request_inputs(
+                plan.source_config.access.request_inputs,
+                spark=spark,
+            )
+        except ApiRequestInputLoadError:
+            if logger is not None:
+                logger.exception(
+                    "api_request_input_loading_failed",
+                    request_input_type=request_input_type,
+                )
+            raise
+
+        request_input_count = len(request_inputs)
+        request_input_metadata = _request_input_metadata(plan, request_input_count)
+        bound_parameter_names = sorted(parameter_bindings or {})
         if logger is not None:
             logger.info(
                 "api_extraction_started",
@@ -246,47 +279,137 @@ class ApiStrategy(BaseStrategy):
                 page_size=plan.source_config.access.pagination.page_size,
                 checkpoint_loaded=checkpoint_state is not None,
                 timeout_seconds=base_request.timeout_seconds,
+                request_input_type=request_input_type,
+                request_input_count=request_input_count,
+                bound_parameter_names=bound_parameter_names,
+                upstream_namespace=request_input_metadata.get("upstream_namespace"),
+                upstream_table_name=request_input_metadata.get("upstream_table_name"),
+                upstream_column_names=(
+                    request_input_metadata["upstream_column_names"].split(",")
+                    if request_input_metadata.get("upstream_column_names")
+                    else []
+                ),
             )
 
-        if _supports_concurrent_pagination(
-            paginator,
-            plan.source_config.access.rate_limit.concurrency,
-        ):
-            (
-                artifacts,
-                total_records,
-                successful_requests,
-                total_attempts,
-                checkpoint_value,
-            ) = self._extract_concurrent_pages(
-                plan,
-                api_hook=api_hook,
-                base_request=base_request,
-                paginator=paginator,
-                pagination_state=pagination_state,
-                checkpoint_state=checkpoint_state,
-                raw_writer=raw_writer,
-                throttle=throttle,
-                logger=logger,
-            )
-        else:
-            (
-                artifacts,
-                total_records,
-                successful_requests,
-                total_attempts,
-                checkpoint_value,
-            ) = self._extract_sequential_pages(
-                plan,
-                api_hook=api_hook,
-                base_request=base_request,
-                paginator=paginator,
-                pagination_state=pagination_state,
-                checkpoint_state=checkpoint_state,
-                raw_writer=raw_writer,
-                throttle=throttle,
-                logger=logger,
-            )
+        artifacts: list[ExtractedArtifact] = []
+        total_records = 0
+        successful_requests = 0
+        total_attempts = 0
+        checkpoint_value: str | None = None
+
+        for request_input_index, request_input in enumerate(request_inputs, start=1):
+            request_input_logger = logger
+            if request_input_logger is not None:
+                request_input_logger = request_input_logger.bind(
+                    request_input_index=request_input_index,
+                    request_input_count=request_input_count,
+                    request_input_type=request_input_type,
+                )
+                request_input_logger.info(
+                    "api_request_input_started",
+                    request_input_field_names=_request_input_field_names(request_input),
+                )
+
+            try:
+                bound_params = resolve_parameter_bindings(
+                    parameter_bindings,
+                    request_input=request_input,
+                    checkpoint_value=checkpoint_request_value,
+                )
+                request_params = merge_request_params(
+                    plan.source_config.access.params,
+                    bound_params,
+                )
+            except ApiParameterBindingError:
+                if request_input_logger is not None:
+                    request_input_logger.exception(
+                        "api_parameter_binding_failed",
+                        request_input_field_names=_request_input_field_names(request_input),
+                    )
+                raise
+
+            request_input_base_request = base_request
+            if request_params:
+                request_input_base_request = request_input_base_request.with_params(request_params)
+
+            if request_input_logger is not None:
+                request_input_logger.info(
+                    "api_request_input_bound",
+                    bound_parameter_names=sorted(bound_params),
+                    request_parameter_names=sorted(request_params),
+                )
+
+            pagination_state = paginator.initial_state(request_input_base_request)
+            try:
+                if _supports_concurrent_pagination(
+                    paginator,
+                    plan.source_config.access.rate_limit.concurrency,
+                ):
+                    (
+                        request_input_artifacts,
+                        request_input_total_records,
+                        request_input_successful_requests,
+                        request_input_total_attempts,
+                        request_input_checkpoint_value,
+                    ) = self._extract_concurrent_pages(
+                        plan,
+                        api_hook=api_hook,
+                        base_request=request_input_base_request,
+                        paginator=paginator,
+                        pagination_state=pagination_state,
+                        checkpoint_state=checkpoint_state,
+                        checkpoint_value=checkpoint_value,
+                        raw_writer=raw_writer,
+                        throttle=throttle,
+                        logger=request_input_logger,
+                        request_input_index=request_input_index,
+                        request_input_count=request_input_count,
+                    )
+                else:
+                    (
+                        request_input_artifacts,
+                        request_input_total_records,
+                        request_input_successful_requests,
+                        request_input_total_attempts,
+                        request_input_checkpoint_value,
+                    ) = self._extract_sequential_pages(
+                        plan,
+                        api_hook=api_hook,
+                        base_request=request_input_base_request,
+                        paginator=paginator,
+                        pagination_state=pagination_state,
+                        checkpoint_state=checkpoint_state,
+                        checkpoint_value=checkpoint_value,
+                        raw_writer=raw_writer,
+                        throttle=throttle,
+                        logger=request_input_logger,
+                        request_input_index=request_input_index,
+                        request_input_count=request_input_count,
+                    )
+            except Exception:
+                if request_input_logger is not None:
+                    request_input_logger.exception("api_request_execution_failed")
+                raise
+
+            artifacts.extend(request_input_artifacts)
+            total_records += request_input_total_records
+            successful_requests += request_input_successful_requests
+            total_attempts += request_input_total_attempts
+            checkpoint_value = request_input_checkpoint_value
+
+            if request_input_logger is not None:
+                request_input_logger.info(
+                    "api_request_input_finished",
+                    request_count=request_input_successful_requests,
+                    retry_count=max(
+                        request_input_total_attempts - request_input_successful_requests,
+                        0,
+                    ),
+                    attempt_count=request_input_total_attempts,
+                    records_extracted=request_input_total_records,
+                    artifact_count=len(request_input_artifacts),
+                    checkpoint_value=request_input_checkpoint_value,
+                )
 
         if logger is not None:
             logger.info(
@@ -297,6 +420,8 @@ class ApiStrategy(BaseStrategy):
                 records_extracted=total_records,
                 artifact_count=len(artifacts),
                 checkpoint_value=checkpoint_value,
+                request_input_type=request_input_type,
+                request_input_count=request_input_count,
             )
 
         extraction_result = ExtractionResult.from_plan(
@@ -312,6 +437,7 @@ class ApiStrategy(BaseStrategy):
                 "auth_type": plan.source_config.access.auth.type,
                 "checkpoint_loaded": str(checkpoint_state is not None).lower(),
                 "records_extracted": str(total_records),
+                **request_input_metadata,
             },
         )
         if hook is not None:
@@ -327,15 +453,17 @@ class ApiStrategy(BaseStrategy):
         paginator,
         pagination_state: PaginationState | None,
         checkpoint_state: CheckpointState | None,
+        checkpoint_value: str | None,
         raw_writer: RawArtifactWriter,
         throttle: ApiRequestThrottle,
         logger: StructuredLogger | None,
+        request_input_index: int,
+        request_input_count: int,
     ) -> tuple[list[ExtractedArtifact], int, int, int, str | None]:
         artifacts: list[ExtractedArtifact] = []
         total_records = 0
         successful_requests = 0
         total_attempts = 0
-        checkpoint_value: str | None = None
 
         with ApiClient(self.transport_factory()) as client:
             while pagination_state is not None:
@@ -369,6 +497,8 @@ class ApiStrategy(BaseStrategy):
                     api_hook=api_hook,
                     logger=logger,
                     total_records=total_records,
+                    request_input_index=request_input_index,
+                    request_input_count=request_input_count,
                 )
                 artifacts.append(processed.artifact)
                 total_records += processed.records_extracted
@@ -392,16 +522,18 @@ class ApiStrategy(BaseStrategy):
         paginator: PageNumberPaginator | OffsetPaginator,
         pagination_state: PaginationState | None,
         checkpoint_state: CheckpointState | None,
+        checkpoint_value: str | None,
         raw_writer: RawArtifactWriter,
         throttle: ApiRequestThrottle,
         logger: StructuredLogger | None,
+        request_input_index: int,
+        request_input_count: int,
     ) -> tuple[list[ExtractedArtifact], int, int, int, str | None]:
         concurrency = plan.source_config.access.rate_limit.concurrency
         artifacts: list[ExtractedArtifact] = []
         total_records = 0
         successful_requests = 0
         total_attempts = 0
-        checkpoint_value: str | None = None
         next_request_index = pagination_state.request_index if pagination_state is not None else 1
         predicted_state = pagination_state
         pending: dict[int, SubmittedApiRequest] = {}
@@ -463,6 +595,8 @@ class ApiStrategy(BaseStrategy):
                     api_hook=api_hook,
                     logger=logger,
                     total_records=total_records,
+                    request_input_index=request_input_index,
+                    request_input_count=request_input_count,
                 )
                 artifacts.append(processed.artifact)
                 total_records += processed.records_extracted
@@ -550,7 +684,7 @@ class ApiStrategy(BaseStrategy):
             url=_resolve_url(plan.source_config),
             timeout_seconds=source_access.timeout_seconds,
             headers=_freeze_string_mapping(source_access.headers or {}),
-            params=_freeze_string_mapping(source_access.params or {}),
+            params=(),
         )
         request = inject_auth(request, source_access.auth, env_reader=self._resolve_env_var)
 
@@ -663,6 +797,8 @@ class ApiStrategy(BaseStrategy):
         api_hook: ApiHook | None,
         logger: StructuredLogger | None,
         total_records: int,
+        request_input_index: int,
+        request_input_count: int,
     ) -> ProcessedApiRequest:
         if api_hook is not None:
             response = api_hook.handle_response(plan, request, response)
@@ -684,6 +820,8 @@ class ApiStrategy(BaseStrategy):
             response=response,
             payload=payload,
             pagination_state=pagination_state,
+            request_input_index=request_input_index,
+            request_input_count=request_input_count,
         )
 
         next_cursor = None
@@ -789,16 +927,26 @@ class ApiStrategy(BaseStrategy):
         response: ApiResponse,
         payload: Any,
         pagination_state: PaginationState,
+        request_input_index: int,
+        request_input_count: int,
     ):
         relative_path = _raw_relative_path(
             plan.source_config.outputs.raw.format,
             pagination_state,
+            request_input_index=request_input_index,
+            request_input_count=request_input_count,
         )
         metadata = {
             "request_url": response.request.full_url(),
             "status_code": str(response.status_code),
             "request_index": str(pagination_state.request_index),
+            "request_input_index": str(request_input_index),
+            "request_input_count": str(request_input_count),
+            "request_input_type": plan.source_config.access.request_inputs.type,
         }
+        bound_parameter_names = sorted(plan.source_config.access.parameter_bindings or {})
+        if bound_parameter_names:
+            metadata["bound_parameter_names"] = ",".join(bound_parameter_names)
         if pagination_state.page_number is not None:
             metadata["page_number"] = str(pagination_state.page_number)
         if pagination_state.offset is not None:
@@ -961,7 +1109,13 @@ def _predicted_next_pagination_state(
     )
 
 
-def _raw_relative_path(raw_format: str, pagination_state: PaginationState) -> Path:
+def _raw_relative_path(
+    raw_format: str,
+    pagination_state: PaginationState,
+    *,
+    request_input_index: int,
+    request_input_count: int,
+) -> Path:
     suffix = RAW_FILE_SUFFIXES[raw_format]
     if pagination_state.page_number is not None:
         filename = f"page-{pagination_state.page_number:04d}{suffix}"
@@ -971,7 +1125,41 @@ def _raw_relative_path(raw_format: str, pagination_state: PaginationState) -> Pa
         filename = f"cursor-{pagination_state.request_index:04d}{suffix}"
     else:
         filename = f"response-{pagination_state.request_index:04d}{suffix}"
+    if request_input_count > 1:
+        return Path(f"request-input-{request_input_index:06d}") / filename
     return Path("pages") / filename
+
+
+def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> dict[str, str]:
+    parameter_bindings = plan.source_config.access.parameter_bindings or {}
+    request_inputs = plan.source_config.access.request_inputs
+    metadata = {
+        "request_input_type": request_inputs.type,
+        "request_input_count": str(request_input_count),
+    }
+    if parameter_bindings:
+        metadata["bound_parameter_names"] = ",".join(sorted(parameter_bindings))
+    if request_inputs.type == "iceberg_rows":
+        metadata["upstream_namespace"] = request_inputs.namespace
+        metadata["upstream_table_name"] = request_inputs.table_name
+        metadata["upstream_column_names"] = ",".join(
+            sorted(
+                {
+                    str(column).strip()
+                    for column in request_inputs.columns.values()
+                    if str(column).strip()
+                }
+            )
+        )
+    return metadata
+
+
+def _request_input_field_names(
+    request_input: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    if not request_input:
+        return ()
+    return tuple(sorted(str(field_name) for field_name in request_input))
 
 
 def _default_records_from_payload(payload: Any) -> Sequence[Any]:

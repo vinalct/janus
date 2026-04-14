@@ -15,7 +15,6 @@ from janus.models.source_config import SourceConfig
 from janus.registry import load_registry
 from janus.strategies.base import BaseStrategy, SourceHook
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -81,7 +80,10 @@ class FakeStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         hook: SourceHook | None = None,
+        *,
+        spark=None,
     ) -> ExtractionResult:
+        del spark
         extraction_result = ExtractionResult.from_plan(
             plan,
             artifacts=(
