@@ -141,13 +141,14 @@ Supported request-input types:
 - `none`
 - `date_window` with `start`, `end`, and `step`
 - `iceberg_rows` with `namespace`, `table_name`, `columns`, and optional `distinct`
+- `combined` with an `inputs:` list of two or more `date_window` or `iceberg_rows` entries
 
 Supported binding sources:
 
 - `checkpoint_value`
 - `request_input.window_start`
 - `request_input.window_end`
-- `request_input.<field>` for fields declared under `access.request_inputs.columns` when `type: iceberg_rows`
+- `request_input.<field>` for fields from `iceberg_rows` columns, or from any sub-input when `type: combined`
 
 Keep the boundaries sharp:
 
@@ -221,6 +222,46 @@ access:
 ```
 
 JANUS loads one projected row per distinct `codOrgaoExercicioSiape` value, binds `codigoOrgao` from that request input, and keeps the shared pagination, retry, raw-persistence, and metadata flow unchanged inside each request stream.
+
+### Example: Combined Identifier and Date Window
+
+This pattern is a good fit when an endpoint requires both an upstream entity identifier and a bounded date context per request stream — neither input alone is sufficient.
+
+```yaml
+strategy: api
+strategy_variant: page_number_api
+
+access:
+  request_inputs:
+    type: combined
+    inputs:
+      - type: iceberg_rows
+        namespace: bronze_transparencia
+        table_name: orgaos
+        columns:
+          orgao_codigo: codigo
+        distinct: true
+      - type: date_window
+        start: 2025-01-01
+        end: 2025-12-31
+        step: month
+  parameter_bindings:
+    codigoOrgao:
+      from: request_input.orgao_codigo
+    dataInicio:
+      from: request_input.window_start
+      format: "%Y-%m-%d"
+    dataFinal:
+      from: request_input.window_end
+      format: "%Y-%m-%d"
+  pagination:
+    type: page_number
+    page_param: pagina
+    size_param: tamanhoPagina
+    page_size: 50
+```
+
+JANUS computes the Cartesian product of the two input streams and runs one request stream per combination. With 5 org codes and 12 monthly windows, that produces 60 request streams, each bound with its own `codigoOrgao`, `dataInicio`, and `dataFinal`.
 
 ### `extraction`
 

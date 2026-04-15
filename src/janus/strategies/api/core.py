@@ -15,9 +15,11 @@ from urllib.parse import urljoin
 
 from janus.checkpoints import CheckpointState, CheckpointStore
 from janus.models import (
+    CombinedRequestInputsConfig,
     ExecutionPlan,
     ExtractedArtifact,
     ExtractionResult,
+    IcebergRowsRequestInputsConfig,
     SourceConfig,
     WriteResult,
 )
@@ -1139,7 +1141,9 @@ def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> di
     }
     if parameter_bindings:
         metadata["bound_parameter_names"] = ",".join(sorted(parameter_bindings))
-    if request_inputs.type == "iceberg_rows":
+    if request_inputs.type == "iceberg_rows" and isinstance(
+        request_inputs, IcebergRowsRequestInputsConfig
+    ):
         metadata["upstream_namespace"] = request_inputs.namespace
         metadata["upstream_table_name"] = request_inputs.table_name
         metadata["upstream_column_names"] = ",".join(
@@ -1151,6 +1155,23 @@ def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> di
                 }
             )
         )
+    if request_inputs.type == "combined" and isinstance(
+        request_inputs, CombinedRequestInputsConfig
+    ):
+        for sub_ri in request_inputs.inputs:
+            if isinstance(sub_ri, IcebergRowsRequestInputsConfig):
+                metadata["upstream_namespace"] = sub_ri.namespace
+                metadata["upstream_table_name"] = sub_ri.table_name
+                metadata["upstream_column_names"] = ",".join(
+                    sorted(
+                        {
+                            str(column).strip()
+                            for column in sub_ri.columns.values()
+                            if str(column).strip()
+                        }
+                    )
+                )
+                break
     return metadata
 
 

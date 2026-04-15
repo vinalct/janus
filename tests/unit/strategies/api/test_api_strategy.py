@@ -620,6 +620,98 @@ def test_api_strategy_request_inputs_bind_iceberg_rows_from_runtime_spark(tmp_pa
     )
 
 
+def test_api_strategy_combined_request_inputs_cross_join_iceberg_and_date_window(tmp_path):
+    plan = _build_plan(
+        tmp_path,
+        source_id="combined_source",
+        request_inputs={
+            "type": "combined",
+            "inputs": [
+                {
+                    "type": "iceberg_rows",
+                    "namespace": "bronze_transparencia",
+                    "table_name": "orgaos",
+                    "columns": {"orgao_codigo": "codigo"},
+                },
+                {
+                    "type": "date_window",
+                    "start": date(2025, 1, 1),
+                    "end": date(2025, 2, 28),
+                    "step": "month",
+                },
+            ],
+        },
+        parameter_bindings={
+            "codigoOrgao": {"from": "request_input.orgao_codigo"},
+            "dataInicio": {"from": "request_input.window_start", "format": "%Y-%m-%d"},
+            "dataFinal": {"from": "request_input.window_end", "format": "%Y-%m-%d"},
+        },
+        page_size=2,
+    )
+    spark = FakeSparkSession(
+        {
+            "bronze_transparencia.orgaos": FakeDataFrame(
+                [
+                    {"codigo": "26000"},
+                    {"codigo": "52000"},
+                ]
+            )
+        }
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"records": [{"id": "A"}]}),
+            ResponseSpec(200, {"records": [{"id": "B"}]}),
+            ResponseSpec(200, {"records": [{"id": "C"}]}),
+            ResponseSpec(200, {"records": [{"id": "D"}]}),
+        ],
+    )
+
+    result = strategy.extract(plan, spark=spark)
+    metadata = result.metadata_as_dict()
+
+    queries = [parse_qs(urlsplit(req.full_url()).query) for req in transport.requests]
+    assert [q["codigoOrgao"] for q in queries] == [["26000"], ["26000"], ["52000"], ["52000"]]
+    assert [q["dataInicio"] for q in queries] == [
+        ["2025-01-01"],
+        ["2025-02-01"],
+        ["2025-01-01"],
+        ["2025-02-01"],
+    ]
+    assert [q["dataFinal"] for q in queries] == [
+        ["2025-01-31"],
+        ["2025-02-28"],
+        ["2025-01-31"],
+        ["2025-02-28"],
+    ]
+
+    assert metadata["request_input_type"] == "combined"
+    assert metadata["request_input_count"] == "4"
+    assert metadata["upstream_namespace"] == "bronze_transparencia"
+    assert metadata["upstream_table_name"] == "orgaos"
+    assert metadata["upstream_column_names"] == "codigo"
+
+    assert Path(result.artifacts[0].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "combined_source"
+        / "request-input-000001"
+        / "page-0001.json"
+    )
+    assert Path(result.artifacts[3].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "combined_source"
+        / "request-input-000004"
+        / "page-0001.json"
+    )
+
+
 def test_api_strategy_hook_can_override_checkpoint_params_and_record_extraction(tmp_path):
     plan = _build_plan(
         tmp_path,

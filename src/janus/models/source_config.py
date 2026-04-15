@@ -28,8 +28,9 @@ SUPPORTED_WRITE_MODES = frozenset({"append", "ignore", "overwrite"})
 SUPPORTED_BACKOFF_STRATEGIES = frozenset({"exponential", "fixed"})
 SUPPORTED_HTTP_METHODS = frozenset({"DELETE", "GET", "PATCH", "POST", "PUT"})
 SUPPORTED_FEDERATION_LEVELS = frozenset({"federal"})
-SUPPORTED_REQUEST_INPUT_TYPES = frozenset({"date_window", "iceberg_rows", "none"})
+SUPPORTED_REQUEST_INPUT_TYPES = frozenset({"combined", "date_window", "iceberg_rows", "none"})
 SUPPORTED_REQUEST_INPUT_STEPS = frozenset({"day", "month"})
+_SUPPORTED_SUB_REQUEST_INPUT_TYPES = frozenset({"date_window", "iceberg_rows"})
 SUPPORTED_PARAMETER_BINDING_WINDOW_SOURCES = frozenset(
     {"request_input.window_end", "request_input.window_start"}
 )
@@ -103,6 +104,11 @@ class IcebergRowsRequestInputsConfig(RequestInputsConfig):
     table_name: str
     columns: dict[str, str]
     distinct: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CombinedRequestInputsConfig(RequestInputsConfig):
+    inputs: tuple[RequestInputsConfig, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,58 +568,61 @@ def _build_request_inputs_config(
         "access.request_inputs",
     )
 
-    if request_input_type == "date_window":
-        start = _require_date(data, "start", issues, "access.request_inputs")
-        end = _require_date(data, "end", issues, "access.request_inputs")
-        step = _require_enum(
-            data,
-            "step",
-            SUPPORTED_REQUEST_INPUT_STEPS,
-            issues,
-            "access.request_inputs",
-        )
+    if request_input_type == "combined":
+        return _build_combined_request_inputs_config(data, issues)
+
+    return _parse_request_input_entry(
+        data, request_input_type, "access.request_inputs", issues
+    )
+
+
+def _parse_request_input_entry(
+    data: Mapping[str, Any],
+    input_type: str,
+    prefix: str,
+    issues: list[ValidationIssue],
+) -> RequestInputsConfig:
+    """Parse one atomic request-input config from an already-validated dict."""
+    if input_type == "date_window":
+        start = _require_date(data, "start", issues, prefix)
+        end = _require_date(data, "end", issues, prefix)
+        step = _require_enum(data, "step", SUPPORTED_REQUEST_INPUT_STEPS, issues, prefix)
 
         if start is not None and end is not None and start > end:
             issues.append(
                 ValidationIssue(
-                    "access.request_inputs.end",
-                    "must be on or after access.request_inputs.start",
+                    f"{prefix}.end",
+                    f"must be on or after {prefix}.start",
                 )
             )
 
         return DateWindowRequestInputsConfig(
-            type=request_input_type,
+            type=input_type,
             start=start or date.min,
             end=end or date.min,
             step=step,
         )
 
-    if request_input_type == "iceberg_rows":
-        namespace = _require_string(data, "namespace", issues, "access.request_inputs")
-        table_name = _require_string(data, "table_name", issues, "access.request_inputs")
+    if input_type == "iceberg_rows":
+        namespace = _require_string(data, "namespace", issues, prefix)
+        table_name = _require_string(data, "table_name", issues, prefix)
         columns_value = data.get("columns")
         columns = _require_non_empty_string_mapping(
             columns_value,
-            "access.request_inputs.columns",
+            f"{prefix}.columns",
             issues,
         )
         if isinstance(columns_value, Mapping) and not columns_value:
             issues.append(
                 ValidationIssue(
-                    "access.request_inputs.columns",
+                    f"{prefix}.columns",
                     "must not be empty",
                 )
             )
-        distinct = _optional_bool(
-            data,
-            "distinct",
-            issues,
-            "access.request_inputs",
-            default=False,
-        )
+        distinct = _optional_bool(data, "distinct", issues, prefix, default=False)
 
         return IcebergRowsRequestInputsConfig(
-            type=request_input_type,
+            type=input_type,
             namespace=namespace,
             table_name=table_name,
             columns=columns,
@@ -621,6 +630,76 @@ def _build_request_inputs_config(
         )
 
     return RequestInputsConfig(type="none")
+
+
+def _build_combined_request_inputs_config(
+    data: Mapping[str, Any],
+    issues: list[ValidationIssue],
+) -> RequestInputsConfig:
+    """Validate and build a combined request-input config from a list of sub-inputs."""
+    inputs_raw = data.get("inputs")
+    if not isinstance(inputs_raw, list):
+        issues.append(
+            ValidationIssue(
+                "access.request_inputs.inputs",
+                "is required and must be a list when type is 'combined'",
+            )
+        )
+        return CombinedRequestInputsConfig(type="combined", inputs=())
+
+    if len(inputs_raw) < 2:
+        issues.append(
+            ValidationIssue(
+                "access.request_inputs.inputs",
+                "must contain at least 2 entries when type is 'combined'",
+            )
+        )
+        return CombinedRequestInputsConfig(type="combined", inputs=())
+
+    sub_configs: list[RequestInputsConfig] = []
+    seen_fields: set[str] = set()
+
+    for idx, sub_raw in enumerate(inputs_raw):
+        sub_prefix = f"access.request_inputs.inputs[{idx}]"
+        if not isinstance(sub_raw, Mapping):
+            issues.append(ValidationIssue(sub_prefix, "must be a mapping"))
+            continue
+
+        sub_type = _require_enum(
+            sub_raw,
+            "type",
+            _SUPPORTED_SUB_REQUEST_INPUT_TYPES,
+            issues,
+            sub_prefix,
+        )
+        if not sub_type:
+            continue
+
+        sub_config = _parse_request_input_entry(sub_raw, sub_type, sub_prefix, issues)
+
+        sub_fields = _request_input_field_names_for(sub_config)
+        conflicts = seen_fields.intersection(sub_fields)
+        if conflicts:
+            conflicting = ", ".join(sorted(conflicts))
+            issues.append(
+                ValidationIssue(
+                    sub_prefix,
+                    f"field name(s) {conflicting!r} conflict with another input in this combined config",
+                )
+            )
+        seen_fields.update(sub_fields)
+        sub_configs.append(sub_config)
+
+    return CombinedRequestInputsConfig(type="combined", inputs=tuple(sub_configs))
+
+
+def _request_input_field_names_for(config: RequestInputsConfig) -> frozenset[str]:
+    """Return the set of field names that a request-input config exposes at runtime."""
+    if config.type == "date_window":
+        return frozenset({"window_start", "window_end"})
+    if config.type == "iceberg_rows" and isinstance(config, IcebergRowsRequestInputsConfig):
+        return frozenset(config.columns.keys())
+    return frozenset()
 
 
 def _build_parameter_bindings_config(
@@ -751,6 +830,24 @@ def _validate_parameter_binding_source(
                 ValidationIssue(
                     field_path,
                     f"must reference one of access.request_inputs.columns: {allowed_fields}",
+                )
+            )
+
+    if request_inputs.type == "combined":
+        if not isinstance(request_inputs, CombinedRequestInputsConfig):
+            return
+
+        all_fields = frozenset(
+            field
+            for sub in request_inputs.inputs
+            for field in _request_input_field_names_for(sub)
+        )
+        if request_input_field not in all_fields:
+            allowed_fields = ", ".join(sorted(all_fields))
+            issues.append(
+                ValidationIssue(
+                    field_path,
+                    f"must reference one of the combined input fields: {allowed_fields}",
                 )
             )
 

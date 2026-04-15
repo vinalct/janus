@@ -10,6 +10,7 @@ from janus.models.contracts import (
 from janus.models.source_config import (
     AccessConfig,
     AuthConfig,
+    CombinedRequestInputsConfig,
     DateWindowRequestInputsConfig,
     ExtractionConfig,
     IcebergRowsRequestInputsConfig,
@@ -31,6 +32,7 @@ from janus.models.source_config import (
 __all__ = [
     "AccessConfig",
     "AuthConfig",
+    "CombinedRequestInputsConfig",
     "DateWindowRequestInputsConfig",
     "ExecutionPlan",
     "ExtractedArtifact",

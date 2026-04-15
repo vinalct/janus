@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from janus.models.source_config import SourceConfig, SourceConfigValidationError
+from janus.models.source_config import (
+    CombinedRequestInputsConfig,
+    DateWindowRequestInputsConfig,
+    IcebergRowsRequestInputsConfig,
+    SourceConfig,
+    SourceConfigValidationError,
+)
 from janus.registry import SourceNotFoundError, load_registry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -560,8 +566,150 @@ def test_registry_rejects_request_input_bindings_when_request_inputs_are_invalid
         load_registry(project_root)
 
     message = str(exc_info.value)
-    assert "access.request_inputs.type: must be one of: date_window, iceberg_rows, none" in message
+    assert "access.request_inputs.type: must be one of: combined, date_window, iceberg_rows, none" in message
     assert (
         "access.parameter_bindings.id.from: requires access.request_inputs to declare a non-'none' type"  # noqa: E501
         in message
+    )
+
+
+def test_registry_parses_combined_request_inputs_and_parameter_bindings(tmp_path):
+    source_yaml = _valid_source_yaml("combined_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: combined\n"
+        "    inputs:\n"
+        "      - type: iceberg_rows\n"
+        "        namespace: bronze_transparencia\n"
+        "        table_name: orgaos\n"
+        "        columns:\n"
+        "          orgao_codigo: codigo\n"
+        "      - type: date_window\n"
+        "        start: 2025-01-01\n"
+        "        end: 2025-03-31\n"
+        "        step: month\n"
+        "  parameter_bindings:\n"
+        "    codigoOrgao:\n"
+        "      from: request_input.orgao_codigo\n"
+        "    dataInicio:\n"
+        "      from: request_input.window_start\n"
+        "      format: \"%Y-%m-%d\"\n"
+        "    dataFinal:\n"
+        "      from: request_input.window_end\n"
+        "      format: \"%Y-%m-%d\"\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"combined.yaml": source_yaml})
+
+    source = load_registry(project_root).get_source("combined_source")
+
+    assert source.access.request_inputs.type == "combined"
+    assert isinstance(source.access.request_inputs, CombinedRequestInputsConfig)
+    assert len(source.access.request_inputs.inputs) == 2
+
+    iceberg_sub = source.access.request_inputs.inputs[0]
+    assert isinstance(iceberg_sub, IcebergRowsRequestInputsConfig)
+    assert iceberg_sub.namespace == "bronze_transparencia"
+    assert iceberg_sub.table_name == "orgaos"
+    assert iceberg_sub.columns == {"orgao_codigo": "codigo"}
+
+    window_sub = source.access.request_inputs.inputs[1]
+    assert isinstance(window_sub, DateWindowRequestInputsConfig)
+    assert window_sub.start.isoformat() == "2025-01-01"
+    assert window_sub.end.isoformat() == "2025-03-31"
+    assert window_sub.step == "month"
+
+    assert source.access.parameter_bindings is not None
+    assert source.access.parameter_bindings["codigoOrgao"].from_ == "request_input.orgao_codigo"
+    assert source.access.parameter_bindings["dataInicio"].from_ == "request_input.window_start"
+    assert source.access.parameter_bindings["dataInicio"].format == "%Y-%m-%d"
+    assert source.access.parameter_bindings["dataFinal"].from_ == "request_input.window_end"
+
+
+def test_registry_rejects_combined_request_inputs_with_too_few_entries(tmp_path):
+    source_yaml = _valid_source_yaml("combined_short_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: combined\n"
+        "    inputs:\n"
+        "      - type: date_window\n"
+        "        start: 2025-01-01\n"
+        "        end: 2025-03-31\n"
+        "        step: month\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"combined_short.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert (
+        "access.request_inputs.inputs: must contain at least 2 entries when type is 'combined'"
+        in str(exc_info.value)
+    )
+
+
+def test_registry_rejects_combined_request_inputs_with_field_name_conflicts(tmp_path):
+    source_yaml = _valid_source_yaml("combined_conflict_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: combined\n"
+        "    inputs:\n"
+        "      - type: date_window\n"
+        "        start: 2025-01-01\n"
+        "        end: 2025-03-31\n"
+        "        step: month\n"
+        "      - type: date_window\n"
+        "        start: 2025-01-01\n"
+        "        end: 2025-03-31\n"
+        "        step: month\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"combined_conflict.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert "conflict with another input in this combined config" in str(exc_info.value)
+
+
+def test_registry_rejects_combined_parameter_binding_referencing_unknown_field(tmp_path):
+    source_yaml = _valid_source_yaml("combined_bad_binding_source", enabled=True).replace(
+        "  auth:\n"
+        "    type: none\n",
+        "  request_inputs:\n"
+        "    type: combined\n"
+        "    inputs:\n"
+        "      - type: iceberg_rows\n"
+        "        namespace: bronze_transparencia\n"
+        "        table_name: orgaos\n"
+        "        columns:\n"
+        "          orgao_codigo: codigo\n"
+        "      - type: date_window\n"
+        "        start: 2025-01-01\n"
+        "        end: 2025-03-31\n"
+        "        step: month\n"
+        "  parameter_bindings:\n"
+        "    bad_param:\n"
+        "      from: request_input.nonexistent_field\n"
+        "  auth:\n"
+        "    type: none\n",
+        1,
+    )
+    project_root = _create_project(tmp_path, {"combined_bad_binding.yaml": source_yaml})
+
+    with pytest.raises(SourceConfigValidationError) as exc_info:
+        load_registry(project_root)
+
+    assert (
+        "must reference one of the combined input fields" in str(exc_info.value)
     )

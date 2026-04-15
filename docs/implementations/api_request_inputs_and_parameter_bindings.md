@@ -73,6 +73,18 @@ The scope is intentionally narrow:
 - no joins
 - no arbitrary SQL
 
+### `combined`
+
+Use this type when an endpoint requires parameters from more than one independent source — for example, an entity identifier from an upstream Iceberg table and a date range per month.
+
+Declare two or more atomic inputs under `inputs:`. JANUS resolves each sub-input independently, computes the Cartesian product, and merges each combination into one flat request context. Parameter bindings resolve against that merged context as normal.
+
+Constraints:
+
+- `inputs` must contain at least two entries.
+- Each entry must be `date_window` or `iceberg_rows`. Nesting `combined` or `none` is not supported.
+- Field names must not conflict across entries. Two `date_window` entries, for example, both expose `window_start` and `window_end`, which is rejected at registry load time.
+
 ## Supported parameter bindings
 
 The supported binding sources are:
@@ -80,7 +92,7 @@ The supported binding sources are:
 - `checkpoint_value`
 - `request_input.window_start`
 - `request_input.window_end`
-- `request_input.<field>`
+- `request_input.<field>` — any field exposed by the active request input; for `combined`, this covers fields from all sub-inputs
 
 Bindings may also declare an optional `format` for date-like values. This is what allows a request window to become `%Y%m` for one endpoint and `%Y-%m-%d` for another without adding endpoint-specific code.
 
@@ -158,6 +170,7 @@ That coverage locks down:
 - contract validation
 - date-window generation
 - Iceberg row loading
+- combined input Cartesian product and merged binding resolution
 - binding resolution
 - deterministic raw artifact naming
 - backward compatibility for existing static-param API sources

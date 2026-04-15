@@ -3,6 +3,7 @@ from datetime import date
 import pytest
 
 from janus.models import (
+    CombinedRequestInputsConfig,
     DateWindowRequestInputsConfig,
     IcebergRowsRequestInputsConfig,
     ParameterBinding,
@@ -376,3 +377,89 @@ def test_load_request_inputs_rejects_iceberg_rows_without_spark():
     assert str(exc_info.value) == (
         "access.request_inputs: iceberg_rows inputs require an active SparkSession"
     )
+
+
+def test_load_request_inputs_combined_computes_cartesian_product_of_iceberg_and_date_window():
+    iceberg_input = IcebergRowsRequestInputsConfig(
+        type="iceberg_rows",
+        namespace="bronze_transparencia",
+        table_name="orgaos",
+        columns={"orgao_codigo": "codigo"},
+    )
+    window_input = DateWindowRequestInputsConfig(
+        type="date_window",
+        start=date(2025, 1, 1),
+        end=date(2025, 2, 28),
+        step="month",
+    )
+    request_inputs = CombinedRequestInputsConfig(
+        type="combined",
+        inputs=(iceberg_input, window_input),
+    )
+    spark = FakeSparkSession(
+        {
+            "bronze_transparencia.orgaos": FakeDataFrame(
+                [
+                    {"codigo": "26000"},
+                    {"codigo": "52000"},
+                ]
+            )
+        }
+    )
+
+    result = load_request_inputs(request_inputs, spark=spark)
+
+    assert result == (
+        {
+            "orgao_codigo": "26000",
+            "window_start": date(2025, 1, 1),
+            "window_end": date(2025, 1, 31),
+        },
+        {
+            "orgao_codigo": "26000",
+            "window_start": date(2025, 2, 1),
+            "window_end": date(2025, 2, 28),
+        },
+        {
+            "orgao_codigo": "52000",
+            "window_start": date(2025, 1, 1),
+            "window_end": date(2025, 1, 31),
+        },
+        {
+            "orgao_codigo": "52000",
+            "window_start": date(2025, 2, 1),
+            "window_end": date(2025, 2, 28),
+        },
+    )
+
+
+def test_load_request_inputs_combined_resolves_bindings_from_merged_context():
+    bindings = {
+        "codigoOrgao": ParameterBinding(from_="request_input.orgao_codigo"),
+        "mesAno": ParameterBinding(from_="request_input.window_end", format="%Y%m"),
+    }
+    iceberg_input = IcebergRowsRequestInputsConfig(
+        type="iceberg_rows",
+        namespace="bronze_transparencia",
+        table_name="orgaos",
+        columns={"orgao_codigo": "codigo"},
+    )
+    window_input = DateWindowRequestInputsConfig(
+        type="date_window",
+        start=date(2025, 1, 1),
+        end=date(2025, 1, 31),
+        step="month",
+    )
+    request_inputs = CombinedRequestInputsConfig(
+        type="combined",
+        inputs=(iceberg_input, window_input),
+    )
+    spark = FakeSparkSession(
+        {"bronze_transparencia.orgaos": FakeDataFrame([{"codigo": "26000"}])}
+    )
+
+    combined_contexts = load_request_inputs(request_inputs, spark=spark)
+
+    resolved = resolve_parameter_bindings(bindings, request_input=combined_contexts[0])
+
+    assert resolved == {"codigoOrgao": "26000", "mesAno": "202501"}

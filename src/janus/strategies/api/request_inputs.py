@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from itertools import product as itertools_product
 from typing import TYPE_CHECKING, Any
 
 from janus.models import (
+    CombinedRequestInputsConfig,
     DateWindowRequestInputsConfig,
     IcebergRowsRequestInputsConfig,
     ParameterBinding,
@@ -80,6 +82,22 @@ def load_request_inputs(
     if request_inputs.type == "none":
         return (None,)
 
+    if request_inputs.type == "combined":
+        if not isinstance(request_inputs, CombinedRequestInputsConfig):
+            raise ApiRequestInputLoadError(
+                "access.request_inputs: combined inputs must use CombinedRequestInputsConfig"
+            )
+        return _load_combined_request_inputs(request_inputs, spark=spark)
+
+    return _load_single_request_input(request_inputs, spark=spark)
+
+
+def _load_single_request_input(
+    request_inputs: RequestInputsConfig,
+    *,
+    spark: SparkSession | None,
+) -> tuple[dict[str, Any], ...]:
+    """Load contexts for one atomic (non-combined) request-input type."""
     if request_inputs.type == "date_window":
         if not isinstance(request_inputs, DateWindowRequestInputsConfig):
             raise ApiRequestInputLoadError(
@@ -98,6 +116,24 @@ def load_request_inputs(
         "access.request_inputs.type: unsupported runtime request-input "
         f"type {request_inputs.type!r}"
     )
+
+
+def _load_combined_request_inputs(
+    request_inputs: CombinedRequestInputsConfig,
+    *,
+    spark: SparkSession | None,
+) -> tuple[dict[str, Any], ...]:
+    """Compute the Cartesian product of all sub-input contexts."""
+    all_contexts = [
+        _load_single_request_input(sub, spark=spark) for sub in request_inputs.inputs
+    ]
+    combined: list[dict[str, Any]] = []
+    for combo in itertools_product(*all_contexts):
+        merged: dict[str, Any] = {}
+        for ctx in combo:
+            merged.update(ctx)
+        combined.append(merged)
+    return tuple(combined)
 
 
 def generate_date_window_request_inputs(
