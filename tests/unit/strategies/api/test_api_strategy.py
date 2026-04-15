@@ -286,6 +286,7 @@ def test_api_strategy_request_inputs_bind_date_windows_and_partition_raw_outputs
     plan = _build_plan(
         tmp_path,
         source_id="windowed_source",
+        params={"situacao": "TODAS"},
         request_inputs={
             "type": "date_window",
             "start": date(2025, 1, 1),
@@ -313,6 +314,7 @@ def test_api_strategy_request_inputs_bind_date_windows_and_partition_raw_outputs
     metadata = result.metadata_as_dict()
 
     queries = [parse_qs(urlsplit(request.full_url()).query) for request in transport.requests]
+    assert [query["situacao"] for query in queries] == [["TODAS"], ["TODAS"]]
     assert [query["mesAno"] for query in queries] == [["202501"], ["202502"]]
     assert [query["page"] for query in queries] == [["1"], ["1"]]
     assert [query["page_size"] for query in queries] == [["2"], ["2"]]
@@ -349,6 +351,43 @@ def test_api_strategy_request_inputs_bind_date_windows_and_partition_raw_outputs
         payload for payload in payloads if payload["event"] == "api_request_finished"
     ]
     assert [payload["fields"]["request_input_index"] for payload in finished_requests] == [1, 2]
+
+
+def test_api_strategy_keeps_static_params_backward_compatible_when_request_inputs_default_to_none(
+    tmp_path,
+):
+    plan = _build_plan(
+        tmp_path,
+        source_id="static_param_source",
+        params={"situacao": "TODAS"},
+        page_size=2,
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [ResponseSpec(200, {"records": [{"id": "1"}]})],
+    )
+
+    result = strategy.extract(plan)
+    metadata = result.metadata_as_dict()
+
+    query = parse_qs(urlsplit(transport.requests[0].full_url()).query)
+    assert query["situacao"] == ["TODAS"]
+    assert query["page"] == ["1"]
+    assert query["page_size"] == ["2"]
+
+    assert result.records_extracted == 1
+    assert metadata["request_input_type"] == "none"
+    assert metadata["request_input_count"] == "1"
+    assert "bound_parameter_names" not in metadata
+    assert Path(result.artifacts[0].path) == (
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "static_param_source"
+        / "pages"
+        / "page-0001.json"
+    )
 
 
 def test_api_strategy_page_number_extracts_raw_pages_and_tracks_checkpoint(tmp_path):

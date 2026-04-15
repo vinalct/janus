@@ -121,6 +121,106 @@ The registry contract is intentionally small. The most important current options
 - `access.auth.type` controls auth shape. Supported values today are `none`, `header_token`, `bearer_token`, `query_token`, and `basic`.
 - `access.pagination.type` must match the chosen family variant when pagination is used: `page_number`, `offset`, `cursor`, or `none`.
 - `access.rate_limit` carries `requests_per_minute`, optional `backoff_seconds`, and optional `concurrency`.
+- `access.params` is the home for static literal request parameters.
+- `access.request_inputs` is an optional API-only block for bounded runtime request contexts before pagination starts.
+- `access.parameter_bindings` is an optional API-only block for request parameters resolved from the current request input or checkpoint state.
+
+### API Request Shaping
+
+For API sources, keep the request contract split by responsibility:
+
+- `access.params` holds fixed literals that should be sent on every request.
+- `access.request_inputs` defines the bounded outer request contexts JANUS should resolve before pagination starts.
+- `access.parameter_bindings` maps request parameter names to runtime values from the current request input or the current checkpoint.
+- hooks remain the escape hatch when the request still needs source-specific preparation after those three layers are exhausted.
+
+If `access.request_inputs` is omitted, JANUS keeps the existing one-stream behavior with `type: none`.
+
+Supported request-input types:
+
+- `none`
+- `date_window` with `start`, `end`, and `step`
+- `iceberg_rows` with `namespace`, `table_name`, `columns`, and optional `distinct`
+
+Supported binding sources:
+
+- `checkpoint_value`
+- `request_input.window_start`
+- `request_input.window_end`
+- `request_input.<field>` for fields declared under `access.request_inputs.columns` when `type: iceberg_rows`
+
+Keep the boundaries sharp:
+
+- use `access.params` for literals such as `situacao: TODAS`;
+- use `access.parameter_bindings` for values such as `mesAno`, `dataIdaDe`, `dataIdaAte`, or a detail identifier that changes per request input;
+- use a hook only when the request shape is still irregular, such as custom signing, request-body generation, or a one-off cursor rule.
+
+Request inputs do not replace pagination. They sit outside it. Choose the strategy variant and `access.pagination` that match the API request loop, then add `access.request_inputs` only when the endpoint also needs a bounded outer context.
+
+### Example: Monthly Parameter Binding
+
+This pattern is a good fit when the endpoint still paginates normally, but also expects one bounded date context per request stream.
+
+```yaml
+strategy: api
+strategy_variant: page_number_api
+
+access:
+  params:
+    situacao: TODAS
+  request_inputs:
+    type: date_window
+    start: 2025-01-01
+    end: 2025-03-31
+    step: month
+  parameter_bindings:
+    mesAno:
+      from: request_input.window_end
+      format: "%Y%m"
+    dataIdaDe:
+      from: request_input.window_start
+      format: "%Y-%m-%d"
+    dataIdaAte:
+      from: request_input.window_end
+      format: "%Y-%m-%d"
+  pagination:
+    type: page_number
+    page_param: pagina
+    size_param: tamanhoPagina
+    page_size: 50
+```
+
+JANUS resolves one monthly window at a time, binds the three runtime parameters for that window, and then runs the normal page loop inside each request stream.
+
+### Example: Iceberg-Driven Identifier Iteration
+
+This pattern is a good fit for detail endpoints that depend on identifiers JANUS already wrote to Bronze Iceberg.
+
+```yaml
+strategy: api
+strategy_variant: page_number_api
+
+access:
+  params:
+    situacao: ATIVO
+  request_inputs:
+    type: iceberg_rows
+    namespace: bronze_transparencia
+    table_name: orgaos__siape
+    columns:
+      orgao_codigo: codOrgaoExercicioSiape
+    distinct: true
+  parameter_bindings:
+    codigoOrgao:
+      from: request_input.orgao_codigo
+  pagination:
+    type: page_number
+    page_param: pagina
+    size_param: tamanhoPagina
+    page_size: 50
+```
+
+JANUS loads one projected row per distinct `codOrgaoExercicioSiape` value, binds `codigoOrgao` from that request input, and keeps the shared pagination, retry, raw-persistence, and metadata flow unchanged inside each request stream.
 
 ### `extraction`
 

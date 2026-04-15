@@ -27,6 +27,7 @@ Use the API family when the source is fundamentally about requesting pages or wi
 The shared API strategy already owns:
 
 - request construction from source config;
+- bounded request-input loading and parameter binding before pagination when a source needs runtime request contexts;
 - auth injection from environment variables;
 - pagination flow;
 - bounded retry and request pacing;
@@ -39,6 +40,13 @@ Typical fit:
 - public APIs with page or offset parameters;
 - APIs that return JSON records directly;
 - endpoints where the main complexity is request/response behavior.
+
+Keep the request-shaping layers separate:
+
+- `access.params` for fixed literals;
+- `access.request_inputs` for bounded outer request contexts;
+- `access.parameter_bindings` for runtime values derived from the current request input or checkpoint;
+- hooks for the cases that are still genuinely irregular.
 
 Good hook use in this family:
 
