@@ -18,7 +18,7 @@ define RUN_COMPOSE
 	JANUS_CONTAINER_USER=$$container_user JANUS_UID=$(JANUS_UID) JANUS_GID=$(JANUS_GID) JANUS_PROJECT_ROOT=$(JANUS_PROJECT_ROOT) $$compose_cmd $$compose_files $(1)
 endef
 
-.PHONY: bootstrap check-compose up down status logs shell pyspark-local lint test run-local run-local-config docker-build docker-run clean
+.PHONY: bootstrap check-compose up ensure-up down status logs shell pyspark-local lint test run-local run-local-config docker-build docker-run clean
 
 check-compose:
 	@compose_cmd="$$( $(DETECT_COMPOSE) )" || { \
@@ -31,8 +31,12 @@ check-compose:
 bootstrap: check-compose
 	$(call RUN_COMPOSE,build $(SERVICE))
 
+# Explicit fresh restart — stops and recreates the container.
 up: check-compose
 	$(call RUN_COMPOSE,up -d --force-recreate $(SERVICE))
+
+ensure-up: check-compose
+	$(call RUN_COMPOSE,up -d $(SERVICE))
 
 down: check-compose
 	$(call RUN_COMPOSE,down)
@@ -43,10 +47,10 @@ status: check-compose
 logs: check-compose
 	$(call RUN_COMPOSE,logs $(SERVICE))
 
-shell: up
+shell: ensure-up
 	$(call RUN_COMPOSE,exec $(SERVICE) sh)
 
-pyspark-local: up
+pyspark-local: ensure-up
 	$(call RUN_COMPOSE,exec $(SERVICE) sh -lc '\
 	ivy_dir="$${JANUS_SPARK_IVY_DIR:-data/metadata/ivy}"; \
 	if [ "$$ivy_dir" = "$${ivy_dir#/}" ]; then ivy_dir="/workspace/$$ivy_dir"; fi; \
@@ -69,16 +73,16 @@ pyspark-local: up
 --conf spark.sql.session.timeZone=UTC \
 	--conf spark.ui.enabled=false')
 
-lint: up
+lint: ensure-up
 	$(call RUN_COMPOSE,exec -T $(SERVICE) python -m ruff check src tests)
 
-test: up
+test: ensure-up
 	$(call RUN_COMPOSE,exec -T $(SERVICE) python -m pytest)
 
-run-local: up
+run-local: ensure-up
 	$(call RUN_COMPOSE,exec -T $(SERVICE) python -m janus.main --environment $(ENVIRONMENT) --with-spark)
 
-run-local-config: up
+run-local-config: ensure-up
 	$(call RUN_COMPOSE,exec -T $(SERVICE) python -m janus.main --environment $(ENVIRONMENT))
 
 docker-build: bootstrap
