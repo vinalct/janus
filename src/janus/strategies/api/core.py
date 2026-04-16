@@ -191,7 +191,7 @@ class ApiRequestThrottle:
 class SubmittedApiRequest:
     pagination_state: PaginationState
     request: ApiRequest
-    future: Future[tuple[ApiResponse, int]]
+    future: Future[tuple[ApiResponse, Any, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -578,7 +578,7 @@ class ApiStrategy(BaseStrategy):
                     checkpoint_state=checkpoint_state,
                     logger=logger,
                 )
-                response, attempts_used = self._send_with_retries(
+                response, payload, attempts_used = self._send_with_retries(
                     plan,
                     client,
                     request,
@@ -594,6 +594,7 @@ class ApiStrategy(BaseStrategy):
                     pagination_state,
                     request,
                     response,
+                    payload,
                     attempts_used,
                     checkpoint_value,
                     api_hook=api_hook,
@@ -699,7 +700,7 @@ class ApiStrategy(BaseStrategy):
                     break
 
                 submitted = pending.pop(next_request_index)
-                response, attempts_used = submitted.future.result()
+                response, payload, attempts_used = submitted.future.result()
                 successful_requests += 1
                 total_attempts += attempts_used
                 processed = self._process_response(
@@ -709,6 +710,7 @@ class ApiStrategy(BaseStrategy):
                     submitted.pagination_state,
                     submitted.request,
                     response,
+                    payload,
                     attempts_used,
                     checkpoint_value,
                     api_hook=api_hook,
@@ -867,7 +869,7 @@ class ApiStrategy(BaseStrategy):
         request: ApiRequest,
         throttle: ApiRequestThrottle,
         logger: StructuredLogger | None,
-    ) -> tuple[ApiResponse, int]:
+    ) -> tuple[ApiResponse, Any, int]:
         with ApiClient(self.transport_factory()) as client:
             return self._send_with_retries(
                 plan,
@@ -884,7 +886,7 @@ class ApiStrategy(BaseStrategy):
         request: ApiRequest,
         throttle: ApiRequestThrottle,
         logger: StructuredLogger | None,
-    ) -> tuple[ApiResponse, int]:
+    ) -> tuple[ApiResponse, Any, int]:
         retry_config = plan.source_config.extraction.retry
         last_transport_error: Exception | None = None
 
@@ -900,7 +902,14 @@ class ApiStrategy(BaseStrategy):
                 continue
 
             if 200 <= response.status_code < 300:
-                return response, attempt
+                try:
+                    payload = self._decode_payload(plan, response)
+                except ApiPayloadError:
+                    if attempt == retry_config.max_attempts:
+                        raise
+                    self._sleep_for_retry(plan, attempt, response=response, logger=logger)
+                    continue
+                return response, payload, attempt
 
             if (
                 response.status_code not in RETRYABLE_STATUS_CODES
@@ -922,6 +931,7 @@ class ApiStrategy(BaseStrategy):
         pagination_state: PaginationState,
         request: ApiRequest,
         response: ApiResponse,
+        payload: Any,
         attempts_used: int,
         checkpoint_value: str | None,
         *,
@@ -934,7 +944,6 @@ class ApiStrategy(BaseStrategy):
         if api_hook is not None:
             response = api_hook.handle_response(plan, request, response)
 
-        payload = self._decode_payload(plan, response)
         if api_hook is not None:
             payload = api_hook.transform_payload(plan, request, response, payload)
 

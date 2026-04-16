@@ -25,6 +25,7 @@ class ResponseSpec:
     payload: Any
     headers: dict[str, str] = field(default_factory=dict)
     format_name: str = "json"
+    raw_body: bytes | None = None
 
 
 class FakeTransport:
@@ -49,7 +50,9 @@ class FakeTransport:
         if isinstance(response, Exception):
             raise response
 
-        if response.format_name == "json":
+        if response.raw_body is not None:
+            body = response.raw_body
+        elif response.format_name == "json":
             body = json.dumps(response.payload).encode("utf-8")
         elif response.format_name == "jsonl":
             body = "\n".join(json.dumps(item) for item in response.payload).encode("utf-8")
@@ -556,6 +559,65 @@ def test_api_strategy_retries_transient_failures_with_bounded_backoff(tmp_path):
     assert metadata["attempt_count"] == "3"
     assert metadata["retry_count"] == "2"
     assert metadata["request_count"] == "1"
+
+
+def test_api_strategy_retries_bad_payload_on_200_response(tmp_path):
+    plan = _build_plan(
+        tmp_path,
+        source_id="payload_retry_source",
+        retry_max_attempts=3,
+        retry_backoff_seconds=2,
+        retry_backoff_strategy="fixed",
+        requests_per_minute=None,
+        page_size=2,
+    )
+    sleeps: list[float] = []
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, None, raw_body=b"<html>temporarily unavailable</html>"),
+            ResponseSpec(200, None, raw_body=b"<html>temporarily unavailable</html>"),
+            ResponseSpec(200, {"records": [{"id": "1"}]}),
+        ],
+        sleeper=sleeps.append,
+    )
+
+    result = strategy.extract(plan)
+    metadata = result.metadata_as_dict()
+
+    assert sleeps == [2.0, 2.0]
+    assert len(transport.requests) == 3
+    assert metadata["attempt_count"] == "3"
+    assert metadata["retry_count"] == "2"
+    assert metadata["request_count"] == "1"
+
+
+def test_api_strategy_raises_after_exhausting_retries_on_bad_payload(tmp_path):
+    from janus.strategies.api.core import ApiPayloadError
+
+    plan = _build_plan(
+        tmp_path,
+        source_id="payload_exhaust_source",
+        retry_max_attempts=2,
+        retry_backoff_seconds=1,
+        retry_backoff_strategy="fixed",
+        requests_per_minute=None,
+        page_size=2,
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, None, raw_body=b"<html>bad</html>"),
+            ResponseSpec(200, None, raw_body=b"<html>bad</html>"),
+        ],
+    )
+
+    import pytest
+
+    with pytest.raises(ApiPayloadError):
+        strategy.extract(plan)
+
+    assert len(transport.requests) == 2
 
 
 def test_api_strategy_request_inputs_bind_iceberg_rows_from_runtime_spark(tmp_path):
