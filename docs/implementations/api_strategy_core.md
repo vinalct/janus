@@ -12,7 +12,7 @@ The result is not a source integration for Transparencia, IBGE, or any other one
 
 - `src/janus/strategies/api/http.py` now defines the request and response transport objects, auth injection rules, and the default stdlib-backed transport.
 - `src/janus/strategies/api/pagination.py` now defines the reusable paginator components for page-number, offset, cursor, and no-pagination flows.
-- `src/janus/strategies/api/core.py` now implements the `ApiStrategy` itself, including request building, retry and throttling behavior, checkpoint-aware incremental execution, raw persistence, and metadata emission.
+- `src/janus/strategies/api/core.py` now implements the `ApiStrategy` itself, including request building, retry and throttling behavior, checkpoint-aware incremental execution, per-page extraction progress tracking, raw persistence, and metadata emission.
 - `src/janus/strategies/api/__init__.py` now exposes the API strategy package surface for downstream imports.
 - `src/janus/planner/core.py` now resolves API variants to the real `ApiStrategy` in the default strategy catalog.
 - `tests/unit/strategies/api/test_api_strategy.py` now covers the main runtime behaviors introduced in this step.
@@ -216,14 +216,21 @@ The strategy also computes the highest observed checkpoint value while processin
 
 Every successful response is now persisted to the raw zone through the shared `RawArtifactWriter`.
 
-The strategy writes deterministic file names under a `pages/` subdirectory:
+The strategy writes deterministic file names under a raw subdirectory.
 
-- `page-0001.json`
-- `offset-00000000.json`
-- `cursor-0001.json`
-- `response-0001.json`
+For sources with a single request input, files land under `pages/`:
 
-depending on the active pagination mode.
+- `pages/page-0001.json`
+- `pages/offset-00000000.json`
+- `pages/cursor-0001.json`
+- `pages/response-0001.json`
+
+For sources with multiple request inputs — `iceberg_rows`, `date_window`, or `combined` — each input gets its own subdirectory keyed by its position in the enumeration:
+
+- `request-input-000001/page-0001.json`
+- `request-input-000002/page-0001.json`
+
+The file naming within each subdirectory follows the same page-number, offset, cursor, or response convention as the single-input case.
 
 That gives JANUS an exact raw payload trail for API runs instead of treating HTTP responses as transient in-memory objects that disappear once parsing is done.
 
@@ -233,6 +240,40 @@ The raw write metadata currently includes basic operational context such as:
 - response status;
 - request index;
 - page number, offset, or cursor when applicable.
+
+## Extraction progress and resumable runs
+
+Long-running API extractions fail mid-run. A source with 33,000 pages at 240 req/min still takes over two hours to complete. When the remote API returns an unexpected 400 or 500 at page 30,000, JANUS does not lose what it already wrote.
+
+Every page the API strategy writes to the raw zone is durably persisted as a file with a deterministic name. The problem was not the raw files—they survive. The problem was that the strategy had no memory of where it stopped, so the next invocation restarted from page one.
+
+The strategy now saves an `extraction_progress.json` entry after each page lands on disk. This file lives in the metadata zone alongside run records and checkpoint state. It is keyed by source id rather than run id, so it survives across separate CLI invocations.
+
+When the operator runs the command with `--resume`, the strategy reads this progress file and resumes from where the previous run stopped without touching the API for any page or input combination it already has on disk.
+
+### Multi-input progress tracking
+
+For sources that iterate over multiple request inputs — `iceberg_rows`, `date_window`, or `combined` — the progress file tracks each input by its **content**, not by its position in the list.
+
+Each input gets a stable fingerprint derived from its field values:
+
+```
+orgao_codigo=170010|window_end=2025-01-31|window_start=2025-01-01
+```
+
+The file records completed inputs as a list of `{"key": ..., "index": ...}` objects plus the key and file-path index for the input that was in progress when the run stopped. On resume:
+
+- inputs whose fingerprint is in `completed_inputs` are skipped and their raw files are re-discovered from disk;
+- the input whose fingerprint matches `current_input_key` has its raw files re-discovered up to the last page and pagination resumes from there;
+- all remaining inputs are started fresh.
+
+This makes resume correct even when upstream Iceberg data reorders between invocations or the total input count grows.
+
+### Pagination mode support
+
+Resume is supported for page-number and offset pagination. Cursor pagination does not support per-page resume because there is no way to derive the next cursor without the response of the previous page; cursor runs restart from the beginning when `--resume` is used, which is still better than corrupted state.
+
+The progress file is removed at the end of every successful extraction. A normal run without `--resume` also removes any stale progress file before starting, so partial state from a previous run does not silently influence an intentional fresh run.
 
 ## Hooks and extension points
 

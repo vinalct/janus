@@ -110,6 +110,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow planning or executing a source that is configured but disabled.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume extraction from the last recorded page instead of starting over. "
+            "Reads the extraction_progress.json written by a previous partial run and "
+            "re-uses already-fetched raw files. Has no effect if no progress file exists."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.execute and not args.source_id:
@@ -148,6 +157,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     planned_run = None
     if args.source_id:
         try:
+            run_attributes: dict[str, str] = {"trigger": "cli"}
+            if args.resume:
+                run_attributes["resume"] = "true"
             planned_run = Planner().plan(
                 PlanningRequest.create(
                     source_id=args.source_id,
@@ -156,7 +168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_id=args.run_id,
                     started_at=args.started_at,
                     include_disabled=args.include_disabled,
-                    attributes={"trigger": "cli"},
+                    attributes=run_attributes,
                 )
             )
         except (FileNotFoundError, PlannerError, SourceNotFoundError, ValueError) as exc:

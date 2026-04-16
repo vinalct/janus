@@ -1,3 +1,4 @@
+from janus.checkpoints.progress import ExtractionProgressStore
 from janus.checkpoints.store import (
     SUPPORTED_CHECKPOINT_DECISIONS,
     CheckpointHistoryEntry,
@@ -11,5 +12,6 @@ __all__ = [
     "CheckpointState",
     "CheckpointStore",
     "CheckpointWriteResult",
+    "ExtractionProgressStore",
     "SUPPORTED_CHECKPOINT_DECISIONS",
 ]

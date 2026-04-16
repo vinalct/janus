@@ -8,12 +8,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from typing import Any
 from urllib.parse import urljoin
 
-from janus.checkpoints import CheckpointState, CheckpointStore
+from janus.checkpoints import CheckpointState, CheckpointStore, ExtractionProgressStore
 from janus.models import (
     CombinedRequestInputsConfig,
     ExecutionPlan,
@@ -210,6 +211,7 @@ class ApiStrategy(BaseStrategy):
     )
     raw_writer_factory: Callable[[StorageLayout], RawArtifactWriter] = RawArtifactWriter
     checkpoint_store: CheckpointStore = field(default_factory=CheckpointStore)
+    progress_store: ExtractionProgressStore = field(default_factory=ExtractionProgressStore)
     env_reader: Callable[[str], str | None] = os.getenv
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -293,13 +295,47 @@ class ApiStrategy(BaseStrategy):
                 ),
             )
 
+        resume = plan.run_context.attributes_as_dict().get("resume") == "true"
+        progress = None
+        if resume:
+            progress = self.progress_store.load(plan)
+            if logger is not None:
+                if progress is not None:
+                    logger.info(
+                        "api_extraction_resuming",
+                        current_input_key=progress.get("current_input_key"),
+                        last_page_number=progress.get("last_page_number"),
+                        last_offset=progress.get("last_offset"),
+                        completed_input_count=len(progress.get("completed_inputs", [])),
+                        prior_artifact_count=progress.get("artifact_count", 0),
+                    )
+                else:
+                    logger.info("api_extraction_resume_requested_no_progress_found")
+        else:
+            self.progress_store.clear(plan)
+
         artifacts: list[ExtractedArtifact] = []
         total_records = 0
         successful_requests = 0
         total_attempts = 0
         checkpoint_value: str | None = None
 
+        completed_by_key: dict[str, int] = {}
+        if progress is not None:
+            for entry in progress.get("completed_inputs", []):
+                completed_by_key[entry["key"]] = entry["index"]
+        current_key_from_progress: str | None = (
+            progress.get("current_input_key") if progress is not None else None
+        )
+        current_index_from_progress: int | None = (
+            progress.get("current_input_index") if progress is not None else None
+        )
+
+        completed_inputs: list[tuple[str, int]] = list(completed_by_key.items())
+
         for request_input_index, request_input in enumerate(request_inputs, start=1):
+            request_input_key = _request_input_key(request_input)
+
             request_input_logger = logger
             if request_input_logger is not None:
                 request_input_logger = request_input_logger.bind(
@@ -307,6 +343,29 @@ class ApiStrategy(BaseStrategy):
                     request_input_count=request_input_count,
                     request_input_type=request_input_type,
                 )
+
+            if request_input_key in completed_by_key:
+                file_index = completed_by_key[request_input_key]
+                pre_artifacts = _rediscover_all_artifacts_for_input(
+                    plan, storage_layout, file_index, request_input_count
+                )
+                artifacts.extend(pre_artifacts)
+                if request_input_logger is not None:
+                    request_input_logger.info(
+                        "api_request_input_skipped_already_complete",
+                        recovered_artifact_count=len(pre_artifacts),
+                        input_key=request_input_key,
+                    )
+                continue
+
+            is_resuming = progress is not None and request_input_key == current_key_from_progress
+            file_index = (
+                current_index_from_progress
+                if is_resuming and current_index_from_progress is not None
+                else request_input_index
+            )
+
+            if request_input_logger is not None:
                 request_input_logger.info(
                     "api_request_input_started",
                     request_input_field_names=_request_input_field_names(request_input),
@@ -342,6 +401,21 @@ class ApiStrategy(BaseStrategy):
                 )
 
             pagination_state = paginator.initial_state(request_input_base_request)
+
+            if is_resuming:
+                pre_artifacts = _rediscover_raw_artifacts(
+                    plan, storage_layout, progress, file_index, request_input_count
+                )
+                artifacts.extend(pre_artifacts)
+                pagination_state = _resume_pagination_state(paginator, pagination_state, progress)
+                if request_input_logger is not None:
+                    request_input_logger.info(
+                        "api_extraction_resume_artifacts_recovered",
+                        recovered_artifact_count=len(pre_artifacts),
+                        resuming_at_page=pagination_state.page_number,
+                        resuming_at_offset=pagination_state.offset,
+                        input_key=request_input_key,
+                    )
             try:
                 if _supports_concurrent_pagination(
                     paginator,
@@ -364,8 +438,13 @@ class ApiStrategy(BaseStrategy):
                         raw_writer=raw_writer,
                         throttle=throttle,
                         logger=request_input_logger,
-                        request_input_index=request_input_index,
+                        request_input_index=file_index,
                         request_input_count=request_input_count,
+                        completed_inputs=completed_inputs,
+                        current_input_key=request_input_key,
+                        current_input_index=file_index,
+                        progress_store=self.progress_store,
+                        prior_artifact_count=len(artifacts),
                     )
                 else:
                     (
@@ -385,8 +464,13 @@ class ApiStrategy(BaseStrategy):
                         raw_writer=raw_writer,
                         throttle=throttle,
                         logger=request_input_logger,
-                        request_input_index=request_input_index,
+                        request_input_index=file_index,
                         request_input_count=request_input_count,
+                        completed_inputs=completed_inputs,
+                        current_input_key=request_input_key,
+                        current_input_index=file_index,
+                        progress_store=self.progress_store,
+                        prior_artifact_count=len(artifacts),
                     )
             except Exception:
                 if request_input_logger is not None:
@@ -398,6 +482,7 @@ class ApiStrategy(BaseStrategy):
             successful_requests += request_input_successful_requests
             total_attempts += request_input_total_attempts
             checkpoint_value = request_input_checkpoint_value
+            completed_inputs.append((request_input_key, file_index))
 
             if request_input_logger is not None:
                 request_input_logger.info(
@@ -425,6 +510,8 @@ class ApiStrategy(BaseStrategy):
                 request_input_type=request_input_type,
                 request_input_count=request_input_count,
             )
+
+        self.progress_store.clear(plan)
 
         extraction_result = ExtractionResult.from_plan(
             plan,
@@ -461,6 +548,11 @@ class ApiStrategy(BaseStrategy):
         logger: StructuredLogger | None,
         request_input_index: int,
         request_input_count: int,
+        completed_inputs: list[tuple[str, int]],
+        current_input_key: str | None,
+        current_input_index: int,
+        progress_store: ExtractionProgressStore,
+        prior_artifact_count: int = 0,
     ) -> tuple[list[ExtractedArtifact], int, int, int, str | None]:
         artifacts: list[ExtractedArtifact] = []
         total_records = 0
@@ -505,6 +597,18 @@ class ApiStrategy(BaseStrategy):
                 artifacts.append(processed.artifact)
                 total_records += processed.records_extracted
                 checkpoint_value = processed.checkpoint_value
+                progress_store.save(
+                    plan,
+                    page_number=pagination_state.page_number,
+                    offset=pagination_state.offset,
+                    cursor=pagination_state.cursor,
+                    request_index=pagination_state.request_index,
+                    artifact_count=prior_artifact_count + len(artifacts),
+                    completed_inputs=completed_inputs,
+                    current_input_key=current_input_key,
+                    current_input_index=current_input_index,
+                    request_input_count=request_input_count,
+                )
                 pagination_state = processed.next_pagination_state
 
         return (
@@ -530,6 +634,11 @@ class ApiStrategy(BaseStrategy):
         logger: StructuredLogger | None,
         request_input_index: int,
         request_input_count: int,
+        completed_inputs: list[tuple[str, int]],
+        current_input_key: str | None,
+        current_input_index: int,
+        progress_store: ExtractionProgressStore,
+        prior_artifact_count: int = 0,
     ) -> tuple[list[ExtractedArtifact], int, int, int, str | None]:
         concurrency = plan.source_config.access.rate_limit.concurrency
         artifacts: list[ExtractedArtifact] = []
@@ -603,6 +712,18 @@ class ApiStrategy(BaseStrategy):
                 artifacts.append(processed.artifact)
                 total_records += processed.records_extracted
                 checkpoint_value = processed.checkpoint_value
+                progress_store.save(
+                    plan,
+                    page_number=submitted.pagination_state.page_number,
+                    offset=submitted.pagination_state.offset,
+                    cursor=submitted.pagination_state.cursor,
+                    request_index=submitted.pagination_state.request_index,
+                    artifact_count=prior_artifact_count + len(artifacts),
+                    completed_inputs=completed_inputs,
+                    current_input_key=current_input_key,
+                    current_input_index=current_input_index,
+                    request_input_count=request_input_count,
+                )
                 next_request_index += 1
                 if processed.next_pagination_state is None:
                     stop_submitting = True
@@ -1175,12 +1296,139 @@ def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> di
     return metadata
 
 
+def _request_input_key(request_input: dict[str, Any] | None) -> str:
+    """Stable, content-based fingerprint for a request input context."""
+    if request_input is None:
+        return "__none__"
+    return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
+
+
 def _request_input_field_names(
     request_input: Mapping[str, Any] | None,
 ) -> tuple[str, ...]:
     if not request_input:
         return ()
     return tuple(sorted(str(field_name) for field_name in request_input))
+
+
+def _resume_pagination_state(
+    paginator: Any,
+    pagination_state: PaginationState,
+    progress: dict[str, Any],
+) -> PaginationState:
+    """Return a pagination state that resumes after the last recorded page."""
+    last_page = progress.get("last_page_number")
+    if last_page is not None:
+        return PaginationState(request_index=1, page_number=last_page + 1)
+
+    last_offset = progress.get("last_offset")
+    if last_offset is not None and isinstance(paginator, OffsetPaginator):
+        return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
+
+    return pagination_state
+
+
+def _pages_dir(
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    request_input_index: int,
+    request_input_count: int,
+) -> Path:
+    """Return the raw subdirectory for one request input, mirroring _raw_relative_path."""
+    raw_dir = storage_layout.resolve_output(plan, "raw").resolved_path
+    if request_input_count > 1:
+        return raw_dir / f"request-input-{request_input_index:06d}"
+    return raw_dir / "pages"
+
+
+def _rediscover_all_artifacts_for_input(
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    request_input_index: int,
+    request_input_count: int,
+) -> list[ExtractedArtifact]:
+    """Return all raw artifacts written for a fully completed request input."""
+    raw_format = plan.source_config.outputs.raw.format
+    suffix = RAW_FILE_SUFFIXES.get(raw_format, "")
+    directory = _pages_dir(plan, storage_layout, request_input_index, request_input_count)
+
+    if not directory.exists():
+        return []
+
+    candidates: list[tuple[int, Path]] = []
+    for path in directory.glob(f"*{suffix}"):
+        stem = path.stem
+        for prefix, start in (("page-", 5), ("offset-", 7), ("cursor-", 7), ("response-", 9)):
+            if stem.startswith(prefix):
+                try:
+                    candidates.append((int(stem[start:]), path))
+                except ValueError:
+                    pass
+                break
+
+    artifacts = []
+    for _, path in sorted(candidates):
+        checksum = sha256(path.read_bytes()).hexdigest()
+        artifacts.append(ExtractedArtifact(path=str(path), format=raw_format, checksum=checksum))
+    return artifacts
+
+
+def _rediscover_raw_artifacts(
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    progress: dict[str, Any],
+    request_input_index: int = 1,
+    request_input_count: int = 1,
+) -> list[ExtractedArtifact]:
+    """Re-discover raw artifact files written by a previous partial run."""
+    raw_format = plan.source_config.outputs.raw.format
+    suffix = RAW_FILE_SUFFIXES.get(raw_format, "")
+    directory = _pages_dir(plan, storage_layout, request_input_index, request_input_count)
+
+    if not directory.exists():
+        return []
+
+    last_page = progress.get("last_page_number")
+    last_offset = progress.get("last_offset")
+    artifacts: list[ExtractedArtifact] = []
+
+    if last_page is not None:
+        candidates: list[tuple[int, Path]] = []
+        for path in directory.glob(f"page-*{suffix}"):
+            stem = path.stem
+            if not stem.startswith("page-"):
+                continue
+            try:
+                num = int(stem[5:])
+            except ValueError:
+                continue
+            if num <= last_page:
+                candidates.append((num, path))
+        for _, path in sorted(candidates):
+            checksum = sha256(path.read_bytes()).hexdigest()
+            artifacts.append(
+                ExtractedArtifact(path=str(path), format=raw_format, checksum=checksum)
+            )
+
+    elif last_offset is not None:
+        candidates = []
+        for path in directory.glob(f"offset-*{suffix}"):
+            stem = path.stem
+            if not stem.startswith("offset-"):
+                continue
+            try:
+                num = int(stem[7:])
+            except ValueError:
+                continue
+            if num <= last_offset:
+                candidates.append((num, path))
+        for _, path in sorted(candidates):
+            checksum = sha256(path.read_bytes()).hexdigest()
+            artifacts.append(
+                ExtractedArtifact(path=str(path), format=raw_format, checksum=checksum)
+            )
+
+    return artifacts
 
 
 def _default_records_from_payload(payload: Any) -> Sequence[Any]:

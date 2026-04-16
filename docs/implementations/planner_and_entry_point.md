@@ -93,7 +93,7 @@ It carries execution status, extracted artifacts, materialized outputs, persiste
 
 ## The command-line flow
 
-`janus` now supports three useful modes.
+`janus` supports four useful modes.
 
 ### 1. Runtime validation only
 
@@ -106,7 +106,11 @@ This validates the environment profile, prepares runtime paths, and prints the r
 ### 2. Deterministic planning for one source
 
 ```bash
-janus       --environment local       --source-id federal_open_data_example       --run-id run-20260409-001       --started-at 2026-04-09T12:00:00+00:00
+janus \
+  --environment local \
+  --source-id federal_open_data_example \
+  --run-id run-20260409-001 \
+  --started-at 2026-04-09T12:00:00+00:00
 ```
 
 That command loads the source from the registry, resolves the dispatch path, and prints a `planned_run` summary.
@@ -114,7 +118,12 @@ That command loads the source from the registry, resolves the dispatch path, and
 ### 3. Full framework execution for one source
 
 ```bash
-janus       --environment local       --source-id federal_open_data_example       --run-id run-20260409-001       --started-at 2026-04-09T12:00:00+00:00       --execute
+janus \
+  --environment local \
+  --source-id federal_open_data_example \
+  --run-id run-20260409-001 \
+  --started-at 2026-04-09T12:00:00+00:00 \
+  --execute
 ```
 
 That command performs planning plus extraction, Spark normalization, bronze writing, validation persistence, and lineage/checkpoint recording. The resulting JSON contains both `planned_run` and `executed_run`.
@@ -122,10 +131,31 @@ That command performs planning plus extraction, Spark normalization, bronze writ
 If a source is intentionally disabled in the registry, the operator must opt in explicitly:
 
 ```bash
-janus       --environment local       --source-id transparencia_servidores_por_orgao       --include-disabled       --execute
+janus \
+  --environment local \
+  --source-id transparencia_renuncias_fiscais \
+  --include-disabled \
+  --execute
 ```
 
 That keeps the default behavior safe while still supporting controlled operational runs.
+
+### 4. Resuming an interrupted extraction
+
+```bash
+janus \
+  --environment local \
+  --source-id transparencia_renuncias_fiscais \
+  --include-disabled \
+  --execute \
+  --resume
+```
+
+`--resume` tells the API strategy to read the `extraction_progress.json` file written by the interrupted run, re-discover raw files already on disk for pages up to the last recorded position, and continue pagination from the next page. Raw files for pages already fetched are not re-requested.
+
+If no progress file exists, `--resume` has no effect and the run starts normally. A run without `--resume` always clears any stale progress file before it starts, so old partial state does not silently carry over into a fresh run.
+
+This flag is only meaningful for API sources. File and catalog strategy runs ignore it.
 
 ## What the tests lock down
 

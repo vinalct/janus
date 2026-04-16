@@ -9,13 +9,15 @@ The result is a small observability layer built around the existing runtime cont
 ## What was added
 
 - `src/janus/checkpoints/store.py` now defines the checkpoint state, checkpoint history, and the persistence rules for rerun-safe writes.
-- `src/janus/checkpoints/__init__.py` now exposes the checkpoint API for downstream imports.
+- `src/janus/checkpoints/progress.py` now defines `ExtractionProgressStore`, which tracks per-page pagination position so a failed extraction run can resume without re-fetching pages it already wrote.
+- `src/janus/checkpoints/__init__.py` now exposes both checkpoint APIs for downstream imports.
 - `src/janus/lineage/models.py` now defines the run metadata and lineage models used to describe one run from start to finish.
 - `src/janus/lineage/persistence.py` now resolves metadata-zone paths and writes JSON artifacts atomically.
 - `src/janus/lineage/store.py` now provides the persistence helpers and the shared `RunObserver` service.
 - `src/janus/lineage/__init__.py` now exposes the lineage API without forcing callers into internal module paths.
 - `src/janus/utils/logging.py` now provides structured JSON logging with secret redaction.
 - `tests/unit/checkpoints/test_store.py` covers checkpoint persistence and rerun behavior.
+- `tests/unit/checkpoints/test_progress.py` covers extraction progress save, load, overwrite, source-id guard, clear behavior, and content-based input tracking round-trips.
 - `tests/unit/lineage/test_run_observer.py` covers run metadata, lineage persistence, and failure capture.
 - `tests/unit/lineage/test_logging.py` covers redaction and structured log output.
 
@@ -62,7 +64,8 @@ Given the configured metadata output path, the code now writes:
 - `runs/<run_id>.json` for the run record;
 - `lineage/<run_id>.json` for the lineage record;
 - `checkpoints/current.json` for the latest stored checkpoint state;
-- `checkpoints/history/<run_id>.json` for the write decision taken during that run.
+- `checkpoints/history/<run_id>.json` for the write decision taken during that run;
+- `extraction_progress.json` for the per-page extraction position of an in-progress or interrupted run.
 
 Those files are written atomically so a rerun does not leave half-written metadata behind if the process is interrupted at the wrong moment.
 
@@ -80,6 +83,45 @@ A checkpoint write now records both the current state and the decision taken dur
 That means a rerun cannot quietly move the checkpoint backwards and make later incremental runs behave as if newer data had never been seen.
 
 The comparison logic tries to do the sensible thing for the common cases first. ISO-8601 timestamps are compared as datetimes, numeric values are compared numerically, and only then does it fall back to plain string comparison.
+
+## Extraction progress tracking
+
+The data checkpoint and the extraction progress file solve different problems and should not be confused.
+
+The data checkpoint answers the question "what is the furthest point in the source data we have seen?" It is keyed by source id, advances monotonically, and drives the request window for the next incremental run.
+
+The extraction progress file answers the question "which combinations and pages did we reach before this run stopped?" It is also keyed by source id, but it tracks extraction position within a single run rather than across runs. Its only job is to make interrupted runs resumable.
+
+The `ExtractionProgressStore` writes `extraction_progress.json` to the metadata zone after every successfully persisted page. When the API strategy starts a new run with `--resume`, it reads this file, re-discovers the raw files already written, and resumes from where the previous run stopped instead of restarting from the beginning.
+
+The store uses the same atomic write mechanism as the rest of the metadata zone so a crash mid-page does not corrupt the recorded position.
+
+The file is cleared at the end of every successful extraction. That means a progress file in the metadata zone always signals an interrupted run, never a completed one. A normal run without `--resume` also clears any stale progress file before it starts, so old progress from a previous failure does not survive into a fresh run.
+
+### Content-based input tracking
+
+For sources with multiple request inputs — `iceberg_rows`, `date_window`, or `combined` — the progress file tracks each input by its **content**, not by its position in the list.
+
+Each request input is identified by a stable fingerprint derived from its field values, for example:
+
+```
+orgao_codigo=170010|window_end=2025-01-31|window_start=2025-01-01
+```
+
+The file records two things:
+
+- `completed_inputs` — a list of `{"key": ..., "index": ...}` objects for every input that finished successfully, where `index` is the file-path slot used when writing raw artifacts.
+- `current_input_key` and `current_input_index` — the key and file-path slot for the input that was in progress when the run stopped.
+
+When resuming, the strategy matches each input by its content fingerprint rather than by its position in the enumeration. This means a resume is correct even when:
+
+- an `iceberg_rows` query returns rows in a different order the second time;
+- a `combined` Cartesian product reorders due to upstream table changes;
+- the total input count has grown since the interrupted run.
+
+Inputs whose key matches an entry in `completed_inputs` are skipped and their raw files are re-discovered from disk. The input whose key matches `current_input_key` has its raw files re-discovered up to `last_page_number` or `last_offset`, and pagination resumes from the next page. Inputs that appear in neither list are started fresh.
+
+For sources using page-number or offset pagination, the re-discovery step is exact: it scans the raw directory for files whose page number or offset is at or below the last recorded value, sorts them numerically, and restores them as pre-populated artifacts. Cursor pagination does not support per-page resume because the cursor for the next page is only available in the response of the previous one; those runs restart from the beginning when `--resume` is used.
 
 ## The `RunObserver`
 
