@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -377,9 +378,12 @@ class ApiStrategy(BaseStrategy):
                     request_input=request_input,
                     checkpoint_value=checkpoint_request_value,
                 )
+                path_params, query_bound_params = _split_path_and_query_params(
+                    base_request.url, bound_params
+                )
                 request_params = merge_request_params(
                     plan.source_config.access.params,
-                    bound_params,
+                    query_bound_params,
                 )
             except ApiParameterBindingError:
                 if request_input_logger is not None:
@@ -390,6 +394,10 @@ class ApiStrategy(BaseStrategy):
                 raise
 
             request_input_base_request = base_request
+            if path_params:
+                request_input_base_request = request_input_base_request.with_url(
+                    base_request.url.format_map(path_params)
+                )
             if request_params:
                 request_input_base_request = request_input_base_request.with_params(request_params)
 
@@ -1140,6 +1148,17 @@ def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:
         environment_config,
         plan.run_context.project_root,
     )
+
+
+def _split_path_and_query_params(
+    url: str,
+    bound_params: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Separate bound params into path params (referenced as {name} in the URL) and query params."""
+    placeholders = set(re.findall(r"\{(\w+)\}", url))
+    path_params = {k: v for k, v in bound_params.items() if k in placeholders}
+    query_params = {k: v for k, v in bound_params.items() if k not in placeholders}
+    return path_params, query_params
 
 
 def _resolve_url(source_config: SourceConfig) -> str:

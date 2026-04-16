@@ -76,3 +76,90 @@ sources:
         - qntVinculos
         - codOrgaoExercicioSiape
       allow_schema_evolution: true
+
+  - source_id: transparencia__emendas_parlamentares__documentos
+    name: Portal da Transparencia - Emendas parlamentares - Documentos
+    description: Consulta os documentos relacionados a emenda parlamentar.
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - emendas parlamentares
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/emendas/documentos/{codigo}
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      request_inputs:
+        type: iceberg_rows
+        namespace: bronze_transparencia
+        table_name: emendas_parlamentares__emendas
+        columns:
+          codigo: codigoEmenda
+        distinct: true
+      parameter_bindings:
+        codigo:
+          from: request_input.codigo
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 120
+        concurrency: 4
+        backoff_seconds: 10
+
+    extraction:
+      mode: snapshot
+      checkpoint_strategy: none
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 2
+
+    schema:
+      mode: infer
+
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/emendas_parlamentares__documentos
+        format: json
+      bronze:
+        path: data/bronze/transparencia/emendas_parlamentares__documentos
+        format: iceberg
+        namespace: bronze_transparencia
+        table_name: emendas_parlamentares__documentos
+      metadata:
+        path: data/metadata/transparencia/emendas_parlamentares__documentos
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true

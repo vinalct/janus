@@ -46,6 +46,9 @@ class ApiRequest:
         headers[name] = value
         return replace(self, headers=_freeze_string_mapping(headers))
 
+    def with_url(self, url: str) -> ApiRequest:
+        return replace(self, url=url)
+
     def with_params(self, params: Mapping[str, Any]) -> ApiRequest:
         merged_params = self.params_as_dict()
         merged_params.update(_stringify_mapping(params))
