@@ -404,6 +404,248 @@ def test_catalog_strategy_resource_catalog_uses_resource_root_results_for_handof
     assert all(record["entity_type"] == "resource" for record in resource_records)
 
 
+def test_catalog_strategy_retries_on_malformed_payload_then_succeeds(tmp_path):
+    plan = _build_plan(tmp_path, source_id="catalog_retry_payload", page_size=10)
+    sleeps = []
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, None, headers={}),  # triggers CatalogPayloadError (invalid JSON)
+            ResponseSpec(200, {"result": {"results": [{"id": "ds-1", "title": "DS 1"}]}}),
+        ],
+        sleeper=sleeps.append,
+    )
+    # Patch FakeTransport so the first response body is invalid JSON
+    bad_body = b"not-json"
+    original_send = transport.send
+
+    call_count = [0]
+
+    def patched_send(request):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            resp = original_send.__func__.__get__(transport, type(transport)).__call__(request)
+            from janus.strategies.api import ApiResponse
+
+            return ApiResponse(
+                request=request,
+                status_code=200,
+                body=bad_body,
+                headers=(),
+            )
+        return original_send(request)
+
+    transport.send = patched_send
+
+    result = strategy.extract(plan)
+
+    assert result.records_extracted == 1
+    assert any(s == 1.0 for s in sleeps)  # retry backoff sleep fired
+
+
+def test_catalog_strategy_retries_on_malformed_payload_exhausts_attempts(tmp_path):
+    plan = _build_plan(tmp_path, source_id="catalog_retry_payload_fail", page_size=10)
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [ResponseSpec(200, {}) for _ in range(3)],
+    )
+    bad_body = b"not-json"
+    original_send = transport.send
+
+    def patched_send(request):
+        resp = original_send(request)
+        from janus.strategies.api import ApiResponse
+
+        return ApiResponse(request=request, status_code=200, body=bad_body, headers=())
+
+    transport.send = patched_send
+
+    import pytest
+    from janus.strategies.catalog import CatalogPayloadError
+
+    with pytest.raises(CatalogPayloadError):
+        strategy.extract(plan)
+
+
+def test_catalog_strategy_checkpoint_as_path_param(tmp_path):
+    from janus.checkpoints import CheckpointStore
+
+    source_config = _build_source_config_with_url(
+        tmp_path,
+        source_id="catalog_path_param",
+        url="https://example.invalid/catalog/{metadata_modified}/datasets",
+        extraction_mode="incremental",
+        checkpoint_field="metadata_modified",
+        checkpoint_strategy="max_value",
+    )
+    from janus.models import RunContext
+    from datetime import datetime, UTC
+
+    run_context = RunContext.create(
+        run_id="run-path-param",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+    )
+    from janus.models import ExecutionPlan
+
+    plan = ExecutionPlan.from_source_config(source_config, run_context)
+    CheckpointStore().save(plan, "2026-04-10T06:00:00Z")
+
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(
+                200,
+                {"result": {"results": [{"id": "ds-1", "metadata_modified": "2026-04-10T08:00:00Z"}]}},
+            )
+        ],
+    )
+
+    result = strategy.extract(plan)
+
+    sent_url = transport.requests[0].full_url()
+    assert "2026-04-09T06:00:00Z" in sent_url  # lookback applied, substituted as path param
+    assert "metadata_modified" not in sent_url.split("?", 1)[-1]  # NOT a query param
+    assert result.records_extracted == 1
+
+
+def test_catalog_strategy_resume_skips_completed_pages_and_rediscovers_artifacts(tmp_path):
+    from janus.checkpoints import ExtractionProgressStore
+    from janus.models import RunContext, ExecutionPlan
+    from datetime import datetime, UTC
+
+    source_id = "catalog_resume"
+    plan_normal = _build_plan(tmp_path, source_id=source_id, page_size=10)
+
+    # Write page-0001.json as if a prior run completed page 1
+    pages_dir = tmp_path / "runtime" / "raw" / "example" / source_id / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    page1_path = pages_dir / "page-0001.json"
+    import json as _json
+
+    page1_content = _json.dumps({"result": {"results": [{"id": "ds-1", "title": "DS 1"}]}})
+    page1_path.write_text(page1_content, encoding="utf-8")
+
+    # Save progress reflecting page 1 done
+    ExtractionProgressStore().save(plan_normal, page_number=1, artifact_count=1)
+
+    # Resume run context
+    run_context = RunContext.create(
+        run_id=f"run-{source_id}",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        attributes={"resume": "true"},
+    )
+    plan_resume = ExecutionPlan.from_source_config(plan_normal.source_config, run_context)
+
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(
+                200,
+                {"result": {"results": [{"id": "ds-2", "title": "DS 2"}]}},
+            ),
+        ],
+    )
+
+    result = strategy.extract(plan_resume)
+
+    # Only page 2 was fetched over the network
+    assert len(transport.requests) == 1
+    sent_url = transport.requests[0].full_url()
+    assert "page=2" in sent_url
+
+    # Both artifacts are present (rediscovered page 1 + fetched page 2)
+    raw_artifact_paths = [
+        Path(a.path).name for a in result.artifacts if Path(a.path).suffix == ".json"
+        and Path(a.path).parent.name == "pages"
+    ]
+    assert "page-0001.json" in raw_artifact_paths
+    assert "page-0002.json" in raw_artifact_paths
+
+
+def test_catalog_strategy_resume_clears_progress_on_success(tmp_path):
+    from janus.checkpoints import ExtractionProgressStore
+
+    source_id = "catalog_resume_clear"
+    plan = _build_plan(tmp_path, source_id=source_id, page_size=10)
+    progress_store = ExtractionProgressStore()
+
+    strategy, _ = _build_strategy(
+        tmp_path,
+        [ResponseSpec(200, {"result": {"results": [{"id": "ds-1", "title": "DS 1"}]}})],
+    )
+    strategy.progress_store.save(plan, page_number=1, artifact_count=1)
+
+    strategy.extract(plan)
+
+    assert strategy.progress_store.load(plan) is None
+
+
+def _build_source_config_with_url(
+    tmp_path,
+    *,
+    source_id: str,
+    url: str,
+    extraction_mode: str = "incremental",
+    checkpoint_field: str | None = None,
+    checkpoint_strategy: str = "none",
+    lookback_days: int | None = 1,
+) -> "SourceConfig":
+    return SourceConfig.from_mapping(
+        {
+            "source_id": source_id,
+            "name": source_id,
+            "owner": "janus",
+            "enabled": True,
+            "source_type": "catalog",
+            "strategy": "catalog",
+            "strategy_variant": "metadata_catalog",
+            "federation_level": "federal",
+            "domain": "example",
+            "public_access": True,
+            "access": {
+                "url": url,
+                "method": "GET",
+                "format": "json",
+                "timeout_seconds": 30,
+                "auth": {"type": "none"},
+                "pagination": {"type": "none"},
+                "rate_limit": {
+                    "requests_per_minute": 60,
+                    "concurrency": 1,
+                    "backoff_seconds": 1,
+                },
+            },
+            "extraction": {
+                "mode": extraction_mode,
+                "checkpoint_field": checkpoint_field,
+                "checkpoint_strategy": checkpoint_strategy,
+                "lookback_days": lookback_days,
+                "retry": {
+                    "max_attempts": 3,
+                    "backoff_strategy": "fixed",
+                    "backoff_seconds": 1,
+                },
+            },
+            "schema": {"mode": "infer"},
+            "spark": {
+                "input_format": "jsonl",
+                "write_mode": "append",
+            },
+            "outputs": {
+                "raw": {"path": f"data/raw/example/{source_id}", "format": "json"},
+                "bronze": {"path": f"data/bronze/example/{source_id}", "format": "iceberg"},
+                "metadata": {"path": f"data/metadata/example/{source_id}", "format": "json"},
+            },
+            "quality": {"allow_schema_evolution": True},
+        },
+        tmp_path / "conf" / "sources" / f"{source_id}.yaml",
+    )
+
+
 def _build_strategy(
     tmp_path: Path,
     responses: list[ResponseSpec | Exception],

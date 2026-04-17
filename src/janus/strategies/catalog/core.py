@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-from janus.checkpoints import CheckpointState, CheckpointStore
+from janus.checkpoints import CheckpointState, CheckpointStore, ExtractionProgressStore
 from janus.models import (
     ExecutionPlan,
     ExtractedArtifact,
@@ -25,6 +27,7 @@ from janus.strategies.api import (
     ApiTransport,
     ApiTransportError,
     AuthResolutionError,
+    OffsetPaginator,
     PaginationState,
     UrllibApiTransport,
     build_paginator,
@@ -226,6 +229,7 @@ class CatalogStrategy(BaseStrategy):
     )
     raw_writer_factory: Callable[[StorageLayout], RawArtifactWriter] = RawArtifactWriter
     checkpoint_store: CheckpointStore = field(default_factory=CheckpointStore)
+    progress_store: ExtractionProgressStore = field(default_factory=ExtractionProgressStore)
     env_reader: Callable[[str], str | None] = os.getenv
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -281,7 +285,36 @@ class CatalogStrategy(BaseStrategy):
                 timeout_seconds=base_request.timeout_seconds,
             )
 
+        resume = plan.run_context.attributes_as_dict().get("resume") == "true"
+        progress = None
+        if resume:
+            progress = self.progress_store.load(plan)
+            if logger is not None:
+                if progress is not None:
+                    logger.info(
+                        "catalog_extraction_resuming",
+                        last_page_number=progress.get("last_page_number"),
+                        last_offset=progress.get("last_offset"),
+                        prior_artifact_count=progress.get("artifact_count", 0),
+                    )
+                else:
+                    logger.info("catalog_extraction_resume_requested_no_progress_found")
+        else:
+            self.progress_store.clear(plan)
+
         raw_artifacts: list[ExtractedArtifact] = []
+
+        if progress is not None:
+            pre_artifacts = _rediscover_catalog_raw_artifacts(plan, storage_layout, progress)
+            raw_artifacts.extend(pre_artifacts)
+            pagination_state = _catalog_resume_pagination_state(paginator, pagination_state, progress)
+            if logger is not None:
+                logger.info(
+                    "catalog_extraction_resume_artifacts_recovered",
+                    recovered_artifact_count=len(pre_artifacts),
+                    resuming_at_page=pagination_state.page_number,
+                    resuming_at_offset=pagination_state.offset,
+                )
         normalized_records: dict[str, list[dict[str, Any]]] = {
             entity_type: [] for entity_type in ENTITY_TYPE_ORDER
         }
@@ -312,7 +345,7 @@ class CatalogStrategy(BaseStrategy):
                         request_url=request.full_url(),
                     )
 
-                response, attempts_used = self._send_with_retries(
+                response, payload, attempts_used = self._send_with_retries(
                     plan,
                     client,
                     request,
@@ -325,7 +358,6 @@ class CatalogStrategy(BaseStrategy):
                 if catalog_hook is not None:
                     response = catalog_hook.handle_response(plan, request, response)
 
-                payload = self._decode_payload(plan, response)
                 if catalog_hook is not None:
                     payload = catalog_hook.transform_payload(plan, request, response, payload)
 
@@ -405,8 +437,17 @@ class CatalogStrategy(BaseStrategy):
                             else None
                         ),
                     )
+                self.progress_store.save(
+                    plan,
+                    page_number=pagination_state.page_number,
+                    offset=pagination_state.offset,
+                    cursor=pagination_state.cursor,
+                    request_index=pagination_state.request_index,
+                    artifact_count=len(raw_artifacts),
+                )
                 pagination_state = next_pagination_state
 
+        self.progress_store.clear(plan)
         normalized_artifacts = self._persist_normalized_records(
             plan,
             raw_writer,
@@ -543,7 +584,13 @@ class CatalogStrategy(BaseStrategy):
                 checkpoint_params = _stringify_mapping(hook_checkpoint_params)
 
         if checkpoint_params:
-            request = request.with_params(checkpoint_params)
+            path_params, query_checkpoint_params = _split_path_and_query_params(
+                request.url, checkpoint_params
+            )
+            if path_params:
+                request = request.with_url(request.url.format_map(path_params))
+            if query_checkpoint_params:
+                request = request.with_params(query_checkpoint_params)
         return request
 
     def _send_with_retries(
@@ -553,7 +600,7 @@ class CatalogStrategy(BaseStrategy):
         request: ApiRequest,
         throttle: CatalogRequestThrottle,
         logger: StructuredLogger | None,
-    ) -> tuple[ApiResponse, int]:
+    ) -> tuple[ApiResponse, Any, int]:
         retry_config = plan.source_config.extraction.retry
         last_transport_error: Exception | None = None
 
@@ -569,7 +616,14 @@ class CatalogStrategy(BaseStrategy):
                 continue
 
             if 200 <= response.status_code < 300:
-                return response, attempt
+                try:
+                    payload = self._decode_payload(plan, response)
+                except CatalogPayloadError:
+                    if attempt == retry_config.max_attempts:
+                        raise
+                    self._sleep_for_retry(plan, attempt, response=response, logger=logger)
+                    continue
+                return response, payload, attempt
 
             if (
                 response.status_code not in RETRYABLE_STATUS_CODES
@@ -805,6 +859,17 @@ def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:
         environment_config,
         plan.run_context.project_root,
     )
+
+
+def _split_path_and_query_params(
+    url: str,
+    bound_params: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Separate bound params into path params (referenced as {name} in the URL) and query params."""
+    placeholders = set(re.findall(r"\{(\w+)\}", url))
+    path_params = {k: v for k, v in bound_params.items() if k in placeholders}
+    query_params = {k: v for k, v in bound_params.items() if k not in placeholders}
+    return path_params, query_params
 
 
 def _resolve_url(source_config: SourceConfig) -> str:
@@ -1298,3 +1363,70 @@ def _parse_datetime(value: str) -> datetime | None:
 def _format_datetime(value: datetime) -> str:
     normalized = value.astimezone(UTC).isoformat()
     return normalized.replace("+00:00", "Z")
+
+
+def _catalog_pages_dir(plan: ExecutionPlan, storage_layout: StorageLayout) -> Path:
+    raw_dir = storage_layout.resolve_output(plan, "raw").resolved_path
+    return raw_dir / "pages"
+
+
+def _rediscover_catalog_raw_artifacts(
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    progress: dict[str, Any],
+) -> list[ExtractedArtifact]:
+    """Re-discover raw JSON artifacts written by a previous partial catalog run."""
+    directory = _catalog_pages_dir(plan, storage_layout)
+    if not directory.exists():
+        return []
+
+    last_page = progress.get("last_page_number")
+    last_offset = progress.get("last_offset")
+    artifacts: list[ExtractedArtifact] = []
+
+    if last_page is not None:
+        candidates: list[tuple[int, Path]] = []
+        for path in directory.glob("page-*.json"):
+            stem = path.stem
+            try:
+                num = int(stem[5:])
+            except ValueError:
+                continue
+            if num <= last_page:
+                candidates.append((num, path))
+        for _, path in sorted(candidates):
+            checksum = sha256(path.read_bytes()).hexdigest()
+            artifacts.append(ExtractedArtifact(path=str(path), format="json", checksum=checksum))
+
+    elif last_offset is not None:
+        candidates = []
+        for path in directory.glob("offset-*.json"):
+            stem = path.stem
+            try:
+                num = int(stem[7:])
+            except ValueError:
+                continue
+            if num <= last_offset:
+                candidates.append((num, path))
+        for _, path in sorted(candidates):
+            checksum = sha256(path.read_bytes()).hexdigest()
+            artifacts.append(ExtractedArtifact(path=str(path), format="json", checksum=checksum))
+
+    return artifacts
+
+
+def _catalog_resume_pagination_state(
+    paginator: Any,
+    pagination_state: PaginationState,
+    progress: dict[str, Any],
+) -> PaginationState:
+    """Return a pagination state that resumes after the last recorded page."""
+    last_page = progress.get("last_page_number")
+    if last_page is not None:
+        return PaginationState(request_index=1, page_number=last_page + 1)
+
+    last_offset = progress.get("last_offset")
+    if last_offset is not None and isinstance(paginator, OffsetPaginator):
+        return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
+
+    return pagination_state
