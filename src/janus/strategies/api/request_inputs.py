@@ -177,7 +177,10 @@ def validate_iceberg_request_input_source(
         if (normalized_column := str(column).strip())
     }
     for binding_name, source_column in sorted(request_inputs.columns.items()):
-        if source_column not in normalized_columns:
+        # For nested struct references like "catalog_payload.id", check that the
+        # root field exists in the top-level columns; Spark resolves the rest.
+        root_field = source_column.split(".")[0]
+        if root_field not in normalized_columns:
             message = (
                 f"access.request_inputs.columns.{binding_name}: source column "
                 f"{source_column!r} was not found in Iceberg table {table_identifier!r}"
