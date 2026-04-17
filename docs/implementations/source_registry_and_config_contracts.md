@@ -36,7 +36,7 @@ A source definition is expected to carry these sections:
 - Identity fields such as `source_id`, `name`, `owner`, `domain`, and `enabled`.
 - Strategy fields such as `source_type`, `strategy`, and `strategy_variant`.
 - An `access` block for connection details, auth, pagination, and rate limits.
-- An `extraction` block for mode, checkpoint semantics, and retry behavior.
+- An `extraction` block for mode, checkpoint semantics, retry behavior, and the dead-letter budget for item-level self-healing.
 - A `schema` block for infer-vs-explicit schema handling.
 - A `spark` block for input format and write behavior.
 - An `outputs` block for `raw`, `bronze`, and `metadata` targets. Each target declares `path` and `format`, and Iceberg bronze targets may optionally declare `namespace` and `table_name`.

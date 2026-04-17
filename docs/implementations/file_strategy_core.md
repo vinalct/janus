@@ -27,6 +27,7 @@ That means the strategy now owns these responsibilities:
 - choosing which discovered file or files should actually run for the configured variant;
 - downloading remote payloads when the source is HTTP-based;
 - applying auth and retry behavior for remote file requests;
+- recording irrecoverable file candidates in source-scoped dead-letter state;
 - validating a checksum when one is available;
 - persisting raw downloads through the shared raw writer;
 - extracting ZIP packages through reusable archive logic;
@@ -91,6 +92,8 @@ In practice, that means remote file execution now supports:
 - the same safe single-threaded request throttling style already used elsewhere in the project.
 
 The important boundary here is that the file strategy is reusing generic HTTP plumbing, not API pagination or API payload logic. The file runtime still stays file-oriented.
+
+When one selected file candidate still fails, the strategy records that candidate in the dead-letter state and continues only while `extraction.dead_letter_max_items` allows it. When the operator runs with `--resume`, previously dead-lettered candidates are skipped instead of being retried again.
 
 ## Raw persistence
 

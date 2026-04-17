@@ -317,6 +317,38 @@ def test_file_strategy_rejects_local_checksum_mismatch(tmp_path):
         strategy.extract(plan)
 
 
+def test_file_strategy_dead_letters_failed_file_and_continues(tmp_path):
+    source_dir = tmp_path / "fixtures" / "dead_letter_files"
+    source_dir.mkdir(parents=True)
+    bad_path = source_dir / "bad.csv"
+    good_path = source_dir / "good.csv"
+    bad_path.write_text("id\n1\n", encoding="utf-8")
+    good_path.write_text("id\n2\n", encoding="utf-8")
+    bad_path.with_name("bad.csv.sha256").write_text("deadbeef\n", encoding="utf-8")
+
+    plan = _build_plan(
+        tmp_path,
+        source_id="file_dead_letter",
+        access_path=source_dir,
+        file_pattern="*.csv",
+        dead_letter_max_items=1,
+    )
+    strategy, _ = _build_strategy(tmp_path)
+
+    result = strategy.extract(plan)
+    metadata = result.metadata_as_dict()
+
+    assert [Path(artifact.path).name for artifact in result.artifacts] == ["good.csv"]
+    assert result.records_extracted == 1
+    assert metadata["persisted_file_count"] == "1"
+    assert metadata["dead_letter_count"] == "1"
+    assert metadata["dead_letter_skipped_count"] == "1"
+
+    dead_letter_path = strategy.dead_letter_store.path(plan)
+    dead_letter_payload = json.loads(dead_letter_path.read_text(encoding="utf-8"))
+    assert dead_letter_payload["entries"][0]["item_type"] == "file_candidate"
+
+
 def _event_payload(payloads: list[dict], event: str) -> dict:
     for payload in payloads:
         if payload["event"] == event:
@@ -360,6 +392,7 @@ def _build_plan(
     retry_backoff_strategy: str = "fixed",
     rate_limit_backoff_seconds: int | None = 5,
     requests_per_minute: int | None = 10,
+    dead_letter_max_items: int = 0,
 ) -> ExecutionPlan:
     source_config = _build_source_config(
         tmp_path,
@@ -378,6 +411,7 @@ def _build_plan(
         retry_backoff_strategy=retry_backoff_strategy,
         rate_limit_backoff_seconds=rate_limit_backoff_seconds,
         requests_per_minute=requests_per_minute,
+        dead_letter_max_items=dead_letter_max_items,
     )
     run_context = RunContext.create(
         run_id=f"run-{source_id}",
@@ -406,6 +440,7 @@ def _build_source_config(
     retry_backoff_strategy: str = "fixed",
     rate_limit_backoff_seconds: int | None = 5,
     requests_per_minute: int | None = 10,
+    dead_letter_max_items: int = 0,
 ) -> SourceConfig:
     access_block: dict[str, Any] = {
         "method": "GET",
@@ -443,6 +478,7 @@ def _build_source_config(
                 "mode": extraction_mode,
                 "checkpoint_field": checkpoint_field,
                 "checkpoint_strategy": checkpoint_strategy,
+                "dead_letter_max_items": dead_letter_max_items,
                 "retry": {
                     "max_attempts": retry_max_attempts,
                     "backoff_strategy": retry_backoff_strategy,

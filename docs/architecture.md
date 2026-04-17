@@ -111,6 +111,7 @@ Operational metadata is a first-class part of the architecture, not a later clea
 - `janus.quality.store.ValidationReportStore` persists those reports in the metadata zone.
 - `janus.checkpoints.store.CheckpointStore` manages rerun-safe checkpoint advancement.
 - `janus.checkpoints.progress.ExtractionProgressStore` tracks per-page extraction progress so partial runs can resume where they stopped.
+- `janus.checkpoints.dead_letters.DeadLetterStore` persists source-scoped dead-letter state so exhausted request inputs or file candidates can be skipped safely on resume and within a configured execution budget.
 - `janus.lineage.store.RunObserver` persists run metadata and lineage artifacts.
 - `janus.utils.logging` emits structured logs with secret redaction.
 
@@ -127,7 +128,7 @@ The main implementation areas are:
 - `src/janus/strategies/`: API, file, and catalog family behavior.
 - `src/janus/readers/`, `src/janus/writers/`, `src/janus/normalizers/`: shared runtime I/O and normalization.
 - `src/janus/quality/`: reusable validation checks and persisted reports.
-- `src/janus/checkpoints/`: rerun-safe data checkpoints and per-page extraction progress.
+- `src/janus/checkpoints/`: rerun-safe data checkpoints, dead-letter state, and per-page extraction progress.
 - `src/janus/lineage/`: run metadata and lineage artifacts.
 - `src/janus/utils/`: runtime config, storage resolution, Spark bootstrap, and logging.
 
@@ -173,7 +174,7 @@ Today the public CLI in `src/janus/main.py` supports:
 - optional Spark session bootstrap;
 - deterministic planning for one configured source;
 - full end-to-end execution through extraction, Spark normalization, bronze writing, quality validation, and metadata persistence;
-- resuming a failed extraction run from the last successfully written page with `--resume`.
+- resuming a failed extraction run from saved progress or dead-letter state with `--resume`.
 
 The architecture is real end-to-end for API, file, and catalog source families. The CLI is the primary execution interface for all three.
 

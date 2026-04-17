@@ -151,11 +151,11 @@ janus \
   --resume
 ```
 
-`--resume` tells the API strategy to read the `extraction_progress.json` file written by the interrupted run, re-discover raw files already on disk for pages up to the last recorded position, and continue pagination from the next page. Raw files for pages already fetched are not re-requested.
+`--resume` tells the API and catalog strategies to read the `extraction_progress.json` file written by the interrupted run, re-discover raw files already on disk for pages up to the last recorded position, and continue pagination from the next page. It also tells the API, catalog, and file strategies to read `dead_letters/current.json` so request inputs or file candidates already known to be unrecoverable are skipped instead of retried again.
 
-If no progress file exists, `--resume` has no effect and the run starts normally. A run without `--resume` always clears any stale progress file before it starts, so old partial state does not silently carry over into a fresh run.
+If no progress or dead-letter file exists, `--resume` has no effect and the run starts normally. A run without `--resume` always clears any stale progress or dead-letter state before it starts, so old partial state does not silently carry over into a fresh run.
 
-This flag is only meaningful for API sources. File and catalog strategy runs ignore it.
+This flag is meaningful for API, catalog, and file sources. API and catalog sources use per-page progress plus dead-letter state; file sources use dead-letter state only.
 
 ## What the tests lock down
 

@@ -20,6 +20,7 @@ class MetadataZonePaths:
     lineage_dir: Path
     checkpoints_dir: Path
     checkpoint_history_dir: Path
+    dead_letters_dir: Path
 
     @classmethod
     def from_plan(cls, plan: ExecutionPlan) -> MetadataZonePaths:
@@ -30,6 +31,7 @@ class MetadataZonePaths:
             lineage_dir=base_dir / "lineage",
             checkpoints_dir=base_dir / "checkpoints",
             checkpoint_history_dir=base_dir / "checkpoints" / "history",
+            dead_letters_dir=base_dir / "dead_letters",
         )
 
     def run_metadata_path(self, run_id: str) -> Path:
@@ -44,6 +46,10 @@ class MetadataZonePaths:
 
     def checkpoint_history_path(self, run_id: str) -> Path:
         return self.checkpoint_history_dir / f"{run_id}.json"
+
+    @property
+    def dead_letter_state_path(self) -> Path:
+        return self.dead_letters_dir / "current.json"
 
 
 def read_json_mapping(path: Path) -> dict[str, Any] | None:

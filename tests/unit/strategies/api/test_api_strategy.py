@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import janus.strategies.api.http as http_module
-from janus.checkpoints import CheckpointStore
+from janus.checkpoints import CheckpointStore, DeadLetterStore, ExtractionProgressStore
 from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.planner import StrategyCatalog
 from janus.strategies.api import ApiHook, ApiResponse, ApiStrategy
@@ -620,6 +620,135 @@ def test_api_strategy_raises_after_exhausting_retries_on_bad_payload(tmp_path):
     assert len(transport.requests) == 2
 
 
+def test_api_strategy_dead_letters_failed_request_input_and_continues(tmp_path):
+    plan = _build_plan(
+        tmp_path,
+        source_id="dead_letter_source",
+        pagination_type="none",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze_test",
+            "table_name": "ids",
+            "columns": {"entity_id": "id"},
+        },
+        parameter_bindings={"id": {"from": "request_input.entity_id"}},
+        retry_max_attempts=2,
+        requests_per_minute=None,
+        dead_letter_max_items=1,
+    )
+    spark = FakeSparkSession(
+        {
+            "bronze_test.ids": FakeDataFrame(
+                [
+                    {"id": "alpha"},
+                    {"id": "beta"},
+                    {"id": "gamma"},
+                ]
+            )
+        }
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"records": [{"id": "alpha"}]}),
+            ResponseSpec(503, {"error": "missing"}),
+            ResponseSpec(503, {"error": "missing"}),
+            ResponseSpec(200, {"records": [{"id": "gamma"}]}),
+        ],
+    )
+
+    result = strategy.extract(plan, spark=spark)
+    metadata = result.metadata_as_dict()
+
+    queries = [parse_qs(urlsplit(request.full_url()).query) for request in transport.requests]
+    assert [query["id"] for query in queries] == [["alpha"], ["beta"], ["beta"], ["gamma"]]
+    assert [Path(artifact.path).parent.name for artifact in result.artifacts] == [
+        "request-input-000001",
+        "request-input-000003",
+    ]
+    assert result.records_extracted == 2
+    assert metadata["dead_letter_count"] == "1"
+    assert metadata["dead_letter_skipped_count"] == "1"
+
+    dead_letter_path = DeadLetterStore().path(plan)
+    dead_letter_payload = json.loads(dead_letter_path.read_text(encoding="utf-8"))
+    assert dead_letter_payload["entries"][0]["item_key"] == "entity_id=beta"
+    assert dead_letter_payload["entries"][0]["item_type"] == "request_input"
+
+
+def test_api_strategy_resume_skips_preexisting_dead_lettered_input(tmp_path):
+    source_config = _build_source_config(
+        tmp_path,
+        source_id="resume_dead_letter_source",
+        pagination_type="none",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze_test",
+            "table_name": "ids",
+            "columns": {"entity_id": "id"},
+        },
+        parameter_bindings={"id": {"from": "request_input.entity_id"}},
+        requests_per_minute=None,
+    )
+    initial_plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-resume_dead_letter_source-initial",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        ),
+    )
+    DeadLetterStore().record(
+        initial_plan,
+        item_key="entity_id=beta",
+        item_type="request_input",
+        error=RuntimeError("missing beta"),
+        metadata={"request_url": "https://example.invalid/records?id=beta"},
+    )
+    ExtractionProgressStore().save(
+        initial_plan,
+        artifact_count=0,
+        current_input_key="entity_id=beta",
+        current_input_index=1,
+        request_input_count=2,
+    )
+    plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-resume_dead_letter_source-resume",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 5, tzinfo=UTC),
+            attributes={"resume": "true"},
+        ),
+    )
+
+    spark = FakeSparkSession(
+        {
+            "bronze_test.ids": FakeDataFrame(
+                [
+                    {"id": "beta"},
+                    {"id": "gamma"},
+                ]
+            )
+        }
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [ResponseSpec(200, {"records": [{"id": "gamma"}]})],
+    )
+
+    result = strategy.extract(plan, spark=spark)
+    metadata = result.metadata_as_dict()
+
+    queries = [parse_qs(urlsplit(request.full_url()).query) for request in transport.requests]
+    assert [query["id"] for query in queries] == [["gamma"]]
+    assert result.records_extracted == 1
+    assert metadata["dead_letter_count"] == "1"
+    assert metadata["dead_letter_skipped_count"] == "1"
+
+
 def test_api_strategy_request_inputs_bind_iceberg_rows_from_runtime_spark(tmp_path):
     plan = _build_plan(
         tmp_path,
@@ -849,6 +978,7 @@ def _build_plan(
     params: dict[str, str] | None = None,
     request_inputs: dict[str, Any] | None = None,
     parameter_bindings: dict[str, Any] | None = None,
+    dead_letter_max_items: int = 0,
 ) -> ExecutionPlan:
     source_config = _build_source_config(
         tmp_path,
@@ -869,6 +999,7 @@ def _build_plan(
         params=params,
         request_inputs=request_inputs,
         parameter_bindings=parameter_bindings,
+        dead_letter_max_items=dead_letter_max_items,
     )
     run_context = RunContext.create(
         run_id=f"run-{source_id}",
@@ -899,6 +1030,7 @@ def _build_source_config(
     params: dict[str, str] | None = None,
     request_inputs: dict[str, Any] | None = None,
     parameter_bindings: dict[str, Any] | None = None,
+    dead_letter_max_items: int = 0,
 ) -> SourceConfig:
     return SourceConfig.from_mapping(
         {
@@ -934,6 +1066,7 @@ def _build_source_config(
                 "checkpoint_field": checkpoint_field,
                 "checkpoint_strategy": checkpoint_strategy,
                 "lookback_days": lookback_days,
+                "dead_letter_max_items": dead_letter_max_items,
                 "retry": {
                     "max_attempts": retry_max_attempts,
                     "backoff_strategy": retry_backoff_strategy,

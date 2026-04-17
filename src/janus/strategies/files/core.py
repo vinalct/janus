@@ -16,7 +16,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from janus.checkpoints import CheckpointState, CheckpointStore
+from janus.checkpoints import (
+    CheckpointState,
+    CheckpointStore,
+    DeadLetterStore,
+    can_continue_after_dead_letter,
+)
 from janus.models import (
     ExecutionPlan,
     ExtractedArtifact,
@@ -182,6 +187,7 @@ class FileStrategy(BaseStrategy):
     )
     raw_writer_factory: Callable[[StorageLayout], RawArtifactWriter] = RawArtifactWriter
     checkpoint_store: CheckpointStore = field(default_factory=CheckpointStore)
+    dead_letter_store: DeadLetterStore = field(default_factory=DeadLetterStore)
     env_reader: Callable[[str], str | None] = os.getenv
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -223,6 +229,11 @@ class FileStrategy(BaseStrategy):
             clock=self.clock,
             sleeper=self.sleeper,
         )
+        dead_letter_max_items = plan.source_config.extraction.dead_letter_max_items
+        resume = plan.run_context.attributes_as_dict().get("resume") == "true"
+        dead_letter_state = self.dead_letter_store.load(plan) if resume else None
+        if not resume:
+            self.dead_letter_store.clear(plan)
 
         if logger is not None:
             logger.info(
@@ -242,6 +253,7 @@ class FileStrategy(BaseStrategy):
                     plan.source_config.access.rate_limit.requests_per_minute
                 ),
                 concurrency=plan.source_config.access.rate_limit.concurrency,
+                dead_letter_max_items=dead_letter_max_items,
             )
 
         discovered_files = self._discover_files(plan, file_hook)
@@ -267,9 +279,12 @@ class FileStrategy(BaseStrategy):
         loaded_file_count = 0
         checkpoint_value: str | None = None
         resolved_versions: list[str] = []
+        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_skip_count = 0
 
         with ApiClient(self.transport_factory()) as client:
             for file_index, discovered_file in enumerate(selected_files, start=1):
+                candidate_key = _discovered_file_dead_letter_key(discovered_file)
                 if logger is not None:
                     logger.info(
                         "file_candidate_started",
@@ -288,144 +303,200 @@ class FileStrategy(BaseStrategy):
                         ),
                     )
 
-                payload, response, attempts_used = self._load_payload(
-                    plan,
-                    discovered_file,
-                    client=client,
-                    throttle=throttle,
-                    logger=logger,
-                )
-                total_attempts += attempts_used
-                loaded_file_count += 1
-                if logger is not None:
-                    logger.info(
-                        "file_payload_loaded",
-                        file_index=file_index,
-                        source_kind=discovered_file.source_kind,
-                        filename=discovered_file.filename,
-                        status_code=response.status_code if response is not None else None,
-                        attempts_used=attempts_used,
-                        payload_size_bytes=len(payload),
-                    )
-
-                if file_hook is not None:
-                    payload = file_hook.prepare_download(
-                        plan,
-                        discovered_file,
-                        payload,
-                        response=response,
-                    )
-
-                resolved_filename = _resolved_filename(discovered_file.filename, response)
-                resolved_file = replace(
-                    discovered_file,
-                    filename=resolved_filename,
-                    format=_infer_format_name(
-                        resolved_filename,
-                        fallback=plan.source_config.access.format,
-                    ),
-                )
-                version = self._resolve_version(plan, resolved_file, payload, response, file_hook)
-
-                if _should_skip_for_checkpoint(plan, checkpoint_state, version):
-                    skipped_file_count += 1
+                if candidate_key in dead_letter_keys:
+                    dead_letter_skip_count += 1
                     if logger is not None:
                         logger.info(
-                            "file_candidate_skipped",
+                            "file_candidate_skipped_dead_letter",
                             file_index=file_index,
-                            filename=resolved_filename,
-                            resolved_version=version,
-                            checkpoint_value=(
-                                checkpoint_state.checkpoint_value
-                                if checkpoint_state is not None
-                                else None
-                            ),
-                            reason="checkpoint_not_newer",
+                            filename=discovered_file.filename,
+                            dead_letter_count=len(dead_letter_keys),
                         )
                     continue
 
-                expected_checksum = self._expected_checksum(
-                    plan,
-                    resolved_file,
-                    response=response,
-                    file_hook=file_hook,
-                )
-                actual_checksum = sha256(payload).hexdigest()
-                checksum_verified = expected_checksum is not None
-                if expected_checksum is not None:
-                    if actual_checksum.lower() != expected_checksum.lower():
-                        raise FileIntegrityError(
-                            f"Checksum mismatch for {resolved_filename!r}: "
-                            f"expected {expected_checksum.lower()} got {actual_checksum.lower()}"
-                        )
-                    checksum_verified_count += 1
+                candidate_artifacts: list[ExtractedArtifact] = []
+                candidate_loaded_file_count = 0
+                candidate_total_attempts = 0
+                candidate_archive_member_count = 0
+                candidate_checksum_verified_count = 0
 
-                is_archive = _is_archive_file(plan, resolved_file, payload)
-                artifact_format = (
-                    "binary"
-                    if is_archive
-                    else _infer_handoff_format(
+                try:
+                    payload, response, attempts_used = self._load_payload(
+                        plan,
+                        discovered_file,
+                        client=client,
+                        throttle=throttle,
+                        logger=logger,
+                    )
+                    candidate_total_attempts += attempts_used
+                    candidate_loaded_file_count += 1
+                    if logger is not None:
+                        logger.info(
+                            "file_payload_loaded",
+                            file_index=file_index,
+                            source_kind=discovered_file.source_kind,
+                            filename=discovered_file.filename,
+                            status_code=response.status_code if response is not None else None,
+                            attempts_used=attempts_used,
+                            payload_size_bytes=len(payload),
+                        )
+
+                    if file_hook is not None:
+                        payload = file_hook.prepare_download(
+                            plan,
+                            discovered_file,
+                            payload,
+                            response=response,
+                        )
+
+                    resolved_filename = _resolved_filename(discovered_file.filename, response)
+                    resolved_file = replace(
+                        discovered_file,
+                        filename=resolved_filename,
+                        format=_infer_format_name(
+                            resolved_filename,
+                            fallback=plan.source_config.access.format,
+                        ),
+                    )
+                    version = self._resolve_version(plan, resolved_file, payload, response, file_hook)
+
+                    if _should_skip_for_checkpoint(plan, checkpoint_state, version):
+                        skipped_file_count += 1
+                        if logger is not None:
+                            logger.info(
+                                "file_candidate_skipped",
+                                file_index=file_index,
+                                filename=resolved_filename,
+                                resolved_version=version,
+                                checkpoint_value=(
+                                    checkpoint_state.checkpoint_value
+                                    if checkpoint_state is not None
+                                    else None
+                                ),
+                                reason="checkpoint_not_newer",
+                            )
+                        continue
+
+                    expected_checksum = self._expected_checksum(
+                        plan,
                         resolved_file,
-                        fallback=plan.source_config.spark.input_format,
+                        response=response,
+                        file_hook=file_hook,
                     )
-                )
-                persisted_original = raw_writer.write_bytes(
-                    plan,
-                    _raw_download_relative_path(version, resolved_filename),
-                    payload,
-                    metadata={
-                        "source_kind": resolved_file.source_kind,
-                        "source_location": _redacted_location(resolved_file),
-                        "resolved_version": version,
-                        "attempt_count": str(attempts_used),
-                    },
-                )
-                artifacts.append(
-                    ExtractedArtifact(
-                        path=persisted_original.artifact.path,
-                        format=artifact_format,
-                        checksum=persisted_original.artifact.checksum,
+                    actual_checksum = sha256(payload).hexdigest()
+                    checksum_verified = expected_checksum is not None
+                    if expected_checksum is not None:
+                        if actual_checksum.lower() != expected_checksum.lower():
+                            raise FileIntegrityError(
+                                f"Checksum mismatch for {resolved_filename!r}: "
+                                f"expected {expected_checksum.lower()} got {actual_checksum.lower()}"
+                            )
+                        candidate_checksum_verified_count += 1
+
+                    is_archive = _is_archive_file(plan, resolved_file, payload)
+                    artifact_format = (
+                        "binary"
+                        if is_archive
+                        else _infer_handoff_format(
+                            resolved_file,
+                            fallback=plan.source_config.spark.input_format,
+                        )
                     )
-                )
+                    persisted_original = raw_writer.write_bytes(
+                        plan,
+                        _raw_download_relative_path(version, resolved_filename),
+                        payload,
+                        metadata={
+                            "source_kind": resolved_file.source_kind,
+                            "source_location": _redacted_location(resolved_file),
+                            "resolved_version": version,
+                            "attempt_count": str(attempts_used),
+                        },
+                    )
+                    candidate_artifacts.append(
+                        ExtractedArtifact(
+                            path=persisted_original.artifact.path,
+                            format=artifact_format,
+                            checksum=persisted_original.artifact.checksum,
+                        )
+                    )
+                    if logger is not None:
+                        logger.info(
+                            "file_payload_persisted",
+                            file_index=file_index,
+                            filename=resolved_filename,
+                            source_kind=resolved_file.source_kind,
+                            resolved_version=version,
+                            artifact_path=persisted_original.artifact.path,
+                            artifact_format=artifact_format,
+                            checksum_verified=checksum_verified,
+                            is_archive=is_archive,
+                            payload_size_bytes=len(payload),
+                        )
+
+                    if is_archive:
+                        extracted_artifacts = self._extract_archive(
+                            plan,
+                            raw_writer,
+                            resolved_file,
+                            payload,
+                            version=version,
+                            file_hook=file_hook,
+                        )
+                        candidate_artifacts.extend(extracted_artifacts)
+                        candidate_archive_member_count += len(extracted_artifacts)
+                        if logger is not None:
+                            logger.info(
+                                "file_archive_extracted",
+                                file_index=file_index,
+                                archive_filename=resolved_file.filename,
+                                resolved_version=version,
+                                archive_member_count=len(extracted_artifacts),
+                                first_member_artifact_path=(
+                                    extracted_artifacts[0].path if extracted_artifacts else None
+                                ),
+                            )
+                except Exception as exc:
+                    if logger is not None:
+                        logger.exception("file_candidate_execution_failed")
+                    dead_letter_state = self.dead_letter_store.record(
+                        plan,
+                        item_key=candidate_key,
+                        item_type="file_candidate",
+                        error=exc,
+                        metadata=_discovered_file_dead_letter_metadata(
+                            discovered_file,
+                            file_index=file_index,
+                            selected_file_count=len(selected_files),
+                        ),
+                    )
+                    dead_letter_keys = set(dead_letter_state.item_keys)
+                    if logger is not None:
+                        logger.info(
+                            "file_candidate_dead_lettered",
+                            file_index=file_index,
+                            filename=discovered_file.filename,
+                            dead_letter_count=dead_letter_state.entry_count,
+                            dead_letter_max_items=dead_letter_max_items,
+                            error_type=type(exc).__name__,
+                        )
+                    if not can_continue_after_dead_letter(
+                        total_item_count=len(selected_files),
+                        dead_letter_count=dead_letter_state.entry_count,
+                        dead_letter_max_items=dead_letter_max_items,
+                    ):
+                        raise
+                    dead_letter_skip_count += 1
+                    continue
+
+                artifacts.extend(candidate_artifacts)
+                total_attempts += candidate_total_attempts
+                loaded_file_count += candidate_loaded_file_count
+                checksum_verified_count += candidate_checksum_verified_count
+                archive_member_count += candidate_archive_member_count
                 persisted_file_count += 1
                 resolved_versions.append(version)
                 checkpoint_value = _max_checkpoint_value(checkpoint_value, version)
-                if logger is not None:
-                    logger.info(
-                        "file_payload_persisted",
-                        file_index=file_index,
-                        filename=resolved_filename,
-                        source_kind=resolved_file.source_kind,
-                        resolved_version=version,
-                        artifact_path=persisted_original.artifact.path,
-                        artifact_format=artifact_format,
-                        checksum_verified=checksum_verified,
-                        is_archive=is_archive,
-                        payload_size_bytes=len(payload),
-                    )
-
-                if is_archive:
-                    extracted_artifacts = self._extract_archive(
-                        plan,
-                        raw_writer,
-                        resolved_file,
-                        payload,
-                        version=version,
-                        file_hook=file_hook,
-                    )
-                    artifacts.extend(extracted_artifacts)
-                    archive_member_count += len(extracted_artifacts)
-                    if logger is not None:
-                        logger.info(
-                            "file_archive_extracted",
-                            file_index=file_index,
-                            archive_filename=resolved_file.filename,
-                            resolved_version=version,
-                            archive_member_count=len(extracted_artifacts),
-                            first_member_artifact_path=(
-                                extracted_artifacts[0].path if extracted_artifacts else None
-                            ),
-                        )
 
         normalization_candidate_count = sum(
             1 for artifact in artifacts if artifact.format == plan.source_config.spark.input_format
@@ -458,7 +529,11 @@ class FileStrategy(BaseStrategy):
                 normalization_candidate_count=normalization_candidate_count,
                 artifact_count=len(artifacts),
                 checkpoint_value=checkpoint_value,
+                dead_letter_count=(dead_letter_state.entry_count if dead_letter_state else 0),
+                dead_letter_skipped_count=dead_letter_skip_count,
             )
+
+        dead_letter_count = dead_letter_state.entry_count if dead_letter_state is not None else 0
 
         extraction_result = ExtractionResult.from_plan(
             plan,
@@ -467,6 +542,18 @@ class FileStrategy(BaseStrategy):
             checkpoint_value=checkpoint_value,
             metadata=extraction_metadata,
         )
+        extraction_result = extraction_result.with_metadata(
+            "dead_letter_count",
+            str(dead_letter_count),
+        ).with_metadata(
+            "dead_letter_skipped_count",
+            str(dead_letter_skip_count),
+        )
+        if dead_letter_count > 0:
+            extraction_result = extraction_result.with_metadata(
+                "dead_letter_path",
+                str(self.dead_letter_store.path(plan)),
+            )
         if hook is not None:
             return hook.on_extraction_result(plan, extraction_result)
         return extraction_result
@@ -1104,6 +1191,25 @@ def _redacted_location(discovered_file: DiscoveredFile) -> str:
     if discovered_file.source_kind == "remote":
         return redact_url(discovered_file.location)
     return discovered_file.location
+
+
+def _discovered_file_dead_letter_key(discovered_file: DiscoveredFile) -> str:
+    return f"{discovered_file.source_kind}:{discovered_file.location}"
+
+
+def _discovered_file_dead_letter_metadata(
+    discovered_file: DiscoveredFile,
+    *,
+    file_index: int,
+    selected_file_count: int,
+) -> dict[str, str]:
+    return {
+        "file_index": str(file_index),
+        "selected_file_count": str(selected_file_count),
+        "source_kind": discovered_file.source_kind,
+        "source_location": _redacted_location(discovered_file),
+        "filename": discovered_file.filename,
+    }
 
 
 def _retry_delay_seconds(

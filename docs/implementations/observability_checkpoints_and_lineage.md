@@ -4,13 +4,14 @@ The short version is: JANUS now has a metadata trail for runs.
 
 This step was about giving reruns, failures, and downstream strategy work somewhere concrete to land. Before it, the planner could describe a run, but the project still had no shared way to persist what happened, remember checkpoint progress, or record enough context to diagnose a failure without digging through ad hoc logs.
 
-The result is a small observability layer built around the existing runtime contracts: run metadata records, lineage records, monotonic checkpoints, and structured logging that redacts secrets by default.
+The result is a small observability layer built around the existing runtime contracts: run metadata records, lineage records, monotonic checkpoints, dead-letter state for item-level self-healing, and structured logging that redacts secrets by default.
 
 ## What was added
 
 - `src/janus/checkpoints/store.py` now defines the checkpoint state, checkpoint history, and the persistence rules for rerun-safe writes.
 - `src/janus/checkpoints/progress.py` now defines `ExtractionProgressStore`, which tracks per-page pagination position so a failed extraction run can resume without re-fetching pages it already wrote.
-- `src/janus/checkpoints/__init__.py` now exposes both checkpoint APIs for downstream imports.
+- `src/janus/checkpoints/dead_letters.py` now defines `DeadLetterStore`, which persists source-scoped dead-letter items so retries stay per-item and resumed runs can skip unrecoverable work safely.
+- `src/janus/checkpoints/__init__.py` now exposes the checkpoint, progress, and dead-letter APIs for downstream imports.
 - `src/janus/lineage/models.py` now defines the run metadata and lineage models used to describe one run from start to finish.
 - `src/janus/lineage/persistence.py` now resolves metadata-zone paths and writes JSON artifacts atomically.
 - `src/janus/lineage/store.py` now provides the persistence helpers and the shared `RunObserver` service.
@@ -18,6 +19,7 @@ The result is a small observability layer built around the existing runtime cont
 - `src/janus/utils/logging.py` now provides structured JSON logging with secret redaction.
 - `tests/unit/checkpoints/test_store.py` covers checkpoint persistence and rerun behavior.
 - `tests/unit/checkpoints/test_progress.py` covers extraction progress save, load, overwrite, source-id guard, clear behavior, and content-based input tracking round-trips.
+- `tests/unit/checkpoints/test_dead_letters.py` covers dead-letter persistence, clear behavior, deduplication, and resume reuse across run ids.
 - `tests/unit/lineage/test_run_observer.py` covers run metadata, lineage persistence, and failure capture.
 - `tests/unit/lineage/test_logging.py` covers redaction and structured log output.
 
@@ -65,6 +67,7 @@ Given the configured metadata output path, the code now writes:
 - `lineage/<run_id>.json` for the lineage record;
 - `checkpoints/current.json` for the latest stored checkpoint state;
 - `checkpoints/history/<run_id>.json` for the write decision taken during that run;
+- `dead_letters/current.json` for the source-scoped dead-letter state reused by resumed runs;
 - `extraction_progress.json` for the per-page extraction position of an in-progress or interrupted run.
 
 Those files are written atomically so a rerun does not leave half-written metadata behind if the process is interrupted at the wrong moment.
@@ -123,6 +126,16 @@ Inputs whose key matches an entry in `completed_inputs` are skipped and their ra
 
 For sources using page-number or offset pagination, the re-discovery step is exact: it scans the raw directory for files whose page number or offset is at or below the last recorded value, sorts them numerically, and restores them as pre-populated artifacts. Cursor pagination does not support per-page resume because the cursor for the next page is only available in the response of the previous one; those runs restart from the beginning when `--resume` is used.
 
+## Dead-letter state
+
+The data checkpoint and the extraction progress file still leave one operational question unanswered: "which item kept failing even after request-level retries were exhausted?"
+
+The `DeadLetterStore` writes `dead_letters/current.json` to the metadata zone as a source-scoped JSON control-state file. Each entry records the item key, item type, error type, error message, timestamp, and small execution metadata such as request URL or request-input index.
+
+This file is live execution state, not a historical warehouse table. API, catalog, and file strategies use it when a run is resumed with `--resume`, so request inputs or file candidates already known to be unrecoverable are skipped instead of being retried forever.
+
+A normal run without `--resume` clears stale dead-letter state before it starts. Within one run, strategies still record dead letters as they occur and continue only while `extraction.dead_letter_max_items` allows it. A value of `0` keeps fail-fast behavior after the first dead-lettered item while still preserving enough state for a later resume.
+
 ## The `RunObserver`
 
 The new `RunObserver` is the shared service future strategy modules are expected to call.
@@ -158,6 +171,7 @@ They cover:
 - writing and loading the current checkpoint state;
 - preventing an older rerun from moving the checkpoint backward;
 - skipping checkpoint writes cleanly when checkpointing is disabled;
+- persisting source-scoped dead-letter state and reusing it across resume runs with new run ids;
 - persisting the running and successful run records through the observer;
 - persisting failure reasons in both run metadata and lineage;
 - redacting secret-bearing log fields while preserving the rest of the event payload.

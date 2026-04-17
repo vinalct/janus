@@ -594,6 +594,7 @@ def _build_source_config_with_url(
     checkpoint_field: str | None = None,
     checkpoint_strategy: str = "none",
     lookback_days: int | None = 1,
+    dead_letter_max_items: int = 0,
 ) -> "SourceConfig":
     return SourceConfig.from_mapping(
         {
@@ -625,6 +626,7 @@ def _build_source_config_with_url(
                 "checkpoint_field": checkpoint_field,
                 "checkpoint_strategy": checkpoint_strategy,
                 "lookback_days": lookback_days,
+                "dead_letter_max_items": dead_letter_max_items,
                 "retry": {
                     "max_attempts": 3,
                     "backoff_strategy": "fixed",
@@ -676,6 +678,7 @@ def _build_plan(
     checkpoint_strategy: str = "none",
     lookback_days: int | None = None,
     page_size: int = 100,
+    dead_letter_max_items: int = 0,
 ) -> ExecutionPlan:
     source_config = _build_source_config(
         tmp_path,
@@ -687,6 +690,7 @@ def _build_plan(
         checkpoint_strategy=checkpoint_strategy,
         lookback_days=lookback_days,
         page_size=page_size,
+        dead_letter_max_items=dead_letter_max_items,
     )
     run_context = RunContext.create(
         run_id=f"run-{source_id}",
@@ -708,6 +712,7 @@ def _build_source_config(
     checkpoint_strategy: str = "none",
     lookback_days: int | None = None,
     page_size: int = 100,
+    dead_letter_max_items: int = 0,
 ) -> SourceConfig:
     return SourceConfig.from_mapping(
         {
@@ -740,6 +745,7 @@ def _build_source_config(
                 "checkpoint_field": checkpoint_field,
                 "checkpoint_strategy": checkpoint_strategy,
                 "lookback_days": lookback_days,
+                "dead_letter_max_items": dead_letter_max_items,
                 "retry": {
                     "max_attempts": 3,
                     "backoff_strategy": "fixed",
@@ -815,6 +821,9 @@ def _build_source_config_with_request_inputs(
     path: str = "/catalog/{id}",
     request_inputs: dict,
     parameter_bindings: dict,
+    pagination_type: str = "none",
+    page_size: int = 100,
+    dead_letter_max_items: int = 0,
 ) -> SourceConfig:
     return SourceConfig.from_mapping(
         {
@@ -835,7 +844,7 @@ def _build_source_config_with_request_inputs(
                 "format": "json",
                 "timeout_seconds": 30,
                 "auth": {"type": "none"},
-                "pagination": {"type": "none"},
+                "pagination": _pagination_block(pagination_type, page_size),
                 "rate_limit": {
                     "requests_per_minute": 60,
                     "concurrency": 1,
@@ -847,6 +856,7 @@ def _build_source_config_with_request_inputs(
             "extraction": {
                 "mode": "full_refresh",
                 "checkpoint_strategy": "none",
+                "dead_letter_max_items": dead_letter_max_items,
                 "retry": {
                     "max_attempts": 1,
                     "backoff_strategy": "fixed",
@@ -994,7 +1004,157 @@ def test_catalog_strategy_request_inputs_query_param_binding(tmp_path):
     assert len(transport.requests) == 2
     assert transport.requests[0].params_as_dict().get("organization") == "org-1"
     assert transport.requests[1].params_as_dict().get("organization") == "org-2"
-    assert result.records_extracted == 2
+
+
+def test_catalog_strategy_dead_letters_failed_request_input_without_partial_entities(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    source_config = _build_source_config_with_request_inputs(
+        tmp_path,
+        source_id="catalog_dead_letter",
+        path="/catalog/{entity_id}",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze_test",
+            "table_name": "entities",
+            "columns": {"entity_id": "id"},
+        },
+        parameter_bindings={
+            "entity_id": {"from": "request_input.entity_id"},
+        },
+        pagination_type="page_number",
+        page_size=2,
+        dead_letter_max_items=1,
+    )
+    plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-catalog_dead_letter",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        ),
+    )
+    fake_inputs = ({"entity_id": "alpha"}, {"entity_id": "beta"})
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(
+                200,
+                {
+                    "result": {
+                        "results": [
+                            {"id": "dataset-alpha-1", "title": "Alpha 1"},
+                            {"id": "dataset-alpha-2", "title": "Alpha 2"},
+                        ]
+                    }
+                },
+            ),
+            ResponseSpec(
+                200,
+                {"result": {"results": [{"id": "dataset-beta", "title": "Beta"}]}} ,
+            ),
+        ],
+    )
+    original_send = transport.send
+
+    def patched_send(request):
+        query = parse_qs(urlsplit(request.full_url()).query)
+        if request.url.endswith("/catalog/alpha") and query.get("page") == ["2"]:
+            transport.requests.append(request)
+            return ApiResponse(request=request, status_code=200, body=b"not-json", headers=())
+        return original_send(request)
+
+    transport.send = patched_send
+
+    with patch("janus.strategies.catalog.core.load_request_inputs", return_value=fake_inputs):
+        result = strategy.extract(plan)
+
+    metadata = result.metadata_as_dict()
+    raw_artifact_paths = [
+        Path(artifact.path)
+        for artifact in result.artifacts
+        if Path(artifact.path).suffix == ".json"
+    ]
+    dataset_records = _read_jsonl(
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "catalog_dead_letter"
+        / "normalized"
+        / "datasets.jsonl"
+    )
+
+    assert len(transport.requests) == 3
+    assert [path.parent.name for path in raw_artifact_paths] == ["request-input-000002"]
+    assert [record["entity_key"] for record in dataset_records] == ["dataset-beta"]
+    assert result.records_extracted == 1
+    assert metadata["dead_letter_count"] == "1"
+    assert metadata["dead_letter_skipped_count"] == "1"
+
+
+def test_catalog_strategy_continues_after_multiple_dead_letters_within_budget(tmp_path):
+    from unittest.mock import patch
+
+    source_config = _build_source_config_with_request_inputs(
+        tmp_path,
+        source_id="catalog_dead_letter_budget",
+        path="/catalog/{entity_id}",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze_test",
+            "table_name": "entities",
+            "columns": {"entity_id": "id"},
+        },
+        parameter_bindings={
+            "entity_id": {"from": "request_input.entity_id"},
+        },
+        dead_letter_max_items=2,
+    )
+    plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-catalog_dead_letter_budget",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        ),
+    )
+    fake_inputs = (
+        {"entity_id": "alpha"},
+        {"entity_id": "beta"},
+        {"entity_id": "gamma"},
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(400, {"error": "bad alpha"}),
+            ResponseSpec(400, {"error": "bad beta"}),
+            ResponseSpec(200, {"result": {"results": [{"id": "dataset-gamma", "title": "Gamma"}]}}),
+        ],
+    )
+
+    with patch("janus.strategies.catalog.core.load_request_inputs", return_value=fake_inputs):
+        result = strategy.extract(plan)
+
+    metadata = result.metadata_as_dict()
+
+    assert len(transport.requests) == 3
+    assert [record["entity_id"] for record in _read_jsonl(
+        tmp_path
+        / "runtime"
+        / "raw"
+        / "example"
+        / "catalog_dead_letter_budget"
+        / "normalized"
+        / "datasets.jsonl"
+    )] == ["dataset-gamma"]
+    assert result.records_extracted == 1
+    assert metadata["dead_letter_count"] == "2"
+    assert metadata["dead_letter_skipped_count"] == "2"
 
 
 def test_catalog_source_config_rejects_request_inputs_for_file_source(tmp_path):

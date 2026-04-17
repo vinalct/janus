@@ -23,7 +23,10 @@ from janus.writers import SparkDatasetWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "dados_abertos_catalog"
-SOURCE_ID = "dados_abertos_catalog"
+SOURCE_ID = "dados_abertos_catalog__conjunto_dados__full_refresh"
+SOURCE_CONFIG_PATH = (
+    PROJECT_ROOT / "conf" / "sources" / "dados_abertos_catalog" / "conjunto_de_dados.yaml"
+)
 ICEBERG_RUNTIME_JAR = (
     PROJECT_ROOT
     / "data"
@@ -132,7 +135,7 @@ def test_dados_abertos_catalog_source_contract_uses_generic_catalog_strategy():
     assert source_config.access.pagination.page_param == "pagina"
     assert source_config.access.pagination.size_param == "tamanhoPagina"
     assert source_config.access.pagination.page_size == 15
-    assert source_config.extraction.mode == "snapshot"
+    assert source_config.extraction.mode == "full_refresh"
     assert source_config.extraction.checkpoint_field is None
     assert source_config.extraction.checkpoint_strategy == "none"
     assert source_config.spark.input_format == "jsonl"
@@ -347,7 +350,6 @@ def test_dados_abertos_catalog_extracts_catalog_entities_and_materializes_bronze
 
 def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
     source_config = load_registry(PROJECT_ROOT).get_source(SOURCE_ID, include_disabled=True)
-    config_path = PROJECT_ROOT / "conf" / "sources" / "dados_abertos_catalog" / "dados_abertos_catalog.yaml"
     schema_path = (
         PROJECT_ROOT
         / "conf"
@@ -356,7 +358,7 @@ def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
         / "catalog_metadata_schema.json"
     )
 
-    copied_config_path = tmp_path / "conf" / "sources" / "dados_abertos_catalog" / "dados_abertos_catalog.yaml"
+    copied_config_path = tmp_path / "conf" / "sources" / "dados_abertos_catalog" / "conjunto_de_dados.yaml"
     copied_schema_path = (
         tmp_path
         / "conf"
@@ -367,8 +369,19 @@ def _cloned_source_config(tmp_path: Path, *, page_size: int) -> SourceConfig:
     copied_config_path.parent.mkdir(parents=True, exist_ok=True)
     copied_schema_path.parent.mkdir(parents=True, exist_ok=True)
 
-    config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config_payload["access"]["pagination"]["page_size"] = page_size
+    config_payload = yaml.safe_load(SOURCE_CONFIG_PATH.read_text(encoding="utf-8"))
+    source_entries = config_payload.get("sources") if isinstance(config_payload, dict) else None
+    if not isinstance(source_entries, list):
+        raise AssertionError("Expected a top-level 'sources' list in conjunto_de_dados.yaml")
+
+    matching_source = next(
+        (entry for entry in source_entries if entry.get("source_id") == SOURCE_ID),
+        None,
+    )
+    if matching_source is None:
+        raise AssertionError(f"Source {SOURCE_ID!r} not found in conjunto_de_dados.yaml")
+
+    matching_source["access"]["pagination"]["page_size"] = page_size
     copied_config_path.write_text(
         yaml.safe_dump(config_payload, sort_keys=False),
         encoding="utf-8",

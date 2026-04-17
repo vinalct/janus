@@ -100,7 +100,7 @@ Every source should define:
 - identity fields such as `source_id`, `name`, `owner`, `domain`, and `enabled`;
 - family metadata such as `source_type`, `strategy`, and `strategy_variant`;
 - the `access` block for endpoints, paths, auth, pagination, rate limits, and formats;
-- the `extraction` block for refresh mode, retry policy, and checkpoint semantics;
+- the `extraction` block for refresh mode, retry policy, dead-letter budget, and checkpoint semantics;
 - the `schema` block;
 - the `spark` block;
 - the `outputs` block for `raw`, `bronze`, and `metadata`;
@@ -267,6 +267,7 @@ JANUS computes the Cartesian product of the two input streams and runs one reque
 
 - `extraction.mode` is one of `full_refresh`, `snapshot`, or `incremental`.
 - `extraction.retry` currently supports `max_attempts`, `backoff_strategy`, and `backoff_seconds`.
+- `extraction.dead_letter_max_items` is an optional execution budget for item-level self-healing. After request-level retries are exhausted for one request input or file candidate, JANUS records a dead letter and continues while the run stays within this budget. A value of `0` preserves fail-fast behavior but still records the item so a later `--resume` can skip it.
 - `extraction.checkpoint_field` and `extraction.checkpoint_strategy` matter only when the source is incremental.
 - `extraction.checkpoint_strategy` is one of `none`, `max_value`, or `date_window`.
 - `extraction.lookback_days` is optional and only matters when incremental checkpoint values are time-based.

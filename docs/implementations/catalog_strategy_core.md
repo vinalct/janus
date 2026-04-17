@@ -26,6 +26,7 @@ That means the strategy now owns these responsibilities:
 - building and sending catalog requests from the source contract;
 - applying the configured pagination strategy;
 - respecting configured request pacing and retry rules;
+- recording unrecoverable request inputs in source-scoped dead-letter state once request-level retries are exhausted;
 - reading an existing checkpoint for incremental metadata refreshes;
 - persisting exact raw catalog pages through the shared raw writer;
 - traversing common catalog structures such as datasets, organizations, groups, and resources;
@@ -130,7 +131,10 @@ That means a catalog source now gets the same operational basics as the other ru
 - page-number, offset, cursor, or no-pagination request flow;
 - bounded retry behavior for transient failures;
 - single-threaded throttling through `requests_per_minute`;
+- source-scoped dead-letter tracking for request inputs whose bounded retries are exhausted;
 - incremental refresh support through the checkpoint layer.
+
+If one request input still fails after the retry loop, the strategy records it in the dead-letter state and continues only while `extraction.dead_letter_max_items` allows it. When the operator runs with `--resume`, previously dead-lettered inputs are skipped instead of being retried again.
 
 The checkpoint behavior here is metadata-oriented.
 

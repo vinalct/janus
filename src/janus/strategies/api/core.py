@@ -15,7 +15,13 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urljoin
 
-from janus.checkpoints import CheckpointState, CheckpointStore, ExtractionProgressStore
+from janus.checkpoints import (
+    CheckpointState,
+    CheckpointStore,
+    DeadLetterStore,
+    ExtractionProgressStore,
+    can_continue_after_dead_letter,
+)
 from janus.models import (
     CombinedRequestInputsConfig,
     ExecutionPlan,
@@ -213,6 +219,7 @@ class ApiStrategy(BaseStrategy):
     raw_writer_factory: Callable[[StorageLayout], RawArtifactWriter] = RawArtifactWriter
     checkpoint_store: CheckpointStore = field(default_factory=CheckpointStore)
     progress_store: ExtractionProgressStore = field(default_factory=ExtractionProgressStore)
+    dead_letter_store: DeadLetterStore = field(default_factory=DeadLetterStore)
     env_reader: Callable[[str], str | None] = os.getenv
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -258,6 +265,7 @@ class ApiStrategy(BaseStrategy):
         logger = self._bind_logger(plan)
         request_input_type = plan.source_config.access.request_inputs.type
         parameter_bindings = plan.source_config.access.parameter_bindings
+        dead_letter_max_items = plan.source_config.extraction.dead_letter_max_items
 
         try:
             request_inputs = load_request_inputs(
@@ -287,6 +295,7 @@ class ApiStrategy(BaseStrategy):
                 request_input_type=request_input_type,
                 request_input_count=request_input_count,
                 bound_parameter_names=bound_parameter_names,
+                dead_letter_max_items=dead_letter_max_items,
                 upstream_namespace=request_input_metadata.get("upstream_namespace"),
                 upstream_table_name=request_input_metadata.get("upstream_table_name"),
                 upstream_column_names=(
@@ -298,8 +307,10 @@ class ApiStrategy(BaseStrategy):
 
         resume = plan.run_context.attributes_as_dict().get("resume") == "true"
         progress = None
+        dead_letter_state = None
         if resume:
             progress = self.progress_store.load(plan)
+            dead_letter_state = self.dead_letter_store.load(plan)
             if logger is not None:
                 if progress is not None:
                     logger.info(
@@ -314,6 +325,7 @@ class ApiStrategy(BaseStrategy):
                     logger.info("api_extraction_resume_requested_no_progress_found")
         else:
             self.progress_store.clear(plan)
+            self.dead_letter_store.clear(plan)
 
         artifacts: list[ExtractedArtifact] = []
         total_records = 0
@@ -333,6 +345,8 @@ class ApiStrategy(BaseStrategy):
         )
 
         completed_inputs: list[tuple[str, int]] = list(completed_by_key.items())
+        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_skip_count = 0
 
         for request_input_index, request_input in enumerate(request_inputs, start=1):
             request_input_key = _request_input_key(request_input)
@@ -356,6 +370,16 @@ class ApiStrategy(BaseStrategy):
                         "api_request_input_skipped_already_complete",
                         recovered_artifact_count=len(pre_artifacts),
                         input_key=request_input_key,
+                    )
+                continue
+
+            if request_input_key in dead_letter_keys:
+                dead_letter_skip_count += 1
+                if request_input_logger is not None:
+                    request_input_logger.info(
+                        "api_request_input_skipped_dead_letter",
+                        input_key=request_input_key,
+                        dead_letter_count=len(dead_letter_keys),
                     )
                 continue
 
@@ -480,10 +504,38 @@ class ApiStrategy(BaseStrategy):
                         progress_store=self.progress_store,
                         prior_artifact_count=len(artifacts),
                     )
-            except Exception:
+            except Exception as exc:
                 if request_input_logger is not None:
                     request_input_logger.exception("api_request_execution_failed")
-                raise
+                dead_letter_state = self.dead_letter_store.record(
+                    plan,
+                    item_key=request_input_key,
+                    item_type="request_input",
+                    error=exc,
+                    metadata=_request_input_dead_letter_metadata(
+                        request_input=request_input,
+                        request_input_index=request_input_index,
+                        request_input_count=request_input_count,
+                        request=request_input_base_request,
+                    ),
+                )
+                dead_letter_keys = set(dead_letter_state.item_keys)
+                if request_input_logger is not None:
+                    request_input_logger.info(
+                        "api_request_input_dead_lettered",
+                        input_key=request_input_key,
+                        dead_letter_count=dead_letter_state.entry_count,
+                        dead_letter_max_items=dead_letter_max_items,
+                        error_type=type(exc).__name__,
+                    )
+                if not can_continue_after_dead_letter(
+                    total_item_count=request_input_count,
+                    dead_letter_count=dead_letter_state.entry_count,
+                    dead_letter_max_items=dead_letter_max_items,
+                ):
+                    raise
+                dead_letter_skip_count += 1
+                continue
 
             artifacts.extend(request_input_artifacts)
             total_records += request_input_total_records
@@ -517,9 +569,13 @@ class ApiStrategy(BaseStrategy):
                 checkpoint_value=checkpoint_value,
                 request_input_type=request_input_type,
                 request_input_count=request_input_count,
+                dead_letter_count=(dead_letter_state.entry_count if dead_letter_state else 0),
+                dead_letter_skipped_count=dead_letter_skip_count,
             )
 
         self.progress_store.clear(plan)
+
+        dead_letter_count = dead_letter_state.entry_count if dead_letter_state is not None else 0
 
         extraction_result = ExtractionResult.from_plan(
             plan,
@@ -534,9 +590,16 @@ class ApiStrategy(BaseStrategy):
                 "auth_type": plan.source_config.access.auth.type,
                 "checkpoint_loaded": str(checkpoint_state is not None).lower(),
                 "records_extracted": str(total_records),
+                "dead_letter_count": str(dead_letter_count),
+                "dead_letter_skipped_count": str(dead_letter_skip_count),
                 **request_input_metadata,
             },
         )
+        if dead_letter_count > 0:
+            extraction_result = extraction_result.with_metadata(
+                "dead_letter_path",
+                str(self.dead_letter_store.path(plan)),
+            )
         if hook is not None:
             return hook.on_extraction_result(plan, extraction_result)
         return extraction_result
@@ -1329,6 +1392,24 @@ def _request_input_key(request_input: dict[str, Any] | None) -> str:
     if request_input is None:
         return "__none__"
     return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
+
+
+def _request_input_dead_letter_metadata(
+    *,
+    request_input: Mapping[str, Any] | None,
+    request_input_index: int,
+    request_input_count: int,
+    request: ApiRequest,
+) -> dict[str, str]:
+    metadata = {
+        "request_input_index": str(request_input_index),
+        "request_input_count": str(request_input_count),
+        "request_url": request.full_url(),
+    }
+    field_names = _request_input_field_names(request_input)
+    if field_names:
+        metadata["request_input_field_names"] = ",".join(field_names)
+    return metadata
 
 
 def _request_input_field_names(

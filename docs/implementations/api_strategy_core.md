@@ -12,7 +12,7 @@ The result is not a source integration for Transparencia, IBGE, or any other one
 
 - `src/janus/strategies/api/http.py` now defines the request and response transport objects, auth injection rules, and the default stdlib-backed transport.
 - `src/janus/strategies/api/pagination.py` now defines the reusable paginator components for page-number, offset, cursor, and no-pagination flows.
-- `src/janus/strategies/api/core.py` now implements the `ApiStrategy` itself, including request building, retry and throttling behavior, checkpoint-aware incremental execution, per-page extraction progress tracking, raw persistence, and metadata emission.
+- `src/janus/strategies/api/core.py` now implements the `ApiStrategy` itself, including request building, retry and throttling behavior, checkpoint-aware incremental execution, per-page extraction progress tracking, dead-letter tracking, raw persistence, and metadata emission.
 - `src/janus/strategies/api/__init__.py` now exposes the API strategy package surface for downstream imports.
 - `src/janus/planner/core.py` now resolves API variants to the real `ApiStrategy` in the default strategy catalog.
 - `tests/unit/strategies/api/test_api_strategy.py` now covers the main runtime behaviors introduced in this step.
@@ -30,6 +30,7 @@ That means the layer now owns these responsibilities:
 - applying the configured pagination strategy;
 - respecting the configured request rate;
 - retrying transient failures with bounded backoff;
+- recording unrecoverable request inputs in source-scoped dead-letter state once request-level retries are exhausted;
 - reading an existing checkpoint for incremental runs;
 - persisting exact raw payloads through the shared raw writer;
 - emitting extraction metadata in a shape the rest of JANUS can already consume.
@@ -191,6 +192,8 @@ The computed delay is then bounded by the configured API-side backoff limit when
 
 That gives JANUS safer default behavior without turning one public API integration into an unbounded sleep loop.
 
+When one request input still fails after the bounded retry loop, the strategy records that input in the dead-letter state. The extraction continues only while `extraction.dead_letter_max_items` still allows more dead-lettered inputs; otherwise the failure is raised.
+
 ## Incremental extraction and checkpoints
 
 This step is also where the API strategy starts using the checkpoint layer introduced earlier.
@@ -247,9 +250,9 @@ Long-running API extractions fail mid-run. A source with 33,000 pages at 240 req
 
 Every page the API strategy writes to the raw zone is durably persisted as a file with a deterministic name. The problem was not the raw files—they survive. The problem was that the strategy had no memory of where it stopped, so the next invocation restarted from page one.
 
-The strategy now saves an `extraction_progress.json` entry after each page lands on disk. This file lives in the metadata zone alongside run records and checkpoint state. It is keyed by source id rather than run id, so it survives across separate CLI invocations.
+The strategy now saves an `extraction_progress.json` entry after each page lands on disk. This file lives in the metadata zone alongside run records, checkpoint state, and dead-letter state. It is keyed by source id rather than run id, so it survives across separate CLI invocations.
 
-When the operator runs the command with `--resume`, the strategy reads this progress file and resumes from where the previous run stopped without touching the API for any page or input combination it already has on disk.
+When the operator runs the command with `--resume`, the strategy reads this progress file and the source-scoped dead-letter state. It resumes from where the previous run stopped without touching the API for any page or input combination it already has on disk, and it skips request inputs that were already dead-lettered in the interrupted run.
 
 ### Multi-input progress tracking
 
@@ -264,6 +267,7 @@ orgao_codigo=170010|window_end=2025-01-31|window_start=2025-01-01
 The file records completed inputs as a list of `{"key": ..., "index": ...}` objects plus the key and file-path index for the input that was in progress when the run stopped. On resume:
 
 - inputs whose fingerprint is in `completed_inputs` are skipped and their raw files are re-discovered from disk;
+- inputs whose fingerprint is in the dead-letter state are skipped immediately;
 - the input whose fingerprint matches `current_input_key` has its raw files re-discovered up to the last page and pagination resumes from there;
 - all remaining inputs are started fresh.
 
@@ -273,7 +277,7 @@ This makes resume correct even when upstream Iceberg data reorders between invoc
 
 Resume is supported for page-number and offset pagination. Cursor pagination does not support per-page resume because there is no way to derive the next cursor without the response of the previous page; cursor runs restart from the beginning when `--resume` is used, which is still better than corrupted state.
 
-The progress file is removed at the end of every successful extraction. A normal run without `--resume` also removes any stale progress file before starting, so partial state from a previous run does not silently influence an intentional fresh run.
+The progress file is removed at the end of every successful extraction. A normal run without `--resume` also removes any stale progress file and clears any stale dead-letter state before starting, so partial state from a previous run does not silently influence an intentional fresh run.
 
 ## Hooks and extension points
 

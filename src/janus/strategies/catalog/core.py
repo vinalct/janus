@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -12,7 +13,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-from janus.checkpoints import CheckpointState, CheckpointStore, ExtractionProgressStore
+from janus.checkpoints import (
+    CheckpointState,
+    CheckpointStore,
+    DeadLetterStore,
+    ExtractionProgressStore,
+    can_continue_after_dead_letter,
+)
 from janus.models import (
     ExecutionPlan,
     ExtractedArtifact,
@@ -236,6 +243,7 @@ class CatalogStrategy(BaseStrategy):
     raw_writer_factory: Callable[[StorageLayout], RawArtifactWriter] = RawArtifactWriter
     checkpoint_store: CheckpointStore = field(default_factory=CheckpointStore)
     progress_store: ExtractionProgressStore = field(default_factory=ExtractionProgressStore)
+    dead_letter_store: DeadLetterStore = field(default_factory=DeadLetterStore)
     env_reader: Callable[[str], str | None] = os.getenv
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -278,6 +286,7 @@ class CatalogStrategy(BaseStrategy):
             sleeper=self.sleeper,
         )
         logger = self._bind_logger(plan)
+        dead_letter_max_items = plan.source_config.extraction.dead_letter_max_items
 
         request_inputs_config = plan.source_config.access.request_inputs
         parameter_bindings = plan.source_config.access.parameter_bindings
@@ -305,12 +314,15 @@ class CatalogStrategy(BaseStrategy):
                 timeout_seconds=base_request.timeout_seconds,
                 request_input_type=request_inputs_config.type,
                 request_input_count=len(request_inputs),
+                dead_letter_max_items=dead_letter_max_items,
             )
 
         resume = plan.run_context.attributes_as_dict().get("resume") == "true"
         progress = None
-        if resume and single_input:
+        dead_letter_state = None
+        if resume:
             progress = self.progress_store.load(plan)
+            dead_letter_state = self.dead_letter_store.load(plan)
             if logger is not None:
                 if progress is not None:
                     logger.info(
@@ -321,25 +333,23 @@ class CatalogStrategy(BaseStrategy):
                     )
                 else:
                     logger.info("catalog_extraction_resume_requested_no_progress_found")
-        elif not resume:
+        else:
             self.progress_store.clear(plan)
+            self.dead_letter_store.clear(plan)
 
         raw_artifacts: list[ExtractedArtifact] = []
-        initial_pagination_override: PaginationState | None = None
 
+        completed_by_key: dict[str, int] = {}
         if progress is not None:
-            pre_artifacts = _rediscover_catalog_raw_artifacts(plan, storage_layout, progress)
-            raw_artifacts.extend(pre_artifacts)
-            initial_pagination_override = _catalog_resume_pagination_state(
-                paginator, paginator.initial_state(base_request), progress
-            )
-            if logger is not None:
-                logger.info(
-                    "catalog_extraction_resume_artifacts_recovered",
-                    recovered_artifact_count=len(pre_artifacts),
-                    resuming_at_page=initial_pagination_override.page_number,
-                    resuming_at_offset=initial_pagination_override.offset,
-                )
+            for entry in progress.get("completed_inputs", []):
+                completed_by_key[entry["key"]] = entry["index"]
+        current_key_from_progress: str | None = (
+            progress.get("current_input_key") if progress is not None else None
+        )
+        completed_inputs: list[tuple[str, int]] = list(completed_by_key.items())
+        request_input_count = len(request_inputs)
+        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_skip_count = 0
 
         normalized_records: dict[str, list[dict[str, Any]]] = {
             entity_type: [] for entity_type in ENTITY_TYPE_ORDER
@@ -351,139 +361,264 @@ class CatalogStrategy(BaseStrategy):
         page_record_total = 0
 
         with ApiClient(self.transport_factory()) as client:
-            for request_input in request_inputs:
+            for request_input_index, request_input in enumerate(request_inputs, start=1):
+                request_input_key = _catalog_request_input_key(request_input)
                 per_input_request = _apply_per_input_params(
                     base_request, parameter_bindings, request_input
                 )
 
-                if initial_pagination_override is not None:
-                    pagination_state = initial_pagination_override
-                    initial_pagination_override = None
+                if request_input_key in completed_by_key:
+                    completed_input_index = completed_by_key[request_input_key]
+                    pre_artifacts = _rediscover_catalog_input_artifacts(
+                        plan, storage_layout, completed_input_index, request_input_count
+                    )
+                    raw_artifacts.extend(pre_artifacts)
+                    checkpoint_value = _replay_catalog_entities_from_dir(
+                        self,
+                        plan,
+                        storage_layout,
+                        per_input_request,
+                        paginator,
+                        completed_input_index,
+                        request_input_count,
+                        checkpoint_state,
+                        normalized_records,
+                        entity_indexes,
+                        checkpoint_value,
+                    )
+                    continue
+
+                if request_input_key in dead_letter_keys:
+                    dead_letter_skip_count += 1
+                    if logger is not None:
+                        logger.info(
+                            "catalog_request_input_skipped_dead_letter",
+                            input_key=request_input_key,
+                            dead_letter_count=len(dead_letter_keys),
+                        )
+                    continue
+
+                is_resuming = progress is not None and (
+                    request_input_key == current_key_from_progress
+                    or current_key_from_progress is None
+                )
+                request_input_raw_artifacts: list[ExtractedArtifact] = []
+                request_input_records: dict[str, list[dict[str, Any]]] = {
+                    entity_type: [] for entity_type in ENTITY_TYPE_ORDER
+                }
+                request_input_indexes: dict[tuple[str, str], int] = {}
+                request_input_checkpoint_value = checkpoint_value
+                request_input_successful_requests = 0
+                request_input_total_attempts = 0
+                request_input_page_record_total = 0
+
+                if is_resuming:
+                    pre_artifacts = _rediscover_catalog_raw_artifacts(
+                        plan, storage_layout, progress, request_input_index, request_input_count
+                    )
+                    request_input_raw_artifacts.extend(pre_artifacts)
+                    pagination_state = _catalog_resume_pagination_state(
+                        paginator, paginator.initial_state(per_input_request), progress
+                    )
+                    if logger is not None:
+                        logger.info(
+                            "catalog_extraction_resume_artifacts_recovered",
+                            recovered_artifact_count=len(pre_artifacts),
+                            resuming_at_page=pagination_state.page_number,
+                            resuming_at_offset=pagination_state.offset,
+                        )
                 else:
                     pagination_state = paginator.initial_state(per_input_request)
 
-                while pagination_state is not None:
-                    request = paginator.apply(per_input_request, pagination_state)
-                    if catalog_hook is not None:
-                        request = catalog_hook.prepare_request(
+                try:
+                    while pagination_state is not None:
+                        request = paginator.apply(per_input_request, pagination_state)
+                        if catalog_hook is not None:
+                            request = catalog_hook.prepare_request(
+                                plan,
+                                request,
+                                checkpoint_state=checkpoint_state,
+                                pagination_state=pagination_state,
+                            )
+
+                        if logger is not None:
+                            logger.info(
+                                "catalog_request_started",
+                                request_index=pagination_state.request_index,
+                                page_number=pagination_state.page_number,
+                                offset=pagination_state.offset,
+                                cursor=pagination_state.cursor,
+                                request_url=request.full_url(),
+                            )
+
+                        response, payload, attempts_used = self._send_with_retries(
+                            plan,
+                            client,
+                            request,
+                            throttle,
+                            logger,
+                        )
+                        request_input_total_attempts += attempts_used
+                        request_input_successful_requests += 1
+
+                        if catalog_hook is not None:
+                            response = catalog_hook.handle_response(plan, request, response)
+
+                        if catalog_hook is not None:
+                            payload = catalog_hook.transform_payload(plan, request, response, payload)
+
+                        persisted = self._persist_raw_payload(
+                            plan,
+                            raw_writer,
+                            response=response,
+                            payload=payload,
+                            pagination_state=pagination_state,
+                            request_input_index=request_input_index,
+                            request_input_count=request_input_count,
+                        )
+                        request_input_raw_artifacts.append(persisted.artifact)
+
+                        primary_batch_size = self._page_record_count(
                             plan,
                             request,
-                            checkpoint_state=checkpoint_state,
+                            response,
+                            payload,
+                            hook=catalog_hook,
+                        )
+                        request_input_page_record_total += primary_batch_size
+                        entity_counts_before = {
+                            entity_type: len(records)
+                            for entity_type, records in request_input_records.items()
+                        }
+                        request_input_checkpoint_value = self._collect_catalog_entities(
+                            plan,
+                            payload=payload,
+                            request=request,
+                            response=response,
                             pagination_state=pagination_state,
+                            raw_artifact=persisted.artifact,
+                            checkpoint_state=checkpoint_state,
+                            normalized_records=request_input_records,
+                            entity_indexes=request_input_indexes,
+                            current_checkpoint_value=request_input_checkpoint_value,
                         )
-
-                    if logger is not None:
-                        logger.info(
-                            "catalog_request_started",
-                            request_index=pagination_state.request_index,
-                            page_number=pagination_state.page_number,
-                            offset=pagination_state.offset,
-                            cursor=pagination_state.cursor,
-                            request_url=request.full_url(),
+                        entity_counts_after = {
+                            entity_type: len(records)
+                            for entity_type, records in request_input_records.items()
+                        }
+                        page_entity_count = sum(
+                            entity_counts_after[entity_type] - entity_counts_before[entity_type]
+                            for entity_type in ENTITY_TYPE_ORDER
                         )
-
-                    response, payload, attempts_used = self._send_with_retries(
-                        plan,
-                        client,
-                        request,
-                        throttle,
-                        logger,
-                    )
-                    total_attempts += attempts_used
-                    successful_requests += 1
-
-                    if catalog_hook is not None:
-                        response = catalog_hook.handle_response(plan, request, response)
-
-                    if catalog_hook is not None:
-                        payload = catalog_hook.transform_payload(plan, request, response, payload)
-
-                    persisted = self._persist_raw_payload(
-                        plan,
-                        raw_writer,
-                        response=response,
-                        payload=payload,
-                        pagination_state=pagination_state,
-                    )
-                    raw_artifacts.append(persisted.artifact)
-
-                    primary_batch_size = self._page_record_count(
-                        plan,
-                        request,
-                        response,
-                        payload,
-                        hook=catalog_hook,
-                    )
-                    page_record_total += primary_batch_size
-                    entity_counts_before = {
-                        entity_type: len(records)
-                        for entity_type, records in normalized_records.items()
-                    }
-                    checkpoint_value = self._collect_catalog_entities(
-                        plan,
-                        payload=payload,
-                        request=request,
-                        response=response,
-                        pagination_state=pagination_state,
-                        raw_artifact=persisted.artifact,
-                        checkpoint_state=checkpoint_state,
-                        normalized_records=normalized_records,
-                        entity_indexes=entity_indexes,
-                        current_checkpoint_value=checkpoint_value,
-                    )
-                    entity_counts_after = {
-                        entity_type: len(records)
-                        for entity_type, records in normalized_records.items()
-                    }
-                    page_entity_count = sum(
-                        entity_counts_after[entity_type] - entity_counts_before[entity_type]
-                        for entity_type in ENTITY_TYPE_ORDER
-                    )
-                    next_pagination_state = paginator.next_state(
-                        pagination_state,
-                        records_extracted=primary_batch_size,
-                        payload=payload,
-                    )
-                    if logger is not None:
-                        logger.info(
-                            "catalog_request_finished",
-                            request_index=pagination_state.request_index,
-                            page_number=pagination_state.page_number,
-                            offset=pagination_state.offset,
-                            cursor=pagination_state.cursor,
-                            status_code=response.status_code,
-                            attempts_used=attempts_used,
+                        next_pagination_state = paginator.next_state(
+                            pagination_state,
                             records_extracted=primary_batch_size,
-                            entities_extracted=page_entity_count,
-                            total_records=page_record_total,
-                            total_entities=sum(entity_counts_after.values()),
-                            organizations_extracted=entity_counts_after["organization"],
-                            groups_extracted=entity_counts_after["group"],
-                            datasets_extracted=entity_counts_after["dataset"],
-                            resources_extracted=entity_counts_after["resource"],
-                            artifact_path=persisted.artifact.path,
-                            has_next_page=next_pagination_state is not None,
-                            next_page_number=(
-                                next_pagination_state.page_number
-                                if next_pagination_state is not None
-                                else None
-                            ),
-                            next_offset=(
-                                next_pagination_state.offset
-                                if next_pagination_state is not None
-                                else None
-                            ),
+                            payload=payload,
                         )
-                    if single_input:
+                        if logger is not None:
+                            logger.info(
+                                "catalog_request_finished",
+                                request_index=pagination_state.request_index,
+                                page_number=pagination_state.page_number,
+                                offset=pagination_state.offset,
+                                cursor=pagination_state.cursor,
+                                status_code=response.status_code,
+                                attempts_used=attempts_used,
+                                records_extracted=primary_batch_size,
+                                entities_extracted=page_entity_count,
+                                total_records=page_record_total + request_input_page_record_total,
+                                total_entities=_catalog_total_entity_count(
+                                    normalized_records,
+                                    request_input_records,
+                                ),
+                                organizations_extracted=(
+                                    len(normalized_records["organization"])
+                                    + len(request_input_records["organization"])
+                                ),
+                                groups_extracted=(
+                                    len(normalized_records["group"])
+                                    + len(request_input_records["group"])
+                                ),
+                                datasets_extracted=(
+                                    len(normalized_records["dataset"])
+                                    + len(request_input_records["dataset"])
+                                ),
+                                resources_extracted=(
+                                    len(normalized_records["resource"])
+                                    + len(request_input_records["resource"])
+                                ),
+                                artifact_path=persisted.artifact.path,
+                                has_next_page=next_pagination_state is not None,
+                                next_page_number=(
+                                    next_pagination_state.page_number
+                                    if next_pagination_state is not None
+                                    else None
+                                ),
+                                next_offset=(
+                                    next_pagination_state.offset
+                                    if next_pagination_state is not None
+                                    else None
+                                ),
+                            )
                         self.progress_store.save(
                             plan,
                             page_number=pagination_state.page_number,
                             offset=pagination_state.offset,
                             cursor=pagination_state.cursor,
                             request_index=pagination_state.request_index,
-                            artifact_count=len(raw_artifacts),
+                            artifact_count=len(raw_artifacts) + len(request_input_raw_artifacts),
+                            completed_inputs=completed_inputs,
+                            current_input_key=request_input_key,
+                            current_input_index=request_input_index,
+                            request_input_count=request_input_count,
                         )
-                    pagination_state = next_pagination_state
+                        pagination_state = next_pagination_state
+                except Exception as exc:
+                    if logger is not None:
+                        logger.exception("catalog_request_execution_failed")
+                    dead_letter_state = self.dead_letter_store.record(
+                        plan,
+                        item_key=request_input_key,
+                        item_type="request_input",
+                        error=exc,
+                        metadata=_catalog_request_input_dead_letter_metadata(
+                            request_input=request_input,
+                            request_input_index=request_input_index,
+                            request_input_count=request_input_count,
+                            request=per_input_request,
+                        ),
+                    )
+                    dead_letter_keys = set(dead_letter_state.item_keys)
+                    if logger is not None:
+                        logger.info(
+                            "catalog_request_input_dead_lettered",
+                            input_key=request_input_key,
+                            dead_letter_count=dead_letter_state.entry_count,
+                            dead_letter_max_items=dead_letter_max_items,
+                            error_type=type(exc).__name__,
+                        )
+                    if not can_continue_after_dead_letter(
+                        total_item_count=request_input_count,
+                        dead_letter_count=dead_letter_state.entry_count,
+                        dead_letter_max_items=dead_letter_max_items,
+                    ):
+                        raise
+                    dead_letter_skip_count += 1
+                    continue
+
+                raw_artifacts.extend(request_input_raw_artifacts)
+                _merge_catalog_entity_records(
+                    plan,
+                    normalized_records,
+                    entity_indexes,
+                    request_input_records,
+                )
+                checkpoint_value = request_input_checkpoint_value
+                successful_requests += request_input_successful_requests
+                total_attempts += request_input_total_attempts
+                page_record_total += request_input_page_record_total
+
+                completed_inputs.append((request_input_key, request_input_index))
 
         self.progress_store.clear(plan)
         normalized_artifacts = self._persist_normalized_records(
@@ -508,7 +643,11 @@ class CatalogStrategy(BaseStrategy):
                 groups_extracted=len(normalized_records["group"]),
                 datasets_extracted=len(normalized_records["dataset"]),
                 resources_extracted=len(normalized_records["resource"]),
+                dead_letter_count=(dead_letter_state.entry_count if dead_letter_state else 0),
+                dead_letter_skipped_count=dead_letter_skip_count,
             )
+
+        dead_letter_count = dead_letter_state.entry_count if dead_letter_state is not None else 0
 
         extraction_result = ExtractionResult.from_plan(
             plan,
@@ -528,6 +667,8 @@ class CatalogStrategy(BaseStrategy):
                 "groups_extracted": str(len(normalized_records["group"])),
                 "datasets_extracted": str(len(normalized_records["dataset"])),
                 "resources_extracted": str(len(normalized_records["resource"])),
+                "dead_letter_count": str(dead_letter_count),
+                "dead_letter_skipped_count": str(dead_letter_skip_count),
                 "entity_types_emitted": ",".join(
                     entity_type
                     for entity_type in ENTITY_TYPE_ORDER
@@ -535,6 +676,11 @@ class CatalogStrategy(BaseStrategy):
                 ),
             },
         )
+        if dead_letter_count > 0:
+            extraction_result = extraction_result.with_metadata(
+                "dead_letter_path",
+                str(self.dead_letter_store.path(plan)),
+            )
         if hook is not None:
             return hook.on_extraction_result(plan, extraction_result)
         return extraction_result
@@ -714,10 +860,16 @@ class CatalogStrategy(BaseStrategy):
         response: ApiResponse,
         payload: Any,
         pagination_state: PaginationState,
+        request_input_index: int = 1,
+        request_input_count: int = 1,
     ):
         return raw_writer.write_json(
             plan,
-            _raw_relative_path(pagination_state),
+            _raw_relative_path(
+                pagination_state,
+                request_input_index=request_input_index,
+                request_input_count=request_input_count,
+            ),
             payload,
             metadata={
                 "request_url": response.request.full_url(),
@@ -1002,7 +1154,12 @@ def _retry_delay_seconds(
     return float(min(delay, maximum_delay))
 
 
-def _raw_relative_path(pagination_state: PaginationState) -> Path:
+def _raw_relative_path(
+    pagination_state: PaginationState,
+    *,
+    request_input_index: int = 1,
+    request_input_count: int = 1,
+) -> Path:
     if pagination_state.page_number is not None:
         filename = f"page-{pagination_state.page_number:04d}.json"
     elif pagination_state.offset is not None:
@@ -1011,6 +1168,8 @@ def _raw_relative_path(pagination_state: PaginationState) -> Path:
         filename = f"cursor-{pagination_state.request_index:04d}.json"
     else:
         filename = f"response-{pagination_state.request_index:04d}.json"
+    if request_input_count > 1:
+        return Path(f"request-input-{request_input_index:06d}") / filename
     return Path("pages") / filename
 
 
@@ -1423,18 +1582,76 @@ def _format_datetime(value: datetime) -> str:
     return normalized.replace("+00:00", "Z")
 
 
-def _catalog_pages_dir(plan: ExecutionPlan, storage_layout: StorageLayout) -> Path:
+def _catalog_input_dir(
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    request_input_index: int,
+    request_input_count: int,
+) -> Path:
     raw_dir = storage_layout.resolve_output(plan, "raw").resolved_path
+    if request_input_count > 1:
+        return raw_dir / f"request-input-{request_input_index:06d}"
     return raw_dir / "pages"
+
+
+def _sorted_catalog_pages(directory: Path) -> list[Path]:
+    """Return all catalog page JSON files sorted by sequence number."""
+    if not directory.exists():
+        return []
+    candidates: list[tuple[int, Path]] = []
+    for path in directory.glob("*.json"):
+        stem = path.stem
+        for prefix, start in (
+            ("page-", 5),
+            ("offset-", 7),
+            ("cursor-", 7),
+            ("response-", 9),
+        ):
+            if stem.startswith(prefix):
+                try:
+                    candidates.append((int(stem[start:]), path))
+                except ValueError:
+                    pass
+                break
+    return [p for _, p in sorted(candidates)]
+
+
+def _catalog_pagination_state_from_path(path: Path) -> PaginationState:
+    """Reconstruct a PaginationState from a raw page filename."""
+    stem = path.stem
+    if stem.startswith("page-"):
+        try:
+            num = int(stem[5:])
+            return PaginationState(request_index=num, page_number=num)
+        except ValueError:
+            pass
+    if stem.startswith("offset-"):
+        try:
+            return PaginationState(request_index=1, offset=int(stem[7:]))
+        except ValueError:
+            pass
+    if stem.startswith("cursor-"):
+        try:
+            return PaginationState(request_index=int(stem[7:]), cursor="")
+        except ValueError:
+            pass
+    if stem.startswith("response-"):
+        try:
+            return PaginationState(request_index=int(stem[9:]))
+        except ValueError:
+            pass
+    return PaginationState(request_index=1)
 
 
 def _rediscover_catalog_raw_artifacts(
     plan: ExecutionPlan,
     storage_layout: StorageLayout,
     progress: dict[str, Any],
+    request_input_index: int = 1,
+    request_input_count: int = 1,
 ) -> list[ExtractedArtifact]:
     """Re-discover raw JSON artifacts written by a previous partial catalog run."""
-    directory = _catalog_pages_dir(plan, storage_layout)
+    directory = _catalog_input_dir(plan, storage_layout, request_input_index, request_input_count)
     if not directory.exists():
         return []
 
@@ -1471,6 +1688,123 @@ def _rediscover_catalog_raw_artifacts(
             artifacts.append(ExtractedArtifact(path=str(path), format="json", checksum=checksum))
 
     return artifacts
+
+
+def _rediscover_catalog_input_artifacts(
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    request_input_index: int,
+    request_input_count: int,
+) -> list[ExtractedArtifact]:
+    """Re-discover all raw JSON artifacts for a fully completed catalog input."""
+    artifacts: list[ExtractedArtifact] = []
+    for path in _sorted_catalog_pages(
+        _catalog_input_dir(plan, storage_layout, request_input_index, request_input_count)
+    ):
+        checksum = sha256(path.read_bytes()).hexdigest()
+        artifacts.append(ExtractedArtifact(path=str(path), format="json", checksum=checksum))
+    return artifacts
+
+
+def _replay_catalog_entities_from_dir(
+    strategy: "CatalogStrategy",
+    plan: ExecutionPlan,
+    storage_layout: StorageLayout,
+    per_input_request: ApiRequest,
+    paginator: Any,
+    request_input_index: int,
+    request_input_count: int,
+    checkpoint_state: CheckpointState | None,
+    normalized_records: dict[str, list[dict[str, Any]]],
+    entity_indexes: dict[tuple[str, str], int],
+    current_checkpoint_value: str | None,
+) -> str | None:
+    """Re-collect catalog entities from the raw JSON files of a completed input."""
+    directory = _catalog_input_dir(plan, storage_layout, request_input_index, request_input_count)
+    checkpoint_value = current_checkpoint_value
+    for path in _sorted_catalog_pages(directory):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pagination_state = _catalog_pagination_state_from_path(path)
+        request = paginator.apply(per_input_request, pagination_state)
+        file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        response = ApiResponse(
+            request=request,
+            status_code=200,
+            body=b"",
+            received_at=file_mtime,
+        )
+        checksum = sha256(path.read_bytes()).hexdigest()
+        raw_artifact = ExtractedArtifact(path=str(path), format="json", checksum=checksum)
+        checkpoint_value = strategy._collect_catalog_entities(
+            plan,
+            payload=payload,
+            request=request,
+            response=response,
+            pagination_state=pagination_state,
+            raw_artifact=raw_artifact,
+            checkpoint_state=checkpoint_state,
+            normalized_records=normalized_records,
+            entity_indexes=entity_indexes,
+            current_checkpoint_value=checkpoint_value,
+        )
+    return checkpoint_value
+
+
+def _merge_catalog_entity_records(
+    plan: ExecutionPlan,
+    normalized_records: dict[str, list[dict[str, Any]]],
+    entity_indexes: dict[tuple[str, str], int],
+    request_input_records: Mapping[str, Sequence[dict[str, Any]]],
+) -> None:
+    for entity_type in ENTITY_TYPE_ORDER:
+        for candidate in request_input_records.get(entity_type, ()):  # pragma: no branch
+            entity_key = _string_value(candidate.get("entity_key"))
+            if entity_key is None:
+                continue
+            _upsert_entity_record(
+                plan,
+                normalized_records,
+                entity_indexes,
+                entity_key,
+                candidate,
+            )
+
+
+def _catalog_total_entity_count(
+    normalized_records: Mapping[str, Sequence[dict[str, Any]]],
+    request_input_records: Mapping[str, Sequence[dict[str, Any]]],
+) -> int:
+    return sum(
+        len(normalized_records[entity_type]) + len(request_input_records[entity_type])
+        for entity_type in ENTITY_TYPE_ORDER
+    )
+
+
+def _catalog_request_input_dead_letter_metadata(
+    *,
+    request_input: Mapping[str, Any] | None,
+    request_input_index: int,
+    request_input_count: int,
+    request: ApiRequest,
+) -> dict[str, str]:
+    metadata = {
+        "request_input_index": str(request_input_index),
+        "request_input_count": str(request_input_count),
+        "request_url": request.full_url(),
+    }
+    if request_input:
+        metadata["request_input_field_names"] = ",".join(sorted(str(key) for key in request_input))
+    return metadata
+
+
+def _catalog_request_input_key(request_input: dict[str, Any] | None) -> str:
+    """Stable, content-based fingerprint for a catalog request input context."""
+    if request_input is None:
+        return "__none__"
+    return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
 
 
 def _catalog_resume_pagination_state(

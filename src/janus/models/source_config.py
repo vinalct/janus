@@ -150,6 +150,7 @@ class ExtractionConfig:
     checkpoint_field: str | None = None
     checkpoint_strategy: str = "none"
     lookback_days: int | None = None
+    dead_letter_max_items: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -866,6 +867,14 @@ def _build_extraction_config(raw_value: Any, issues: list[ValidationIssue]) -> E
         default="none",
     )
     lookback_days = _optional_int(data, "lookback_days", issues, "extraction", minimum=0)
+    dead_letter_max_items = _optional_int(
+        data,
+        "dead_letter_max_items",
+        issues,
+        "extraction",
+        default=0,
+        minimum=0,
+    )
     retry = _build_retry_config(data.get("retry"), issues)
 
     if mode == "incremental":
@@ -889,6 +898,7 @@ def _build_extraction_config(raw_value: Any, issues: list[ValidationIssue]) -> E
         checkpoint_field=checkpoint_field,
         checkpoint_strategy=checkpoint_strategy,
         lookback_days=lookback_days,
+        dead_letter_max_items=dead_letter_max_items,
         retry=retry,
     )
 
