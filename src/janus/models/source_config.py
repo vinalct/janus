@@ -550,11 +550,11 @@ def _build_request_inputs_config(
     if raw_value is None:
         return RequestInputsConfig(type="none")
 
-    if source_type != "api":
+    if source_type not in ("api", "catalog"):
         issues.append(
             ValidationIssue(
                 "access.request_inputs",
-                "is only supported for api sources",
+                "is only supported for api and catalog sources",
             )
         )
         return RequestInputsConfig(type="none")
@@ -712,11 +712,11 @@ def _build_parameter_bindings_config(
     if raw_value is None:
         return None
 
-    if source_type != "api":
+    if source_type not in ("api", "catalog"):
         issues.append(
             ValidationIssue(
                 "access.parameter_bindings",
-                "is only supported for api sources",
+                "is only supported for api and catalog sources",
             )
         )
         return None

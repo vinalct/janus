@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from io import StringIO
@@ -800,3 +801,238 @@ def _storage_layout(tmp_path: Path) -> StorageLayout:
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+# ---------------------------------------------------------------------------
+# request_inputs + parameter_bindings tests
+# ---------------------------------------------------------------------------
+
+
+def _build_source_config_with_request_inputs(
+    tmp_path: Path,
+    *,
+    source_id: str,
+    path: str = "/catalog/{id}",
+    request_inputs: dict,
+    parameter_bindings: dict,
+) -> SourceConfig:
+    return SourceConfig.from_mapping(
+        {
+            "source_id": source_id,
+            "name": source_id,
+            "owner": "janus",
+            "enabled": True,
+            "source_type": "catalog",
+            "strategy": "catalog",
+            "strategy_variant": "metadata_catalog",
+            "federation_level": "federal",
+            "domain": "example",
+            "public_access": True,
+            "access": {
+                "base_url": "https://example.invalid",
+                "path": path,
+                "method": "GET",
+                "format": "json",
+                "timeout_seconds": 30,
+                "auth": {"type": "none"},
+                "pagination": {"type": "none"},
+                "rate_limit": {
+                    "requests_per_minute": 60,
+                    "concurrency": 1,
+                    "backoff_seconds": 1,
+                },
+                "request_inputs": request_inputs,
+                "parameter_bindings": parameter_bindings,
+            },
+            "extraction": {
+                "mode": "full_refresh",
+                "checkpoint_strategy": "none",
+                "retry": {
+                    "max_attempts": 1,
+                    "backoff_strategy": "fixed",
+                    "backoff_seconds": 1,
+                },
+            },
+            "schema": {"mode": "infer"},
+            "spark": {"input_format": "jsonl", "write_mode": "overwrite"},
+            "outputs": {
+                "raw": {"path": f"data/raw/example/{source_id}", "format": "json"},
+                "bronze": {"path": f"data/bronze/example/{source_id}", "format": "iceberg"},
+                "metadata": {"path": f"data/metadata/example/{source_id}", "format": "json"},
+            },
+            "quality": {"allow_schema_evolution": True},
+        },
+        tmp_path / "conf" / "sources" / f"{source_id}.yaml",
+    )
+
+
+def test_catalog_strategy_request_inputs_none_behaves_as_before(tmp_path):
+    """Explicit type=none is equivalent to no request_inputs — single extraction loop."""
+    source_config = _build_source_config(tmp_path, source_id="catalog_none_inputs")
+    plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-none",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        ),
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(
+                200,
+                {"results": [{"id": "ds-1", "title": "Dataset 1"}]},
+            ),
+        ],
+    )
+
+    result = strategy.extract(plan)
+
+    assert result.records_extracted == 1
+    assert len(transport.requests) == 1
+
+
+def test_catalog_strategy_iceberg_rows_request_inputs_iterates_over_inputs(tmp_path):
+    """Each iceberg_rows context produces one request with the bound path param."""
+    source_config = _build_source_config_with_request_inputs(
+        tmp_path,
+        source_id="catalog_iceberg_inputs",
+        path="/catalog/{entity_id}",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze__test",
+            "table_name": "entities",
+            "columns": {"entity_id": "id"},
+            "distinct": False,
+        },
+        parameter_bindings={
+            "entity_id": {"from": "request_input.entity_id"},
+        },
+    )
+    plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-iceberg",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        ),
+    )
+
+    # Simulate two iceberg_rows contexts — same as load_request_inputs would return
+    from unittest.mock import patch
+    from janus.strategies.api.request_inputs import load_request_inputs
+
+    fake_inputs = ({"entity_id": "alpha"}, {"entity_id": "beta"})
+
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"results": [{"id": "alpha", "title": "Alpha"}]}),
+            ResponseSpec(200, {"results": [{"id": "beta", "title": "Beta"}]}),
+        ],
+    )
+
+    with patch(
+        "janus.strategies.catalog.core.load_request_inputs",
+        return_value=fake_inputs,
+    ):
+        result = strategy.extract(plan)
+
+    assert len(transport.requests) == 2
+    assert "/catalog/alpha" in transport.requests[0].url
+    assert "/catalog/beta" in transport.requests[1].url
+    assert result.records_extracted == 2
+
+
+def test_catalog_strategy_request_inputs_query_param_binding(tmp_path):
+    """Parameter bindings injected as query params are sent on each request."""
+    source_config = _build_source_config_with_request_inputs(
+        tmp_path,
+        source_id="catalog_query_binding",
+        path="/catalog",
+        request_inputs={
+            "type": "iceberg_rows",
+            "namespace": "bronze__test",
+            "table_name": "orgs",
+            "columns": {"org_id": "id"},
+        },
+        parameter_bindings={
+            "organization": {"from": "request_input.org_id"},
+        },
+    )
+    plan = ExecutionPlan.from_source_config(
+        source_config,
+        RunContext.create(
+            run_id="run-query",
+            environment="local",
+            project_root=tmp_path,
+            started_at=datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
+        ),
+    )
+
+    fake_inputs = ({"org_id": "org-1"}, {"org_id": "org-2"})
+
+    strategy, transport = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(200, {"results": [{"id": "ds-1", "title": "Dataset from org-1"}]}),
+            ResponseSpec(200, {"results": [{"id": "ds-2", "title": "Dataset from org-2"}]}),
+        ],
+    )
+
+    from unittest.mock import patch
+
+    with patch(
+        "janus.strategies.catalog.core.load_request_inputs",
+        return_value=fake_inputs,
+    ):
+        result = strategy.extract(plan)
+
+    assert len(transport.requests) == 2
+    assert transport.requests[0].params_as_dict().get("organization") == "org-1"
+    assert transport.requests[1].params_as_dict().get("organization") == "org-2"
+    assert result.records_extracted == 2
+
+
+def test_catalog_source_config_rejects_request_inputs_for_file_source(tmp_path):
+    """request_inputs is rejected at config load time for non-api/catalog sources."""
+    from janus.models.source_config import SourceConfigValidationError
+
+    with pytest.raises(SourceConfigValidationError, match="access.request_inputs"):
+        SourceConfig.from_mapping(
+            {
+                "source_id": "file_src",
+                "name": "file_src",
+                "owner": "janus",
+                "enabled": True,
+                "source_type": "file",
+                "strategy": "file",
+                "strategy_variant": "static_file",
+                "federation_level": "federal",
+                "domain": "example",
+                "public_access": True,
+                "access": {
+                    "url": "https://example.invalid/file.csv",
+                    "method": "GET",
+                    "format": "csv",
+                    "timeout_seconds": 30,
+                    "auth": {"type": "none"},
+                    "pagination": {"type": "none"},
+                    "rate_limit": {"requests_per_minute": 10, "concurrency": 1, "backoff_seconds": 1},
+                    "request_inputs": {"type": "iceberg_rows", "namespace": "ns", "table_name": "t", "columns": {"x": "y"}},
+                },
+                "extraction": {"mode": "full_refresh", "checkpoint_strategy": "none", "retry": {"max_attempts": 1, "backoff_strategy": "fixed", "backoff_seconds": 0}},
+                "schema": {"mode": "infer"},
+                "spark": {"input_format": "csv", "write_mode": "overwrite"},
+                "outputs": {
+                    "raw": {"path": "data/raw/x", "format": "csv"},
+                    "bronze": {"path": "data/bronze/x", "format": "iceberg"},
+                    "metadata": {"path": "data/metadata/x", "format": "json"},
+                },
+                "quality": {"allow_schema_evolution": True},
+            },
+            tmp_path / "conf" / "sources" / "file_src.yaml",
+        )
