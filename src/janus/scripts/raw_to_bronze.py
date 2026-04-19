@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
@@ -439,6 +440,12 @@ def _build_extraction_result_from_raw(
         )
 
     raw_artifacts = _rediscover_raw_artifacts(plan)
+    raw_artifacts = _rehydrate_file_raw_artifacts(
+        planned_run,
+        plan,
+        raw_artifacts,
+        storage_layout,
+    )
     return ExtractionResult.from_plan(
         plan,
         raw_artifacts,
@@ -465,6 +472,111 @@ def _rediscover_raw_artifacts(plan: ExecutionPlan) -> tuple[ExtractedArtifact, .
     if not artifacts:
         raise FileNotFoundError(f"No raw artifacts were found under {raw_root}")
     return artifacts
+
+
+def _rehydrate_file_raw_artifacts(
+    planned_run: PlannedRun,
+    plan: ExecutionPlan,
+    raw_artifacts: tuple[ExtractedArtifact, ...],
+    storage_layout: StorageLayout,
+) -> tuple[ExtractedArtifact, ...]:
+    if getattr(planned_run.strategy, "strategy_family", None) != "file":
+        return raw_artifacts
+
+    from janus.strategies.files.core import (
+        DiscoveredFile,
+        FileHook,
+        _archive_member_payloads,
+        _filter_members,
+        _infer_handoff_format,
+        _raw_extracted_relative_path,
+    )
+
+    artifacts_by_path = {artifact.path: artifact for artifact in raw_artifacts}
+    raw_writer = RawArtifactWriter(storage_layout)
+    file_hook = planned_run.hook if isinstance(planned_run.hook, FileHook) else None
+    raw_root = Path(plan.raw_output.path)
+
+    for artifact in raw_artifacts:
+        artifact_path = Path(artifact.path)
+        if not _is_archive_download_path(raw_root, artifact_path):
+            continue
+
+        archive_file = DiscoveredFile(
+            source_kind="local",
+            location=str(artifact_path),
+            filename=artifact_path.name,
+            format="binary",
+            version=_download_version(raw_root, artifact_path),
+        )
+        member_payloads = _archive_member_payloads(artifact_path.read_bytes(), archive_file.filename)
+        members = tuple(
+            DiscoveredFile(
+                source_kind="archive",
+                location=member_name,
+                filename=PurePosixPath(member_name).name,
+                format=_artifact_format_for_path(
+                    Path(member_name),
+                    fallback=plan.source_config.spark.input_format,
+                ),
+                version=archive_file.version,
+            )
+            for member_name in member_payloads
+        )
+        members = _filter_members(members, plan.source_config.access.file_pattern)
+        if file_hook is not None:
+            members = tuple(file_hook.archive_members(plan, archive_file, members))
+
+        for member in members:
+            member_payload = member_payloads.get(member.location)
+            if member_payload is None:
+                continue
+            persisted = raw_writer.write_bytes(
+                plan,
+                _raw_extracted_relative_path(
+                    archive_file.version or "current",
+                    archive_file.filename,
+                    member.location,
+                ),
+                member_payload,
+                mode="ignore",
+                metadata={
+                    "archive_filename": archive_file.filename,
+                    "archive_member": member.location,
+                    "resolved_version": archive_file.version or "current",
+                },
+            )
+            artifacts_by_path[str(persisted.artifact.path)] = ExtractedArtifact(
+                path=str(persisted.artifact.path),
+                format=_infer_handoff_format(
+                    member,
+                    fallback=plan.source_config.spark.input_format,
+                ),
+                checksum=persisted.artifact.checksum,
+            )
+
+    return tuple(sorted(artifacts_by_path.values(), key=lambda artifact: artifact.path))
+
+
+def _is_archive_download_path(raw_root: Path, artifact_path: Path) -> bool:
+    try:
+        relative_path = artifact_path.relative_to(raw_root)
+    except ValueError:
+        return False
+    if len(relative_path.parts) < 3 or relative_path.parts[0] != "downloads":
+        return False
+    lower_name = artifact_path.name.lower()
+    return lower_name.endswith(".zip") or lower_name.endswith(".tar.gz") or lower_name.endswith(".tgz")
+
+
+def _download_version(raw_root: Path, artifact_path: Path) -> str:
+    try:
+        relative_path = artifact_path.relative_to(raw_root)
+    except ValueError:
+        return "current"
+    if len(relative_path.parts) >= 3 and relative_path.parts[0] == "downloads":
+        return relative_path.parts[1]
+    return "current"
 
 
 def _build_catalog_extraction_result_from_raw(

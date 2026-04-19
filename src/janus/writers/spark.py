@@ -59,9 +59,11 @@ class SparkDatasetWriter:
         write_mode = mode or plan.source_config.spark.write_mode
         partition_columns = partition_by or plan.source_config.spark.partition_by
 
-        prepared_frame = dataframe
-        if apply_repartition and zone == "bronze" and plan.source_config.spark.repartition:
-            prepared_frame = prepared_frame.repartition(plan.source_config.spark.repartition)
+        prepared_frame = _rebalance_for_write(
+            dataframe,
+            target_partitions=plan.source_config.spark.repartition,
+            apply_repartition=apply_repartition and zone == "bronze",
+        )
 
         resolved_records_written = records_written
         if count_records and resolved_records_written is None:
@@ -104,9 +106,11 @@ class SparkDatasetWriter:
         write_mode = mode or plan.source_config.spark.write_mode
         partition_columns = partition_by or plan.source_config.spark.partition_by
 
-        prepared_frame = dataframe
-        if apply_repartition and plan.source_config.spark.repartition:
-            prepared_frame = prepared_frame.repartition(plan.source_config.spark.repartition)
+        prepared_frame = _rebalance_for_write(
+            dataframe,
+            target_partitions=plan.source_config.spark.repartition,
+            apply_repartition=apply_repartition,
+        )
 
         resolved_records_written = records_written
         if count_records and resolved_records_written is None:
@@ -186,6 +190,23 @@ def _spark_write_format(format_name: str) -> str:
     if normalized == "jsonl":
         return "json"
     return normalized
+
+
+def _rebalance_for_write(
+    dataframe: DataFrame,
+    *,
+    target_partitions: int | None,
+    apply_repartition: bool,
+) -> DataFrame:
+    if not apply_repartition or not target_partitions:
+        return dataframe
+
+    current_partitions = dataframe.rdd.getNumPartitions()
+    if target_partitions < current_partitions:
+        return dataframe.coalesce(target_partitions)
+    if target_partitions > current_partitions:
+        return dataframe.repartition(target_partitions)
+    return dataframe
 
 
 def _partition_clause(partition_columns: tuple[str, ...]) -> str:

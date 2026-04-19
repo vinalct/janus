@@ -4,6 +4,7 @@ import fnmatch
 import glob
 import os
 import re
+import tarfile
 import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
@@ -113,6 +114,19 @@ class FileHook(SourceHook):
     ) -> Sequence[DiscoveredFile]:
         del plan
         return files
+
+    def resolve_links(
+        self,
+        plan: ExecutionPlan,
+        url: str,
+        formato: str | None,
+        transport: ApiTransport,
+    ) -> Sequence[DiscoveredFile]:
+        from janus.strategies.files.resolvers import build_resolver_chain, resolve_link
+
+        return resolve_link(
+            url, formato, transport, build_resolver_chain(plan.source_config.access.link_resolver)
+        )
 
     def resolve_version(
         self,
@@ -256,20 +270,6 @@ class FileStrategy(BaseStrategy):
                 dead_letter_max_items=dead_letter_max_items,
             )
 
-        discovered_files = self._discover_files(plan, file_hook)
-        selected_files = self._select_files(plan, discovered_files, checkpoint_state)
-        if logger is not None:
-            logger.info(
-                "file_discovery_finished",
-                discovered_file_count=len(discovered_files),
-                selected_file_count=len(selected_files),
-                checkpoint_loaded=checkpoint_state is not None,
-                discovered_source_kinds=sorted(
-                    {file.source_kind for file in discovered_files}
-                ),
-                selected_versions=[file.version for file in selected_files],
-            )
-
         artifacts: list[ExtractedArtifact] = []
         persisted_file_count = 0
         archive_member_count = 0
@@ -283,6 +283,20 @@ class FileStrategy(BaseStrategy):
         dead_letter_skip_count = 0
 
         with ApiClient(self.transport_factory()) as client:
+            discovered_files = self._discover_files(plan, file_hook, client.transport)
+            selected_files = self._select_files(plan, discovered_files, checkpoint_state)
+            if logger is not None:
+                logger.info(
+                    "file_discovery_finished",
+                    discovered_file_count=len(discovered_files),
+                    selected_file_count=len(selected_files),
+                    checkpoint_loaded=checkpoint_state is not None,
+                    discovered_source_kinds=sorted(
+                        {file.source_kind for file in discovered_files}
+                    ),
+                    selected_versions=[file.version for file in selected_files],
+                )
+
             for file_index, discovered_file in enumerate(selected_files, start=1):
                 candidate_key = _discovered_file_dead_letter_key(discovered_file)
                 if logger is not None:
@@ -340,6 +354,8 @@ class FileStrategy(BaseStrategy):
                             attempts_used=attempts_used,
                             payload_size_bytes=len(payload),
                         )
+
+                    _validate_remote_payload(discovered_file, payload, response)
 
                     if file_hook is not None:
                         payload = file_hook.prepare_download(
@@ -623,19 +639,34 @@ class FileStrategy(BaseStrategy):
         self,
         plan: ExecutionPlan,
         file_hook: FileHook | None,
+        transport: ApiTransport,
     ) -> tuple[DiscoveredFile, ...]:
+        from janus.strategies.files.resolvers import build_resolver_chain, resolve_link
+
         access = plan.source_config.access
         discovered: list[DiscoveredFile] = []
 
         if access.url:
-            discovered.append(
-                DiscoveredFile(
-                    source_kind="remote",
-                    location=access.url,
-                    filename=_filename_from_url(access.url),
-                    format=_infer_format_name(access.url, fallback=access.format),
+            if file_hook is not None:
+                resolved_from_url: Sequence[DiscoveredFile] = file_hook.resolve_links(
+                    plan, access.url, access.format, transport
                 )
-            )
+            else:
+                chain = build_resolver_chain(access.link_resolver)
+                resolved_from_url = resolve_link(access.url, access.format, transport, chain)
+
+            if resolved_from_url:
+                discovered.extend(resolved_from_url)
+            else:
+                # Fallback: treat URL as direct so the download loop can dead-letter it on failure
+                discovered.append(
+                    DiscoveredFile(
+                        source_kind="remote",
+                        location=access.url,
+                        filename=_filename_from_url(access.url),
+                        format=_infer_format_name(access.url, fallback=access.format),
+                    )
+                )
 
         if access.path:
             discovered.extend(self._discover_local_path(plan, access.path, access.file_pattern))
@@ -900,7 +931,7 @@ class FileStrategy(BaseStrategy):
         version: str,
         file_hook: FileHook | None,
     ) -> tuple[ExtractedArtifact, ...]:
-        member_payloads = _archive_member_payloads(payload)
+        member_payloads = _archive_member_payloads(payload, archive_file.filename)
         members = tuple(
             DiscoveredFile(
                 source_kind="archive",
@@ -1010,7 +1041,9 @@ def _safe_path_segment(value: str) -> str:
     return normalized or "current"
 
 
-def _archive_member_payloads(payload: bytes) -> dict[str, bytes]:
+def _archive_member_payloads(payload: bytes, filename: str = "") -> dict[str, bytes]:
+    if _is_tarball_filename(filename):
+        return _tarball_member_payloads(payload)
     try:
         with zipfile.ZipFile(BytesIO(payload)) as archive:
             members: dict[str, bytes] = {}
@@ -1023,6 +1056,22 @@ def _archive_member_payloads(payload: bytes) -> dict[str, bytes]:
             return members
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         raise ArchiveExtractionError("Could not extract ZIP archive payload") from exc
+
+
+def _tarball_member_payloads(payload: bytes) -> dict[str, bytes]:
+    try:
+        with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as archive:
+            members: dict[str, bytes] = {}
+            for member in archive.getmembers():
+                if not member.isfile():
+                    continue
+                safe_member_path = _safe_archive_member_path(member.name)
+                f = archive.extractfile(member)
+                if f is not None:
+                    members[str(PurePosixPath(*safe_member_path.parts))] = f.read()
+            return members
+    except (OSError, tarfile.TarError) as exc:
+        raise ArchiveExtractionError("Could not extract tar.gz archive payload") from exc
 
 
 def _filter_members(
@@ -1039,6 +1088,11 @@ def _filter_members(
     )
 
 
+def _is_tarball_filename(filename: str) -> bool:
+    lower = filename.lower()
+    return lower.endswith(".tar.gz") or lower.endswith(".tgz")
+
+
 def _is_archive_file(
     plan: ExecutionPlan,
     discovered_file: DiscoveredFile,
@@ -1046,6 +1100,11 @@ def _is_archive_file(
 ) -> bool:
     if plan.source.strategy_variant == "archive_package":
         return True
+    if _is_tarball_filename(discovered_file.filename):
+        try:
+            return tarfile.is_tarfile(BytesIO(payload))
+        except Exception:
+            return False
     suffix = Path(discovered_file.filename).suffix.lower()
     return suffix in ARCHIVE_FILE_SUFFIXES and zipfile.is_zipfile(BytesIO(payload))
 
@@ -1062,6 +1121,34 @@ def _resolved_filename(filename: str, response: ApiResponse | None) -> str:
     return _safe_filename(filename)
 
 
+def _validate_remote_payload(
+    discovered_file: DiscoveredFile,
+    payload: bytes,
+    response: ApiResponse | None,
+) -> None:
+    if discovered_file.source_kind != "remote" or response is None:
+        return
+
+    content_type = response.headers_as_dict().get("Content-Type", "")
+    normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+    if normalized_content_type in {"text/html", "application/xhtml+xml"}:
+        raise FileDownloadError(
+            f"Expected a file payload for {discovered_file.filename!r} but received "
+            f"{normalized_content_type or 'HTML'} from "
+            f"{redact_url(response.request.full_url())}"
+        )
+
+    if (
+        not payload
+        and discovered_file.size_bytes is not None
+        and discovered_file.size_bytes > 0
+    ):
+        raise FileDownloadError(
+            f"Expected a non-empty payload for {discovered_file.filename!r} "
+            f"({discovered_file.size_bytes} bytes discovered) but received 0 bytes"
+        )
+
+
 def _filename_from_url(url: str) -> str:
     path = urlsplit(url).path
     candidate = Path(unquote(path)).name.strip()
@@ -1076,6 +1163,8 @@ def _infer_handoff_format(discovered_file: DiscoveredFile, *, fallback: str) -> 
 
 
 def _infer_format_name(value: str, *, fallback: str) -> str:
+    if _is_tarball_filename(value):
+        return "binary"
     suffix = Path(value).suffix.lower()
     if suffix == ".csv":
         return "csv"

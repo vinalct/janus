@@ -1,15 +1,16 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 from janus.models import ExecutionPlan, RunContext, WriteResult
 from janus.planner import PlannedRun
 from janus.quality import PersistedValidationReport, ValidationCheck, ValidationReport
 from janus.registry import load_registry
 from janus.scripts.raw_to_bronze import RawToBronzeLoader, _artifact_format_for_path
+from janus.strategies.files import FileStrategy
 from janus.strategies.catalog import CatalogStrategy
 from janus.utils.storage import StorageLayout
 
@@ -82,18 +83,21 @@ class FakeNormalizer:
 @dataclass(slots=True)
 class FakeWriter:
     calls: list[str]
+    expected_namespace: str = "curated"
+    expected_table_name: str = "custom_table"
+    result_path: str = "curated.custom_table"
 
     def write(self, dataframe, plan, zone, **kwargs):
         del dataframe
         del kwargs
         self.calls.append("write")
         assert zone == "bronze"
-        assert plan.bronze_output.namespace == "curated"
-        assert plan.bronze_output.table_name == "custom_table"
+        assert plan.bronze_output.namespace == self.expected_namespace
+        assert plan.bronze_output.table_name == self.expected_table_name
         return WriteResult.from_plan(
             plan,
             zone,
-            path="curated.custom_table",
+            path=self.result_path,
             format_name="iceberg",
             mode="overwrite",
             records_written=1,
@@ -274,6 +278,87 @@ def test_raw_to_bronze_loader_regenerates_catalog_jsonl_handoff_from_raw_pages(t
     assert (
         tmp_path / "data" / "raw" / "dados_abertos" / "catalog" / "normalized" / "datasets.jsonl"
     ).exists()
+
+
+def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads(tmp_path):
+    source_config = load_registry(PROJECT_ROOT).get_source(
+        "receita_federal__cnpj__static",
+        include_disabled=True,
+    )
+    run_context = RunContext.create(
+        run_id="run-file-raw-to-bronze-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 19, 12, 0, tzinfo=UTC),
+    )
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=FileStrategy(),
+        hook=None,
+    )
+
+    raw_download_dir = tmp_path / "data" / "raw" / "receita_federal" / "cnpj" / "downloads" / "current"
+    raw_download_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = raw_download_dir / "Empresas0.zip"
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr("K3241.K03200Y0.D30513.EMPRECSV", "1;ACME\n")
+
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj"
+    calls: list[str] = []
+
+    loader = RawToBronzeLoader(
+        reader=FakeReader(calls),
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-file-raw-to-bronze-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(
+            calls,
+            expected_namespace="bronze__receita_federal",
+            expected_table_name="cnpj",
+            result_path="bronze__receita_federal.cnpj",
+        ),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    )
+
+    result = loader.ingest(
+        planned_run,
+        spark=object(),
+        environment_config={},
+        bronze_table="bronze__receita_federal.cnpj",
+    )
+
+    extracted_path = (
+        tmp_path
+        / "data"
+        / "raw"
+        / "receita_federal"
+        / "cnpj"
+        / "extracted"
+        / "current"
+        / "Empresas0"
+        / "K3241.K03200Y0.D30513.EMPRECSV"
+    )
+
+    assert result.is_successful is True
+    assert any(artifact.format == "csv" for artifact in result.handoff.artifacts)
+    assert extracted_path.exists()
+    assert extracted_path.read_text(encoding="utf-8") == "1;ACME\n"
+    assert calls == [
+        "start",
+        "read",
+        "normalize",
+        "write",
+        "validate",
+        "success",
+    ]
 
 
 def _planned_run(tmp_path: Path, calls: list[str]) -> PlannedRun:

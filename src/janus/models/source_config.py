@@ -29,6 +29,7 @@ SUPPORTED_BACKOFF_STRATEGIES = frozenset({"exponential", "fixed"})
 SUPPORTED_HTTP_METHODS = frozenset({"DELETE", "GET", "PATCH", "POST", "PUT"})
 SUPPORTED_FEDERATION_LEVELS = frozenset({"federal"})
 SUPPORTED_REQUEST_INPUT_TYPES = frozenset({"combined", "date_window", "iceberg_rows", "none"})
+SUPPORTED_LINK_RESOLVERS = frozenset({"auto", "direct", "html_links", "nextcloud_webdav"})
 SUPPORTED_REQUEST_INPUT_STEPS = frozenset({"day", "month"})
 _SUPPORTED_SUB_REQUEST_INPUT_TYPES = frozenset({"date_window", "iceberg_rows"})
 SUPPORTED_PARAMETER_BINDING_WINDOW_SOURCES = frozenset(
@@ -134,6 +135,7 @@ class AccessConfig:
     headers: dict[str, str] | None = None
     params: dict[str, str] | None = None
     parameter_bindings: dict[str, ParameterBinding] | None = None
+    link_resolver: str = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +363,10 @@ def _build_access_config(
                 )
             )
 
+    link_resolver = _optional_enum(
+        data, "link_resolver", SUPPORTED_LINK_RESOLVERS, issues, "access", default="auto"
+    )
+
     return AccessConfig(
         format=format_name,
         method=method,
@@ -377,6 +383,7 @@ def _build_access_config(
         pagination=pagination,
         rate_limit=rate_limit,
         request_inputs=request_inputs,
+        link_resolver=link_resolver,
     )
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -347,6 +349,69 @@ def test_file_strategy_dead_letters_failed_file_and_continues(tmp_path):
     dead_letter_path = strategy.dead_letter_store.path(plan)
     dead_letter_payload = json.loads(dead_letter_path.read_text(encoding="utf-8"))
     assert dead_letter_payload["entries"][0]["item_type"] == "file_candidate"
+
+
+def test_file_strategy_extracts_tar_gz_archive_members(tmp_path):
+    archive_path = tmp_path / "fixtures" / "cnpj.tar.gz"
+    archive_path.parent.mkdir(parents=True)
+    archive_path.write_bytes(_make_tarball({"estabelecimentos.csv": b"cnpj;nome\n1234;Alpha\n"}))
+
+    plan = _build_plan(
+        tmp_path,
+        source_id="cnpj_tar_gz",
+        variant="static_file",
+        access_path=archive_path,
+        access_format="binary",
+        spark_input_format="csv",
+        file_pattern="*.csv",
+    )
+    strategy, _ = _build_strategy(tmp_path)
+
+    result = strategy.extract(plan)
+    handoff = strategy.build_normalization_handoff(plan, result)
+
+    assert len(result.artifacts) == 2
+    assert sorted(a.format for a in result.artifacts) == ["binary", "csv"]
+    assert len(handoff.artifacts) == 1
+    assert Path(handoff.artifacts[0].path).name == "estabelecimentos.csv"
+
+
+def test_file_strategy_tar_gz_respects_file_pattern(tmp_path):
+    archive_path = tmp_path / "fixtures" / "cnpj.tar.gz"
+    archive_path.parent.mkdir(parents=True)
+    archive_path.write_bytes(
+        _make_tarball({
+            "estabelecimentos.csv": b"cnpj;nome\n1234;Alpha\n",
+            "LEIAME.txt": b"ignore me\n",
+        })
+    )
+
+    plan = _build_plan(
+        tmp_path,
+        source_id="cnpj_tar_gz_filtered",
+        variant="static_file",
+        access_path=archive_path,
+        access_format="binary",
+        spark_input_format="csv",
+        file_pattern="*.csv",
+    )
+    strategy, _ = _build_strategy(tmp_path)
+
+    result = strategy.extract(plan)
+    handoff = strategy.build_normalization_handoff(plan, result)
+
+    member_names = [Path(a.path).name for a in handoff.artifacts]
+    assert member_names == ["estabelecimentos.csv"]
+
+
+def _make_tarball(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def _event_payload(payloads: list[dict], event: str) -> dict:
