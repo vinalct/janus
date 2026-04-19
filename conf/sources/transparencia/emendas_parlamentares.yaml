@@ -1,6 +1,6 @@
 sources:
 
-  - source_id: transparencia__emendas_parlamentares__emendas
+  - source_id: transparencia__emendas_parlamentares__emendas__full_refresh
     name: Portal da Transparencia - Emendas parlamentares - Emendas
     description: 
     owner: janus
@@ -35,17 +35,18 @@ sources:
         size_param: tamanhoPagina
         page_size: 15
       rate_limit:
-        requests_per_minute: 120
-        concurrency: 4
+        requests_per_minute: 90
+        concurrency: 10
         backoff_seconds: 10
 
     extraction:
-      mode: snapshot
+      mode: full_refresh
       checkpoint_strategy: none
+      dead_letter_max_items: 100
       retry:
         max_attempts: 4
         backoff_strategy: exponential
-        backoff_seconds: 2
+        backoff_seconds: 5
 
     schema:
       mode: infer
@@ -64,7 +65,7 @@ sources:
       bronze:
         path: data/bronze/transparencia/emendas_parlamentares__emendas
         format: iceberg
-        namespace: bronze_transparencia
+        namespace: bronze__transparencia
         table_name: emendas_parlamentares__emendas
       metadata:
         path: data/metadata/transparencia/emendas_parlamentares__emendas
@@ -77,7 +78,7 @@ sources:
         - codOrgaoExercicioSiape
       allow_schema_evolution: true
 
-  - source_id: transparencia__emendas_parlamentares__documentos
+  - source_id: transparencia__emendas_parlamentares__documentos__full_refresh
     name: Portal da Transparencia - Emendas parlamentares - Documentos
     description: Consulta os documentos relacionados a emenda parlamentar.
     owner: janus
@@ -108,7 +109,7 @@ sources:
         header_name: chave-api-dados
       request_inputs:
         type: iceberg_rows
-        namespace: bronze_transparencia
+        namespace: bronze__transparencia
         table_name: emendas_parlamentares__emendas
         columns:
           codigo: codigoEmenda
@@ -122,17 +123,18 @@ sources:
         size_param: tamanhoPagina
         page_size: 15
       rate_limit:
-        requests_per_minute: 120
-        concurrency: 4
+        requests_per_minute: 90
+        concurrency: 10
         backoff_seconds: 10
 
     extraction:
-      mode: snapshot
+      mode: full_refresh
       checkpoint_strategy: none
+      dead_letter_max_items: 100
       retry:
         max_attempts: 4
         backoff_strategy: exponential
-        backoff_seconds: 2
+        backoff_seconds: 5
 
     schema:
       mode: infer
@@ -151,7 +153,7 @@ sources:
       bronze:
         path: data/bronze/transparencia/emendas_parlamentares__documentos
         format: iceberg
-        namespace: bronze_transparencia
+        namespace: bronze__transparencia
         table_name: emendas_parlamentares__documentos
       metadata:
         path: data/metadata/transparencia/emendas_parlamentares__documentos

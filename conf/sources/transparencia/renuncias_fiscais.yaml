@@ -1,0 +1,234 @@
+sources:
+  - source_id: transparencia__renuncias_fiscais__renuncias_valores__full_refresh
+    name: Portal da Transparencia - Renuncias Fiscais - Valores
+    description: 
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - renuncias fiscais
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/renuncias-valor
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 90
+        concurrency: 10
+        backoff_seconds: 10
+
+    extraction:
+      mode: full_refresh
+      checkpoint_strategy: none
+      dead_letter_max_items: 100
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 5
+
+    schema:
+      mode: infer
+      
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/renuncias_fiscais__renuncias_valores
+        format: json
+      bronze:
+        path: data/bronze/transparencia/renuncias_fiscais__renuncias_valores
+        format: iceberg
+        namespace: bronze__transparencia
+        table_name: renuncias_fiscais__renuncias_valores
+      metadata:
+        path: data/metadata/transparencia/renuncias_fiscais__renuncias_valores
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true
+
+  - source_id: transparencia__renuncias_fiscais__empresas_imunes_isentas__full_refresh
+    name: Portal da Transparencia - Renuncias Fiscais - Empresas Imunes e Isentas
+    description:
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - renuncias fiscais
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/renuncias-fiscais-empresas-imunes-isentas
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 90
+        concurrency: 10
+        backoff_seconds: 10
+
+    extraction:
+      mode: full_refresh
+      checkpoint_strategy: none
+      dead_letter_max_items: 100
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 5
+
+    schema:
+      mode: infer
+      
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/renuncias_fiscais__empresas_imunes_isentas
+        format: json
+      bronze:
+        path: data/bronze/transparencia/renuncias_fiscais__empresas_imunes_isentas
+        format: iceberg
+        namespace: bronze__transparencia
+        table_name: renuncias_fiscais__empresas_imunes_isentas
+      metadata:
+        path: data/metadata/transparencia/renuncias_fiscais__empresas_imunes_isentas
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true
+
+  - source_id: transparencia__renuncias_fiscais__empresas_habilitadas__full_refresh
+    name: Portal da Transparencia - Renuncias Fiscais - Empresas Habilitadas a Beneficios Fiscais
+    description:
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - renuncias fiscais
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/renuncias-fiscais-empresas-habilitadas-beneficios-fiscais
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 90
+        concurrency: 10
+        backoff_seconds: 10
+
+    extraction:
+      mode: full_refresh
+      checkpoint_strategy: none
+      dead_letter_max_items: 100
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 5
+
+    schema:
+      mode: infer
+      
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/renuncias_fiscais__empresas_habilitadas
+        format: json
+      bronze:
+        path: data/bronze/transparencia/renuncias_fiscais__empresas_habilitadas
+        format: iceberg
+        namespace: bronze__transparencia
+        table_name: renuncias_fiscais__empresas_habilitadas
+      metadata:
+        path: data/metadata/transparencia/renuncias_fiscais__empresas_habilitadas
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true

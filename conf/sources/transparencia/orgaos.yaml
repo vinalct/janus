@@ -1,8 +1,7 @@
 sources:
-
-  - source_id: transparencia__poder_executivo_federal__servidores_por_orgao__full_refresh
-    name: Portal da Transparencia - Servidores agregados por orgao
-    description: Snapshot ingestion of aggregated federal executive servidor counts by orgao from the Portal da Transparencia API.
+  - source_id: transparencia__orgaos__siape__full_refresh
+    name: Portal da Transparencia - Órgãos do SIAPE
+    description: 
     owner: janus
     enabled: false
     source_type: api
@@ -19,7 +18,7 @@ sources:
 
     access:
       base_url: https://api.portaldatransparencia.gov.br
-      path: /api-de-dados/servidores/por-orgao
+      path: /api-de-dados/orgaos-siape
       method: GET
       format: json
       timeout_seconds: 60
@@ -49,9 +48,8 @@ sources:
         backoff_seconds: 5
 
     schema:
-      mode: explicit
-      path: conf/schemas/transparencia/servidores_por_orgao_schema.json
-
+      mode: infer
+      
     spark:
       input_format: json
       write_mode: overwrite
@@ -61,15 +59,15 @@ sources:
 
     outputs:
       raw:
-        path: data/raw/transparencia/poder_executivo_federal__servidores_por_orgao
+        path: data/raw/transparencia/orgaos__siape
         format: json
       bronze:
-        path: data/bronze/transparencia/poder_executivo_federal__servidores_por_orgao
+        path: data/bronze/transparencia/orgaos__siape
         format: iceberg
         namespace: bronze__transparencia
-        table_name: poder_executivo_federal__servidores_por_orgao
+        table_name: orgaos__siape
       metadata:
-        path: data/metadata/transparencia/poder_executivo_federal__servidores_por_orgao
+        path: data/metadata/transparencia/orgaos__siape
         format: json
 
     quality:
@@ -79,8 +77,8 @@ sources:
         - codOrgaoExercicioSiape
       allow_schema_evolution: true
 
-  - source_id: transparencia__poder_executivo_federal__servidores__full_refresh
-    name: Portal da Transparencia - Servidores do Poder Executivo Federal
+  - source_id: transparencia__orgaos__siafi__full_refresh
+    name: Portal da Transparencia - Órgãos do SIAFI
     description: 
     owner: janus
     enabled: false
@@ -98,7 +96,7 @@ sources:
 
     access:
       base_url: https://api.portaldatransparencia.gov.br
-      path: /api-de-dados/servidores
+      path: /api-de-dados/orgaos-siafi
       method: GET
       format: json
       timeout_seconds: 60
@@ -121,6 +119,7 @@ sources:
     extraction:
       mode: full_refresh
       checkpoint_strategy: none
+      dead_letter_max_items: 100
       retry:
         max_attempts: 4
         backoff_strategy: exponential
@@ -138,15 +137,15 @@ sources:
 
     outputs:
       raw:
-        path: data/raw/transparencia/poder_executivo_federal__servidores
+        path: data/raw/transparencia/orgaos__siafi
         format: json
       bronze:
-        path: data/bronze/transparencia/poder_executivo_federal__servidores
+        path: data/bronze/transparencia/orgaos__siafi
         format: iceberg
         namespace: bronze__transparencia
-        table_name: poder_executivo_federal__servidores
+        table_name: orgaos__siafi
       metadata:
-        path: data/metadata/transparencia/poder_executivo_federal__servidores
+        path: data/metadata/transparencia/orgaos__siafi
         format: json
 
     quality:

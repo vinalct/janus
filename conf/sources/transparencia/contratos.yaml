@@ -1,0 +1,89 @@
+sources:
+  
+  - source_id: transparencia__contratos__contratos__full_refresh
+    name: Portal da Transparencia - Contratos
+    description:
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - contratos
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/contratos
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      request_inputs:
+        type: iceberg_rows
+        namespace: bronze__transparencia
+        table_name: orgaos__siafi
+        columns:
+          orgao_codigo: codigo
+        distinct: true
+      parameter_bindings:
+        codigoOrgao:
+          from: request_input.orgao_codigo
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 90
+        concurrency: 10
+        backoff_seconds: 10
+
+    extraction:
+      mode: full_refresh
+      checkpoint_strategy: none
+      dead_letter_max_items: 100
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 5
+
+    schema:
+      mode: infer
+      
+    spark:
+      input_format: json
+      write_mode: overwrite
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/contratos__contratos
+        format: json
+      bronze:
+        path: data/bronze/transparencia/contratos__contratos
+        format: iceberg
+        namespace: bronze__transparencia
+        table_name: contratos__contratos
+      metadata:
+        path: data/metadata/transparencia/contratos__contratos
+        format: json
+
+    quality:
+      required_fields:
+        - qntPessoas
+        - qntVinculos
+        - codOrgaoExercicioSiape
+      allow_schema_evolution: true
