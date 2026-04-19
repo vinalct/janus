@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+from janus.models import ExecutionPlan, RunContext, WriteResult
+from janus.planner import PlannedRun
+from janus.quality import PersistedValidationReport, ValidationCheck, ValidationReport
+from janus.registry import load_registry
+from janus.scripts.raw_to_bronze import RawToBronzeLoader, _artifact_format_for_path
+from janus.strategies.catalog import CatalogStrategy
+from janus.utils.storage import StorageLayout
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+FIXTURES_ROOT = PROJECT_ROOT / "tests" / "fixtures" / "dados_abertos_catalog"
+
+
+@dataclass(slots=True)
+class FakeStrategy:
+    calls: list[str]
+
+    @property
+    def strategy_family(self) -> str:
+        return "api"
+
+    def plan(self, source_config, run_context, hook=None):
+        raise NotImplementedError
+
+    def extract(self, plan, hook=None, *, spark=None):
+        raise NotImplementedError
+
+    def build_normalization_handoff(self, plan, extraction_result, hook=None):
+        del plan
+        del hook
+        self.calls.append("handoff")
+        assert len(extraction_result.artifacts) == 1
+        assert extraction_result.artifacts[0].format == "json"
+        return extraction_result
+
+    def emit_metadata(self, plan, extraction_result, write_results=(), hook=None):
+        del plan
+        del extraction_result
+        del hook
+        self.calls.append("metadata")
+        return {"write_result_count": len(write_results)}
+
+
+@dataclass(slots=True)
+class FakeReader:
+    calls: list[str]
+
+    def read_extraction_result(
+        self,
+        spark,
+        extraction_result,
+        format_name=None,
+        schema=None,
+        options=None,
+    ):
+        del spark
+        del extraction_result
+        del format_name
+        del schema
+        del options
+        self.calls.append("read")
+        return object()
+
+
+@dataclass(slots=True)
+class FakeNormalizer:
+    calls: list[str]
+
+    def normalize(self, dataframe, plan):
+        del dataframe
+        del plan
+        self.calls.append("normalize")
+        return object()
+
+
+@dataclass(slots=True)
+class FakeWriter:
+    calls: list[str]
+
+    def write(self, dataframe, plan, zone, **kwargs):
+        del dataframe
+        del kwargs
+        self.calls.append("write")
+        assert zone == "bronze"
+        assert plan.bronze_output.namespace == "curated"
+        assert plan.bronze_output.table_name == "custom_table"
+        return WriteResult.from_plan(
+            plan,
+            zone,
+            path="curated.custom_table",
+            format_name="iceberg",
+            mode="overwrite",
+            records_written=1,
+        )
+
+
+@dataclass(slots=True)
+class FakeQualityGate:
+    calls: list[str]
+    report: ValidationReport
+    path: Path
+
+    def validate_and_store(self, plan, **kwargs):
+        del plan
+        del kwargs
+        self.calls.append("validate")
+        return PersistedValidationReport(report=self.report, path=self.path)
+
+
+@dataclass(slots=True)
+class FakeObserver:
+    calls: list[str]
+    metadata_root: Path
+
+    def start_run(self, plan):
+        del plan
+        self.calls.append("start")
+        return SimpleNamespace()
+
+    def record_success(self, plan, extraction_result, write_results=(), **kwargs):
+        del plan
+        del extraction_result
+        del write_results
+        del kwargs
+        self.calls.append("success")
+        return SimpleNamespace(
+            run_metadata_path=self.metadata_root / "runs" / "run-001.json",
+            lineage_path=self.metadata_root / "lineage" / "run-001.json",
+            checkpoint_result=SimpleNamespace(
+                current_path=self.metadata_root / "checkpoints" / "current.json",
+                history_path=self.metadata_root / "checkpoints" / "history" / "run-001.json",
+            ),
+        )
+
+    def record_failure(self, *args, **kwargs):
+        raise AssertionError("record_failure should not be called in the success test")
+
+
+def test_raw_to_bronze_loader_reuses_existing_modules_and_overrides_target_table(tmp_path):
+    calls: list[str] = []
+    planned_run = _planned_run(tmp_path, calls)
+    raw_root = tmp_path / "data" / "raw" / "example" / "federal_open_data_example"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    (raw_root / "page-0001.json").write_text('{"id": 1}\n', encoding="utf-8")
+
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "example" / "federal_open_data_example"
+
+    loader = RawToBronzeLoader(
+        reader=FakeReader(calls),
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(calls),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    )
+
+    result = loader.ingest(
+        planned_run,
+        spark=object(),
+        environment_config={},
+        bronze_table="curated.custom_table",
+    )
+
+    assert calls == [
+        "start",
+        "handoff",
+        "read",
+        "normalize",
+        "write",
+        "metadata",
+        "validate",
+        "success",
+    ]
+    assert result.is_successful is True
+    assert result.write_results[-1].path == "curated.custom_table"
+    assert result.to_summary()["target_table"] == "curated.custom_table"
+    assert result.to_summary()["raw_artifact_count"] == 1
+
+
+def test_artifact_format_inference_uses_file_suffix_before_fallback():
+    assert _artifact_format_for_path(Path("page-0001.json"), fallback="csv") == "json"
+    assert _artifact_format_for_path(Path("dataset.jsonl"), fallback="json") == "jsonl"
+    assert _artifact_format_for_path(Path("download.zip"), fallback="csv") == "binary"
+    assert _artifact_format_for_path(Path("data.unknown"), fallback="parquet") == "parquet"
+
+
+def test_raw_to_bronze_loader_regenerates_catalog_jsonl_handoff_from_raw_pages(tmp_path):
+    source_config = load_registry(PROJECT_ROOT).get_source(
+        "dados_abertos_catalog__conjunto_dados__full_refresh",
+        include_disabled=True,
+    )
+    source_config = replace(
+        source_config,
+        outputs=replace(
+            source_config.outputs,
+            raw=replace(
+                source_config.outputs.raw,
+                path="data/raw/dados_abertos/catalog",
+            ),
+            bronze=replace(
+                source_config.outputs.bronze,
+                path="data/bronze/dados_abertos/catalog",
+            ),
+            metadata=replace(
+                source_config.outputs.metadata,
+                path="data/metadata/dados_abertos/catalog",
+            ),
+        ),
+    )
+    run_context = RunContext.create(
+        run_id="run-catalog-raw-to-bronze-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 17, 12, 0, tzinfo=UTC),
+    )
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=CatalogStrategy(),
+        hook=None,
+    )
+
+    raw_pages_dir = tmp_path / "data" / "raw" / "dados_abertos" / "catalog" / "pages"
+    raw_pages_dir.mkdir(parents=True, exist_ok=True)
+    (raw_pages_dir / "page-0001.json").write_text(
+        (FIXTURES_ROOT / "package_search_page_1.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "dados_abertos" / "catalog"
+    calls: list[str] = []
+
+    loader = RawToBronzeLoader(
+        reader=FakeReader(calls),
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-catalog-raw-to-bronze-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(calls),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    )
+
+    result = loader.ingest(
+        planned_run,
+        spark=object(),
+        environment_config={},
+        bronze_table="curated.custom_table",
+    )
+
+    assert result.is_successful is True
+    assert result.extraction_result.records_extracted == 9
+    assert result.handoff.artifacts
+    assert all(artifact.format == "jsonl" for artifact in result.handoff.artifacts)
+    assert (
+        tmp_path / "data" / "raw" / "dados_abertos" / "catalog" / "normalized" / "datasets.jsonl"
+    ).exists()
+
+
+def _planned_run(tmp_path: Path, calls: list[str]) -> PlannedRun:
+    source_config = load_registry(PROJECT_ROOT).get_source("federal_open_data_example")
+    source_config = replace(
+        source_config,
+        outputs=replace(
+            source_config.outputs,
+            raw=replace(
+                source_config.outputs.raw,
+                path="data/raw/example/federal_open_data_example",
+            ),
+            bronze=replace(
+                source_config.outputs.bronze,
+                path="data/bronze/example/federal_open_data_example",
+            ),
+            metadata=replace(
+                source_config.outputs.metadata,
+                path="data/metadata/example/federal_open_data_example",
+            ),
+        ),
+    )
+    run_context = RunContext.create(
+        run_id="run-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 9, 12, 0, tzinfo=UTC),
+    )
+    return PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=FakeStrategy(calls),
+        hook=None,
+    )
+
+
+def _storage_layout(tmp_path: Path) -> StorageLayout:
+    return StorageLayout.from_environment_config(
+        {
+            "storage": {
+                "root_dir": str(tmp_path / "data"),
+                "raw_dir": str(tmp_path / "data" / "raw"),
+                "bronze_dir": str(tmp_path / "data" / "bronze"),
+                "metadata_dir": str(tmp_path / "data" / "metadata"),
+            }
+        },
+        tmp_path,
+    )

@@ -11,6 +11,7 @@ from pathlib import Path
 from janus.planner import Planner, PlannerError, PlanningRequest
 from janus.registry import SourceNotFoundError
 from janus.runtime import SourceExecutor
+from janus.scripts import ingest_raw_to_bronze
 from janus.utils.environment import build_spark_session, load_environment_config, prepare_runtime
 from janus.utils.logging import build_structured_logger
 
@@ -106,6 +107,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ingest-raw-to-bronze",
+        action="store_true",
+        help=(
+            "Skip extraction, rediscover the selected source raw artifacts already stored in "
+            "the raw zone, and load them into a bronze table informed at the CLI."
+        ),
+    )
+    parser.add_argument(
+        "--bronze-table",
+        help=(
+            "Target bronze table name for --ingest-raw-to-bronze. Accepts either table_name "
+            "or namespace.table_name."
+        ),
+    )
+    parser.add_argument(
         "--include-disabled",
         action="store_true",
         help="Allow planning or executing a source that is configured but disabled.",
@@ -123,6 +139,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     if args.execute and not args.source_id:
         parser.error("--execute requires --source-id")
+    if args.ingest_raw_to_bronze and not args.source_id:
+        parser.error("--ingest-raw-to-bronze requires --source-id")
+    if args.ingest_raw_to_bronze and not args.bronze_table:
+        parser.error("--ingest-raw-to-bronze requires --bronze-table")
+    if args.execute and args.ingest_raw_to_bronze:
+        parser.error("--execute and --ingest-raw-to-bronze cannot be used together")
     if args.include_disabled and not args.source_id:
         parser.error("--include-disabled requires --source-id")
 
@@ -229,6 +251,64 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0 if executed_run.is_successful else 1
+
+    if args.ingest_raw_to_bronze:
+        assert planned_run is not None
+        assert args.bronze_table is not None
+        execution_logger = build_structured_logger(
+            "janus.execution",
+            level=config.get("runtime", {}).get("log_level", "INFO"),
+        ).bind(
+            environment=config.get("name", args.environment),
+            project_root=str(project_root),
+        )
+        execution_logger.info(
+            "cli_raw_to_bronze_requested",
+            source_id=args.source_id,
+            include_disabled=args.include_disabled,
+            bronze_table=args.bronze_table,
+        )
+
+        try:
+            execution_logger.info(
+                "spark_session_starting",
+                app_name=config.get("spark", {}).get("app_name"),
+                master=config.get("spark", {}).get("master"),
+            )
+            spark = build_spark_session(config, resolved_paths)
+        except Exception as exc:  # pragma: no cover - defensive entrypoint guard
+            execution_logger.exception(
+                "spark_session_failed",
+                failure_reason=str(exc),
+                error_type=type(exc).__name__,
+            )
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        try:
+            summary["spark_session"] = {
+                "app_name": spark.sparkContext.appName,
+                "master": spark.sparkContext.master,
+            }
+            execution_logger.info(
+                "spark_session_started",
+                app_name=spark.sparkContext.appName,
+                master=spark.sparkContext.master,
+            )
+            raw_to_bronze_run = ingest_raw_to_bronze(
+                planned_run,
+                spark,
+                config,
+                bronze_table=args.bronze_table,
+                logger=execution_logger,
+            )
+            summary["raw_to_bronze_run"] = raw_to_bronze_run.to_summary()
+        finally:
+            spark.stop()
+            execution_logger.info("spark_session_stopped")
+
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if raw_to_bronze_run.is_successful else 1
 
     print(json.dumps(summary, indent=2, sort_keys=True))
 
