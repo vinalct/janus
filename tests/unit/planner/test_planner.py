@@ -451,6 +451,81 @@ def test_main_executes_source_through_framework_runtime(tmp_path, capsys, monkey
     assert stopped == [True]
 
 
+def test_main_ingests_existing_raw_artifacts_into_requested_bronze_table(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    project_root = _create_project(
+        tmp_path,
+        _source_yaml("cli_source", variant="page_number_api"),
+        include_environment=True,
+    )
+    stopped = []
+
+    class FakeSparkSession:
+        sparkContext = SimpleNamespace(appName="janus-raw-to-bronze-test", master="local[1]")
+
+        def stop(self):
+            stopped.append(True)
+
+    class FakeRawToBronzeRun:
+        is_successful = True
+
+        def to_summary(self):
+            return {
+                "status": "succeeded",
+                "target_table": "curated.cli_source_reloaded",
+                "raw_artifact_count": 2,
+            }
+
+    def fake_ingest_raw_to_bronze(planned_run, spark, environment_config, *, bronze_table, logger):
+        assert planned_run.plan.source.source_id == "cli_source"
+        assert spark.sparkContext.appName == "janus-raw-to-bronze-test"
+        assert environment_config["name"] == "local"
+        assert bronze_table == "curated.cli_source_reloaded"
+        assert logger is not None
+        return FakeRawToBronzeRun()
+
+    monkeypatch.setattr("janus.main.build_spark_session", lambda config, paths: FakeSparkSession())
+    monkeypatch.setattr("janus.main.ingest_raw_to_bronze", fake_ingest_raw_to_bronze)
+
+    exit_code = main(
+        [
+            "--environment",
+            "local",
+            "--project-root",
+            str(project_root),
+            "--source-id",
+            "cli_source",
+            "--run-id",
+            "run-cli-raw-to-bronze-001",
+            "--started-at",
+            "2026-04-08T16:30:00+00:00",
+            "--ingest-raw-to-bronze",
+            "--bronze-table",
+            "curated.cli_source_reloaded",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    log_events = [
+        json.loads(line)["event"] for line in captured.err.splitlines() if line.strip()
+    ]
+
+    assert exit_code == 0
+    assert "cli_raw_to_bronze_requested" in log_events
+    assert "spark_session_started" in log_events
+    assert "spark_session_stopped" in log_events
+    assert payload["planned_run"]["run"]["run_id"] == "run-cli-raw-to-bronze-001"
+    assert payload["raw_to_bronze_run"]["status"] == "succeeded"
+    assert payload["raw_to_bronze_run"]["target_table"] == "curated.cli_source_reloaded"
+    assert payload["spark_session"]["app_name"] == "janus-raw-to-bronze-test"
+    assert stopped == [True]
+
+
 def _create_project(
     tmp_path: Path,
     source_yaml: str,

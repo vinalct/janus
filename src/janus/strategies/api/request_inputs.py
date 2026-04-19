@@ -177,7 +177,7 @@ def validate_iceberg_request_input_source(
         if (normalized_column := str(column).strip())
     }
     for binding_name, source_column in sorted(request_inputs.columns.items()):
-        # For nested struct references like "catalog_payload.id", check that the
+        # For nested struct references like "payload.id", check that the
         # root field exists in the top-level columns; Spark resolves the rest.
         root_field = source_column.split(".")[0]
         if root_field not in normalized_columns:

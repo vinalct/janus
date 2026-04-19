@@ -387,7 +387,9 @@ def test_catalog_strategy_resource_catalog_uses_resource_root_results_for_handof
     handoff = strategy.build_normalization_handoff(plan, result)
 
     assert result.records_extracted == 2
-    assert [Path(artifact.path).name for artifact in handoff.artifacts] == ["resources.jsonl"]
+    assert [Path(artifact.path).name for artifact in handoff.artifacts] == [
+        "resources.jsonl",
+    ]
 
     resource_records = _read_jsonl(
         tmp_path
@@ -1155,6 +1157,48 @@ def test_catalog_strategy_continues_after_multiple_dead_letters_within_budget(tm
     assert result.records_extracted == 1
     assert metadata["dead_letter_count"] == "2"
     assert metadata["dead_letter_skipped_count"] == "2"
+
+
+def test_catalog_strategy_emits_no_entity_types_when_no_entities_returned(tmp_path):
+    """Successful request returning no parseable entities still reports an empty entity handoff cleanly."""
+    plan = _build_plan(tmp_path, source_id="catalog_empty_parse", pagination_type="none")
+    strategy, _ = _build_strategy(
+        tmp_path,
+        [ResponseSpec(200, {})],
+    )
+
+    result = strategy.extract(plan)
+    metadata = result.metadata_as_dict()
+
+    assert metadata["normalized_artifact_count"] == "0"
+    assert metadata["entity_types_emitted"] == "none"
+
+
+def test_catalog_strategy_emits_entity_counts_for_ambiguous_payload(tmp_path):
+    """Payloads with mixed confidence still emit only the entity artifacts discovered by the shared parser."""
+    plan = _build_plan(tmp_path, source_id="catalog_ambiguous_parse", pagination_type="none")
+    strategy, _ = _build_strategy(
+        tmp_path,
+        [
+            ResponseSpec(
+                200,
+                {
+                    "results": [
+                        {"id": "ds-1", "resources": ["r1"], "owner_org": "org-1", "metadata_created": "2026-01-01"},
+                        {"id": "ds-2", "title": "bare"},  # low confidence — no hint keys
+                    ]
+                },
+            )
+        ],
+    )
+
+    result = strategy.extract(plan)
+    metadata = result.metadata_as_dict()
+
+    assert result.records_extracted > 0
+    assert int(metadata["normalized_artifact_count"]) >= 1
+    assert metadata["datasets_extracted"] == "2"
+    assert "dataset" in metadata["entity_types_emitted"].split(",")
 
 
 def test_catalog_source_config_rejects_request_inputs_for_file_source(tmp_path):

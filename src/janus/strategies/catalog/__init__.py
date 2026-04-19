@@ -4,6 +4,8 @@ from janus.strategies.catalog.core import (
     CatalogResponseError,
     CatalogStrategy,
     CatalogStrategyError,
+    NodeClassification,
+    classify_catalog_node,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "CatalogResponseError",
     "CatalogStrategy",
     "CatalogStrategyError",
+    "NodeClassification",
+    "classify_catalog_node",
 ]

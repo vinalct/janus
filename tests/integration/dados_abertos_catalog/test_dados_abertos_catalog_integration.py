@@ -39,18 +39,9 @@ SCHEMA_FIELDS = (
     "entity_type",
     "entity_key",
     "entity_id",
-    "entity_name",
-    "entity_title",
-    "entity_description",
-    "entity_url",
-    "entity_format",
-    "entity_created_at",
-    "entity_updated_at",
-    "entity_state",
     "parent_entity_type",
     "parent_entity_key",
     "parent_entity_id",
-    "parent_entity_name",
     "catalog_collection_path",
     "catalog_record_path",
     "catalog_request_url",
@@ -60,8 +51,7 @@ SCHEMA_FIELDS = (
     "catalog_cursor",
     "catalog_received_at",
     "catalog_raw_artifact_path",
-    "catalog_raw_artifact_checksum",
-    "catalog_payload",
+    "payload",
 )
 
 

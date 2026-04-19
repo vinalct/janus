@@ -22,7 +22,7 @@ from janus.writers import SparkDatasetWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "transparencia"
-SOURCE_ID = "transparencia__poder_executivo_federal__servidores_por_orgao"
+SOURCE_ID = "transparencia__poder_executivo_federal__servidores_por_orgao__full_refresh"
 ICEBERG_RUNTIME_JAR = (
     PROJECT_ROOT
     / "data"
@@ -98,9 +98,9 @@ def test_transparencia_source_contract_uses_safe_api_settings():
     assert source_config.access.auth.type == "header_token"
     assert source_config.access.auth.header_name == "chave-api-dados"
     assert source_config.access.pagination.page_size == 15
-    assert source_config.access.rate_limit.requests_per_minute == 120
-    assert source_config.access.rate_limit.concurrency == 4
-    assert source_config.extraction.mode == "snapshot"
+    assert source_config.access.rate_limit.requests_per_minute == 90
+    assert source_config.access.rate_limit.concurrency == 10
+    assert source_config.extraction.mode == "full_refresh"
     assert source_config.extraction.checkpoint_strategy == "none"
     assert source_config.outputs.bronze.format == "iceberg"
     assert load_expected_fields_from_schema_path(schema_path) == (

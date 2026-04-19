@@ -41,7 +41,6 @@ from janus.strategies.api import (
     inject_auth,
 )
 from janus.strategies.api.request_inputs import (
-    ApiParameterBindingError,
     ApiRequestInputLoadError,
     load_request_inputs,
     resolve_parameter_bindings,
@@ -102,6 +101,15 @@ DATASET_HINT_KEYS = (
 RESOURCE_HINT_KEYS = ("format", "mimetype", "download_url", "url_type", "resource_type")
 ORGANIZATION_HINT_KEYS = ("packages", "dataset_count", "package_count", "image_url")
 GROUP_HINT_KEYS = ("packages", "dataset_count", "package_count")
+CATALOG_NODES_FILE = "catalog_nodes"
+CATALOG_EDGES_FILE = "catalog_edges"
+ENTITY_HINT_KEYS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "dataset": DATASET_HINT_KEYS,
+    "resource": RESOURCE_HINT_KEYS,
+    "organization": ORGANIZATION_HINT_KEYS,
+    "group": GROUP_HINT_KEYS,
+}
+UNKNOWN_ENTITY_TYPE = "unknown"
 
 
 class CatalogStrategyError(RuntimeError):
@@ -211,6 +219,28 @@ class CatalogBatch:
             raise ValueError("collection_path must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentNode:
+    """Structural node discovered during generic JSON document traversal."""
+
+    path: str
+    collection_path: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogParseSummary:
+    """Parse quality metrics for one catalog extraction run."""
+
+    parse_status: str
+    root_node_count: int
+    node_count: int
+    edge_count: int
+    classified_node_count: int
+    unknown_node_count: int
+    parse_warning_count: int
+
+
 @dataclass(slots=True)
 class CatalogRequestThrottle:
     """Single-threaded request throttle reused by metadata/catalog requests."""
@@ -300,8 +330,6 @@ class CatalogStrategy(BaseStrategy):
                     request_input_type=request_inputs_config.type,
                 )
             raise
-
-        single_input = request_inputs_config.type == "none"
 
         if logger is not None:
             logger.info(
@@ -673,7 +701,7 @@ class CatalogStrategy(BaseStrategy):
                     entity_type
                     for entity_type in ENTITY_TYPE_ORDER
                     if normalized_records[entity_type]
-                ),
+                ) or "none",
             },
         )
         if dead_letter_count > 0:
@@ -691,14 +719,19 @@ class CatalogStrategy(BaseStrategy):
         extraction_result: ExtractionResult,
         hook: SourceHook | None = None,
     ) -> ExtractionResult:
+        entity_artifact_names = {
+            f"{ENTITY_FILE_NAMES[entity_type]}.jsonl"
+            for entity_type in ENTITY_TYPE_ORDER
+        }
         handoff_artifacts = tuple(
             artifact
             for artifact in extraction_result.artifacts
             if artifact.format == plan.source_config.spark.input_format
+            and Path(artifact.path).name in entity_artifact_names
         )
         if not handoff_artifacts:
             raise CatalogStrategyError(
-                "No normalized catalog artifacts match the configured "
+                "No normalized catalog entity artifacts match the configured "
                 f"spark.input_format {plan.source_config.spark.input_format!r}"
             )
 
@@ -1200,6 +1233,22 @@ def _root_batches(
                 )
                 if nested_batches:
                     return nested_batches
+
+        root_nodes = [
+            n for n in walk_document(payload, path=path)
+            if n.collection_path == path and n.data
+        ]
+        if root_nodes:
+            entity_type = _infer_entity_type(
+                [n.data for n in root_nodes[:5]], variant=variant, parent_type=None
+            )
+            return (
+                CatalogBatch(
+                    entity_type=entity_type,
+                    records=tuple(n.data for n in root_nodes),
+                    collection_path=path,
+                ),
+            )
         return ()
 
     records = _coerce_records(payload)
@@ -1280,6 +1329,46 @@ def _batches_from_mapping(
             ),
         )
     return ()
+
+
+def walk_document(payload: Any, *, path: str = "payload") -> tuple[DocumentNode, ...]:
+    """Walk any JSON payload and return structural document nodes depth-first, deterministically."""
+    nodes: list[DocumentNode] = []
+    _collect_document_nodes(payload, path=path, collection_path=path, nodes=nodes)
+    return tuple(nodes)
+
+
+def _collect_document_nodes(
+    value: Any,
+    *,
+    path: str,
+    collection_path: str,
+    nodes: list[DocumentNode],
+) -> None:
+    if isinstance(value, Mapping):
+        record = _normalize_mapping(value)
+        nodes.append(DocumentNode(path=path, collection_path=collection_path, data=record))
+        for key in sorted(str(k) for k in value):
+            child = value[key]
+            if isinstance(child, Sequence) and not isinstance(child, str | bytes | bytearray):
+                child_path = f"{path}.{key}"
+                for index, item in enumerate(child):
+                    if isinstance(item, Mapping):
+                        _collect_document_nodes(
+                            item,
+                            path=f"{child_path}[{index}]",
+                            collection_path=child_path,
+                            nodes=nodes,
+                        )
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        for index, item in enumerate(value):
+            if isinstance(item, Mapping):
+                _collect_document_nodes(
+                    item,
+                    path=f"{path}[{index}]",
+                    collection_path=path,
+                    nodes=nodes,
+                )
 
 
 def _coerce_records(value: Any) -> tuple[dict[str, Any], ...]:
@@ -1373,18 +1462,9 @@ def _normalize_catalog_record(
         "entity_type": entity_type,
         "entity_key": entity_reference.entity_key,
         "entity_id": entity_reference.entity_id,
-        "entity_name": _first_string(record, NAME_KEYS),
-        "entity_title": _first_string(record, TITLE_KEYS),
-        "entity_description": _first_string(record, DESCRIPTION_KEYS),
-        "entity_url": _first_string(record, URL_KEYS),
-        "entity_format": _first_string(record, FORMAT_KEYS),
-        "entity_created_at": _first_string(record, CREATED_AT_KEYS),
-        "entity_updated_at": _first_string(record, UPDATED_AT_KEYS),
-        "entity_state": _first_string(record, STATE_KEYS),
         "parent_entity_type": parent.entity_type if parent is not None else None,
         "parent_entity_key": parent.entity_key if parent is not None else None,
         "parent_entity_id": parent.entity_id if parent is not None else None,
-        "parent_entity_name": parent.entity_name if parent is not None else None,
         "catalog_collection_path": collection_path,
         "catalog_record_path": record_path,
         "catalog_request_url": request.full_url(),
@@ -1394,8 +1474,7 @@ def _normalize_catalog_record(
         "catalog_cursor": pagination_state.cursor,
         "catalog_received_at": response.received_at.isoformat(),
         "catalog_raw_artifact_path": raw_artifact.path,
-        "catalog_raw_artifact_checksum": raw_artifact.checksum,
-        "catalog_payload": dict(record),
+        "payload": dict(record),
     }
 
 
@@ -1448,7 +1527,7 @@ def _payload_checkpoint_value(
     record: Mapping[str, Any],
     checkpoint_field: str | None,
 ) -> str | None:
-    payload = record.get("catalog_payload")
+    payload = record.get("payload")
     if not isinstance(payload, Mapping):
         return None
     return _string_value(_lookup_field(payload, checkpoint_field))
@@ -1707,7 +1786,7 @@ def _rediscover_catalog_input_artifacts(
 
 
 def _replay_catalog_entities_from_dir(
-    strategy: "CatalogStrategy",
+    strategy: CatalogStrategy,
     plan: ExecutionPlan,
     storage_layout: StorageLayout,
     per_input_request: ApiRequest,
@@ -1805,6 +1884,188 @@ def _catalog_request_input_key(request_input: dict[str, Any] | None) -> str:
     if request_input is None:
         return "__none__"
     return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
+
+
+def _payload_hash(payload: Any) -> str:
+    return sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class NodeClassification:
+    """Inferred entity role for a generic catalog node."""
+
+    entity_type_guess: str
+    classification_confidence: str
+    classification_signals: tuple[str, ...]
+
+
+def classify_catalog_node(
+    payload: Mapping[str, Any],
+    *,
+    variant: str,
+    parent_type: str | None = None,
+) -> NodeClassification:
+    """Score payload against family-level signals and return an inferred role with explicit confidence.
+
+    Returns ``unknown`` when no hint keys match and no structural parent context is available.
+    Classification is deterministic: same payload + variant + parent_type always yields the same result.
+    """
+    if parent_type == "dataset":
+        signals = _matched_signals(payload, RESOURCE_HINT_KEYS)
+        confidence = "high" if len(signals) >= 2 else "heuristic"
+        return NodeClassification("resource", confidence, signals or (f"parent:{parent_type}",))
+
+    if parent_type in {"organization", "group"}:
+        signals = _matched_signals(payload, DATASET_HINT_KEYS)
+        confidence = "high" if len(signals) >= 2 else "heuristic"
+        return NodeClassification("dataset", confidence, signals or (f"parent:{parent_type}",))
+
+    priority = ROOT_ENTITY_PRIORITY.get(variant, ROOT_ENTITY_PRIORITY["metadata_catalog"])
+    all_signals = {etype: _matched_signals(payload, ENTITY_HINT_KEYS_BY_TYPE[etype]) for etype in priority}
+    all_scores = {etype: len(sigs) for etype, sigs in all_signals.items()}
+
+    best_score = max(all_scores.values())
+    if best_score == 0:
+        return NodeClassification(UNKNOWN_ENTITY_TYPE, "low", ())
+
+    best_type = max(priority, key=lambda t: (all_scores[t], -priority.index(t)))
+    signals = all_signals[best_type]
+    confidence = "high" if best_score >= 2 else "heuristic"
+    return NodeClassification(best_type, confidence, signals)
+
+
+def _matched_signals(payload: Mapping[str, Any], keys: Sequence[str]) -> tuple[str, ...]:
+    return tuple(k for k in keys if k in payload and payload.get(k) not in (None, "", (), [], {}))
+
+
+def _classification_confidence(entity_type: str, payload: Mapping[str, Any]) -> str:
+    hint_keys = ENTITY_HINT_KEYS_BY_TYPE.get(entity_type, ())
+    score = _score_record(payload, hint_keys)
+    if score >= 2:
+        return "high"
+    if score >= 1:
+        return "heuristic"
+    return "low"
+
+
+def _build_generic_catalog_node(
+    entity_record: Mapping[str, Any],
+    *,
+    parent_node_path: str | None,
+    variant: str,
+) -> dict[str, Any]:
+    payload = entity_record.get("payload") or {}
+    parent_type = entity_record.get("parent_entity_type")
+    classification = classify_catalog_node(payload, variant=variant, parent_type=parent_type)
+    return {
+        "node_key": entity_record["entity_key"],
+        "node_path": entity_record["catalog_record_path"],
+        "parent_node_key": entity_record["parent_entity_key"],
+        "parent_node_path": parent_node_path,
+        "root_document_key": entity_record["catalog_raw_artifact_path"],
+        "payload": payload,
+        "payload_hash": _payload_hash(payload),
+        "request_url": entity_record["catalog_request_url"],
+        "raw_artifact_path": entity_record["catalog_raw_artifact_path"],
+        "discovered_at": entity_record["catalog_received_at"],
+        "entity_type_guess": classification.entity_type_guess,
+        "classification_confidence": classification.classification_confidence,
+        "classification_signals": list(classification.classification_signals),
+        "parse_status": "ok",
+    }
+
+
+def _build_generic_catalog_edge(entity_record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "parent_node_key": entity_record["parent_entity_key"],
+        "child_node_key": entity_record["entity_key"],
+        "relationship_type": "contains",
+        "raw_artifact_path": entity_record["catalog_raw_artifact_path"],
+        "discovered_at": entity_record["catalog_received_at"],
+    }
+
+
+def _compute_parse_summary(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> CatalogParseSummary:
+    node_count = len(nodes)
+    edge_count = len(edges)
+    root_node_count = sum(1 for n in nodes if not n.get("parent_node_key"))
+    classified_node_count = sum(
+        1 for n in nodes if n.get("classification_confidence") in ("high", "heuristic")
+    )
+    unknown_node_count = node_count - classified_node_count
+    parse_warning_count = unknown_node_count
+
+    if node_count == 0:
+        parse_status = "empty"
+    elif classified_node_count == 0:
+        parse_status = "ambiguous"
+    elif unknown_node_count > 0:
+        parse_status = "parsed_with_warnings"
+    else:
+        parse_status = "parsed"
+
+    return CatalogParseSummary(
+        parse_status=parse_status,
+        root_node_count=root_node_count,
+        node_count=node_count,
+        edge_count=edge_count,
+        classified_node_count=classified_node_count,
+        unknown_node_count=unknown_node_count,
+        parse_warning_count=parse_warning_count,
+    )
+
+
+def _persist_generic_artifacts(
+    plan: ExecutionPlan,
+    raw_writer: RawArtifactWriter,
+    normalized_records: Mapping[str, Sequence[dict[str, Any]]],
+) -> tuple[list[ExtractedArtifact], CatalogParseSummary]:
+    all_records = [
+        record
+        for entity_type in ENTITY_TYPE_ORDER
+        for record in normalized_records[entity_type]
+    ]
+    if not all_records:
+        return [], _compute_parse_summary([], [])
+
+    path_by_key: dict[str, str] = {
+        record["entity_key"]: record["catalog_record_path"]
+        for record in all_records
+        if record.get("entity_key")
+    }
+
+    variant = plan.source.strategy_variant
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    for record in all_records:
+        parent_key = record.get("parent_entity_key")
+        parent_node_path = path_by_key.get(parent_key) if parent_key else None
+        nodes.append(_build_generic_catalog_node(record, parent_node_path=parent_node_path, variant=variant))
+        if parent_key:
+            edges.append(_build_generic_catalog_edge(record))
+
+    parse_summary = _compute_parse_summary(nodes, edges)
+
+    artifacts: list[ExtractedArtifact] = []
+    persisted = raw_writer.write_json_lines(
+        plan,
+        Path("normalized") / f"{CATALOG_NODES_FILE}.jsonl",
+        nodes,
+        metadata={"record_count": str(len(nodes))},
+    )
+    artifacts.append(persisted.artifact)
+    if edges:
+        persisted = raw_writer.write_json_lines(
+            plan,
+            Path("normalized") / f"{CATALOG_EDGES_FILE}.jsonl",
+            edges,
+            metadata={"record_count": str(len(edges))},
+        )
+        artifacts.append(persisted.artifact)
+    return artifacts, parse_summary
 
 
 def _catalog_resume_pagination_state(
