@@ -61,7 +61,8 @@ sources:
         backoff_seconds: 5
 
     schema:
-      mode: infer
+      mode: explicit
+      path: conf/schemas/transparencia/gastos_cartoes_cartoes_schema.json
       
     spark:
       input_format: json
@@ -85,7 +86,8 @@ sources:
 
     quality:
       required_fields:
-        - qntPessoas
-        - qntVinculos
-        - codOrgaoExercicioSiape
+        - id
+        - mesExtrato
+        - dataTransacao
+        - valorTransacao
       allow_schema_evolution: true

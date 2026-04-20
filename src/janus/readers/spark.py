@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -87,7 +88,40 @@ def _normalize_paths(paths: Sequence[str | Path]) -> tuple[str, ...]:
     normalized_paths = tuple(str(Path(path)) for path in paths)
     if not normalized_paths:
         raise ValueError("paths must not be empty")
-    return normalized_paths
+    return _compact_complete_parent_paths(normalized_paths)
+
+
+def _compact_complete_parent_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
+    file_groups: dict[Path, list[Path]] = defaultdict(list)
+    for path_value in paths:
+        path = Path(path_value)
+        if path.is_file():
+            file_groups[path.parent].append(path)
+
+    compacted_parents: set[Path] = set()
+    for parent, selected_files in file_groups.items():
+        selected_file_set = set(selected_files)
+        if len(selected_files) <= 1 or len(selected_file_set) != len(selected_files):
+            continue
+        discovered_files = {candidate for candidate in parent.rglob("*") if candidate.is_file()}
+        if discovered_files == selected_file_set:
+            compacted_parents.add(parent)
+
+    if not compacted_parents:
+        return paths
+
+    compacted_paths: list[str] = []
+    emitted_parents: set[Path] = set()
+    for path_value in paths:
+        path = Path(path_value)
+        parent = path.parent
+        if path.is_file() and parent in compacted_parents:
+            if parent not in emitted_parents:
+                compacted_paths.append(str(parent))
+                emitted_parents.add(parent)
+            continue
+        compacted_paths.append(path_value)
+    return tuple(compacted_paths)
 
 
 def _resolved_read_options(
