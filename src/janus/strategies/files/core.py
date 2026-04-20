@@ -656,15 +656,28 @@ class FileStrategy(BaseStrategy):
                 resolved_from_url = resolve_link(access.url, access.format, transport, chain)
 
             if resolved_from_url:
-                discovered.extend(resolved_from_url)
+                discovered.extend(
+                    _filter_discovered_files(
+                        resolved_from_url,
+                        access.remote_file_pattern,
+                    )
+                )
             else:
                 # Fallback: treat URL as direct so the download loop can dead-letter it on failure
-                discovered.append(
-                    DiscoveredFile(
-                        source_kind="remote",
-                        location=access.url,
-                        filename=_filename_from_url(access.url),
-                        format=_infer_format_name(access.url, fallback=access.format),
+                discovered.extend(
+                    _filter_discovered_files(
+                        (
+                            DiscoveredFile(
+                                source_kind="remote",
+                                location=access.url,
+                                filename=_filename_from_url(access.url),
+                                format=_infer_format_name(
+                                    access.url,
+                                    fallback=access.format,
+                                ),
+                            ),
+                        ),
+                        access.remote_file_pattern,
                     )
                 )
 
@@ -1074,18 +1087,25 @@ def _tarball_member_payloads(payload: bytes) -> dict[str, bytes]:
         raise ArchiveExtractionError("Could not extract tar.gz archive payload") from exc
 
 
+def _filter_discovered_files(
+    files: Sequence[DiscoveredFile],
+    file_pattern: str | None,
+) -> tuple[DiscoveredFile, ...]:
+    if not file_pattern:
+        return tuple(files)
+    return tuple(
+        item
+        for item in files
+        if fnmatch.fnmatch(item.location, file_pattern)
+        or fnmatch.fnmatch(item.filename, file_pattern)
+    )
+
+
 def _filter_members(
     members: Sequence[DiscoveredFile],
     file_pattern: str | None,
 ) -> tuple[DiscoveredFile, ...]:
-    if not file_pattern:
-        return tuple(members)
-    return tuple(
-        member
-        for member in members
-        if fnmatch.fnmatch(member.location, file_pattern)
-        or fnmatch.fnmatch(member.filename, file_pattern)
-    )
+    return _filter_discovered_files(members, file_pattern)
 
 
 def _is_tarball_filename(filename: str) -> bool:

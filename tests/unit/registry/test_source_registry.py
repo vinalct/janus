@@ -38,6 +38,21 @@ def test_checked_in_registry_returns_typed_source_config():
     assert str(source.config_path).endswith("conf/sources/example/example_source.yaml")
 
 
+def test_checked_in_registry_loads_cnpj_entity_source_contracts():
+    registry = load_registry(PROJECT_ROOT)
+
+    source = registry.get_source("receita_federal__cnpj__empresas", include_disabled=True)
+
+    assert source.enabled is False
+    assert source.source_hook is None
+    assert source.access.remote_file_pattern == "Empresas*.zip"
+    assert source.schema.mode == "explicit"
+    assert source.schema.path == "conf/schemas/receita_federal/cnpj/empresas_schema.json"
+    assert source.outputs.raw.path == "data/raw/receita_federal/cnpj/empresas"
+    assert source.outputs.bronze.namespace == "bronze__receita_federal"
+    assert source.outputs.bronze.table_name == "cnpj_empresas"
+
+
 def test_registry_discovers_sources_in_nested_domain_directories(tmp_path):
     project_root = _create_project(
         tmp_path,

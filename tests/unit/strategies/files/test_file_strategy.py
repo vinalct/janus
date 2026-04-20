@@ -17,7 +17,12 @@ from janus.checkpoints import CheckpointStore
 from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.planner import StrategyCatalog
 from janus.strategies.api import ApiResponse
-from janus.strategies.files import FileIntegrityError, FileStrategy
+from janus.strategies.files import (
+    DiscoveredFile,
+    FileHook,
+    FileIntegrityError,
+    FileStrategy,
+)
 from janus.utils.logging import build_structured_logger
 from janus.utils.storage import StorageLayout
 
@@ -263,6 +268,55 @@ def test_file_strategy_remote_download_retries_and_validates_checksum(tmp_path):
     assert metadata["persisted_file_count"] == "1"
 
 
+def test_file_strategy_filters_remote_discovery_before_download(tmp_path):
+    class MixedRemoteFilesHook(FileHook):
+        def resolve_links(self, plan, url, formato, transport):
+            del plan
+            del url
+            del formato
+            del transport
+            return (
+                DiscoveredFile(
+                    source_kind="remote",
+                    location="https://example.invalid/Empresas0.zip",
+                    filename="Empresas0.zip",
+                    format="binary",
+                ),
+                DiscoveredFile(
+                    source_kind="remote",
+                    location="https://example.invalid/Socios0.zip",
+                    filename="Socios0.zip",
+                    format="binary",
+                ),
+            )
+
+    archive_payload = io.BytesIO()
+    with ZipFile(archive_payload, "w") as archive:
+        archive.writestr("K3241.K03200Y0.D30513.EMPRECSV", "12345678;ACME\n")
+
+    plan = _build_plan(
+        tmp_path,
+        source_id="cnpj_empresas_remote_filter",
+        access_url="https://example.invalid/share",
+        access_format="binary",
+        spark_input_format="csv",
+        remote_file_pattern="Empresas*.zip",
+    )
+    strategy, transport = _build_strategy(
+        tmp_path,
+        responses=[ResponseSpec(200, archive_payload.getvalue())],
+    )
+
+    result = strategy.extract(plan, hook=MixedRemoteFilesHook())
+
+    assert [request.url for request in transport.requests] == [
+        "https://example.invalid/Empresas0.zip"
+    ]
+    assert len(result.artifacts) == 2
+    assert result.artifacts[0].path.endswith("Empresas0.zip")
+    assert result.artifacts[1].path.endswith("K3241.K03200Y0.D30513.EMPRECSV")
+
+
 def test_file_strategy_archive_package_extracts_csv_members_for_handoff(tmp_path):
     archive_path = tmp_path / "fixtures" / "package_2026-04.zip"
     archive_path.parent.mkdir(parents=True)
@@ -447,6 +501,7 @@ def _build_plan(
     access_path: Path | None = None,
     access_url: str | None = None,
     file_pattern: str | None = None,
+    remote_file_pattern: str | None = None,
     access_format: str = "csv",
     spark_input_format: str = "csv",
     extraction_mode: str = "full_refresh",
@@ -466,6 +521,7 @@ def _build_plan(
         access_path=access_path,
         access_url=access_url,
         file_pattern=file_pattern,
+        remote_file_pattern=remote_file_pattern,
         access_format=access_format,
         spark_input_format=spark_input_format,
         extraction_mode=extraction_mode,
@@ -495,6 +551,7 @@ def _build_source_config(
     access_path: Path | None = None,
     access_url: str | None = None,
     file_pattern: str | None = None,
+    remote_file_pattern: str | None = None,
     access_format: str = "csv",
     spark_input_format: str = "csv",
     extraction_mode: str = "full_refresh",
@@ -525,6 +582,8 @@ def _build_source_config(
         access_block["url"] = access_url
     if file_pattern is not None:
         access_block["file_pattern"] = file_pattern
+    if remote_file_pattern is not None:
+        access_block["remote_file_pattern"] = remote_file_pattern
 
     return SourceConfig.from_mapping(
         {

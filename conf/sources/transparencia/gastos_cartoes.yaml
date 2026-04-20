@@ -91,3 +91,97 @@ sources:
         - dataTransacao
         - valorTransacao
       allow_schema_evolution: true
+
+
+  - source_id: transparencia__gastos_cartoes__cartoes__incremental
+    name: Portal da Transparencia - Gastos Cartões
+    description: Consulta os registros de cartoes de pagamento.
+    owner: janus
+    enabled: false
+    source_type: api
+    strategy: api
+    strategy_variant: page_number_api
+    federation_level: federal
+    domain: transparencia
+    public_access: true
+    tags:
+      - transparencia
+      - federal
+      - api
+      - cartoes
+
+    access:
+      base_url: https://api.portaldatransparencia.gov.br
+      path: /api-de-dados/cartoes
+      method: GET
+      format: json
+      timeout_seconds: 60
+      headers:
+        Accept: application/json
+      auth:
+        type: header_token
+        env_var: TRANSPARENCIA_API_TOKEN
+        header_name: chave-api-dados
+      request_inputs:
+        type: date_window
+        start: 2005-01-01
+        end: 2014-12-31
+        step: month
+      parameter_bindings:
+        mesExtratoInicio:
+          from: request_input.window_start
+          format: '%m/%Y'
+        mesExtratoFim:
+          from: request_input.window_end
+          format: '%m/%Y'
+      pagination:
+        type: page_number
+        page_param: pagina
+        size_param: tamanhoPagina
+        page_size: 15
+      rate_limit:
+        requests_per_minute: 90
+        concurrency: 5
+        backoff_seconds: 10
+
+    extraction:
+      mode: incremental
+      checkpoint_field: mesExtrato
+      checkpoint_strategy: max_value
+      dead_letter_max_items: 100
+      retry:
+        max_attempts: 4
+        backoff_strategy: exponential
+        backoff_seconds: 5
+
+    schema:
+      mode: explicit
+      path: conf/schemas/transparencia/gastos_cartoes_cartoes_schema.json
+      
+    spark:
+      input_format: json
+      write_mode: append
+      repartition: 1
+      partition_by:
+        - ingestion_date
+
+    outputs:
+      raw:
+        path: data/raw/transparencia/gastos_cartoes__cartoes
+        format: json
+      bronze:
+        path: data/bronze/transparencia/gastos_cartoes__cartoes
+        format: iceberg
+        namespace: bronze__transparencia
+        table_name: gastos_cartoes__cartoes
+      metadata:
+        path: data/metadata/transparencia/gastos_cartoes__cartoes
+        format: json
+
+    quality:
+      required_fields:
+        - id
+        - mesExtrato
+        - dataTransacao
+        - valorTransacao
+      allow_schema_evolution: true

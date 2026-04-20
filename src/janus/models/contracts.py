@@ -190,6 +190,16 @@ class ExtractionResult:
         """Return extraction metadata as a plain mapping for simpler assertions or logging."""
         return dict(self.metadata)
 
+    def single_artifact_format(self) -> str:
+        """Return the single handoff format carried by this extraction result."""
+        formats = {artifact.format for artifact in self.artifacts}
+        if len(formats) != 1:
+            raise ValueError(
+                "Artifacts contain multiple formats; the caller must resolve the handoff "
+                "before reading it."
+            )
+        return next(iter(formats))
+
     def with_metadata(self, key: str, value: str) -> Self:
         """Return a new extraction result with one additional metadata entry."""
         return replace(self, metadata=_merge_string_mapping(self.metadata, key, value))

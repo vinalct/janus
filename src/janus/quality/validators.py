@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from janus.models import ExecutionPlan, QualityConfig, WriteResult
 from janus.normalizers import NORMALIZATION_METADATA_COLUMNS
 from janus.quality.models import QualityValidationError, ValidationCheck, ValidationReport
 from janus.quality.store import PersistedValidationReport, ValidationReportStore
+from janus.schema_contracts import (
+    load_expected_fields_from_schema_path,
+    resolve_schema_path_for_plan,
+)
 from janus.utils.environment import resolve_project_path
 from janus.utils.storage import bronze_table_identifier
 
@@ -465,10 +468,8 @@ def resolve_schema_expectation(
     if plan.source_config.schema.mode != "explicit" or not plan.source_config.schema.path:
         return SchemaExpectation()
 
-    schema_path = resolve_project_path(
-        plan.run_context.project_root,
-        plan.source_config.schema.path,
-    )
+    schema_path = resolve_schema_path_for_plan(plan)
+    assert schema_path is not None
     if not schema_path.exists():
         return SchemaExpectation()
 
@@ -479,42 +480,6 @@ def resolve_schema_expectation(
         )
     except (ValueError, json.JSONDecodeError) as exc:
         return SchemaExpectation(source=str(schema_path), error=str(exc))
-
-
-def load_expected_fields_from_schema_path(path: Path) -> tuple[str, ...]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return _field_names_from_payload(raw, path)
-    if isinstance(raw, Mapping):
-        for key in ("fields", "columns"):
-            if key in raw:
-                return _field_names_from_payload(raw[key], path)
-        if isinstance(raw.get("schema"), Mapping):
-            nested_schema = raw["schema"]
-            for key in ("fields", "columns"):
-                if key in nested_schema:
-                    return _field_names_from_payload(nested_schema[key], path)
-    raise ValueError(
-        f"Schema file {path} must be a JSON array of field names or a mapping with fields/columns"
-    )
-
-
-def _field_names_from_payload(value: Any, path: Path) -> tuple[str, ...]:
-    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
-        raise ValueError(f"Schema file {path} fields/columns must be an array")
-
-    field_names: list[str] = []
-    for entry in value:
-        if isinstance(entry, str):
-            field_names.append(entry)
-            continue
-        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
-            field_names.append(entry["name"])
-            continue
-        raise ValueError(
-            f"Schema file {path} entries must be strings or objects containing a 'name' field"
-        )
-    return _normalize_field_names(field_names)
 
 
 def _required_field_violation_counts(

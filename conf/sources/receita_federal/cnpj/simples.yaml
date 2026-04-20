@@ -1,0 +1,81 @@
+source_id: receita_federal__cnpj__simples_full_refresh
+name: Receita Federal - CNPJ Simples
+description: >
+  Full-refresh ingestion of the headerless CNPJ Simples files. The resolver
+  downloads only Simples archives and the explicit schema contract supplies the
+  bronze column names.
+owner: janus
+enabled: false
+source_type: file
+strategy: file
+strategy_variant: static_file
+federation_level: federal
+domain: receita_federal
+public_access: true
+tags:
+  - receita-federal
+  - cnpj
+  - simples
+  - bulk-file
+  - federal
+
+access:
+  url: https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9
+  method: GET
+  format: binary
+  link_resolver: nextcloud_webdav
+  remote_file_pattern: "Simples*.zip"
+  timeout_seconds: 600
+  auth:
+    type: none
+  pagination:
+    type: none
+  rate_limit:
+    requests_per_minute: 6
+    concurrency: 1
+    backoff_seconds: 60
+
+extraction:
+  mode: full_refresh
+  checkpoint_strategy: none
+  dead_letter_max_items: 5
+  retry:
+    max_attempts: 3
+    backoff_strategy: exponential
+    backoff_seconds: 30
+
+schema:
+  mode: explicit
+  path: conf/schemas/receita_federal/cnpj/simples_schema.json
+
+spark:
+  input_format: csv
+  write_mode: overwrite
+  repartition: 8
+  partition_by:
+    - ingestion_date
+  read_options:
+    header: "false"
+    sep: ";"
+    encoding: "ISO-8859-1"
+    inferSchema: "false"
+
+outputs:
+  raw:
+    path: data/raw/receita_federal/cnpj/simples
+    format: binary
+  bronze:
+    path: data/bronze/receita_federal/cnpj/simples
+    format: iceberg
+    namespace: bronze__receita_federal
+    table_name: cnpj_simples
+  metadata:
+    path: data/metadata/receita_federal/cnpj/simples
+    format: json
+
+quality:
+  required_fields:
+    - cnpj_basico
+  unique_fields:
+    - cnpj_basico
+  allow_schema_evolution: false

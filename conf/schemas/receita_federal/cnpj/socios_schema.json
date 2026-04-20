@@ -1,0 +1,15 @@
+{
+  "columns": [
+    "cnpj_basico",
+    "identificador_de_socio",
+    "nome_socio_ou_razao_social",
+    "cpf_cnpj_socio",
+    "qualificacao_socio",
+    "data_entrada_sociedade",
+    "pais",
+    "representante_legal",
+    "nome_representante",
+    "qualificacao_representante_legal",
+    "faixa_etaria"
+  ]
+}

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from janus.models import ExecutionPlan, ExtractedArtifact, ExtractionResult, RunContext, WriteResult
 from janus.planner import PlannedRun
@@ -74,6 +75,8 @@ class FakeStrategy:
 @dataclass(slots=True)
 class FakeReader:
     calls: list[str]
+    seen_format_name: str | None = None
+    seen_schema: Any | None = None
     seen_options: dict[str, str] | None = None
 
     def read_extraction_result(
@@ -86,8 +89,8 @@ class FakeReader:
     ):
         del spark
         del extraction_result
-        del format_name
-        del schema
+        self.seen_format_name = format_name
+        self.seen_schema = schema
         self.seen_options = None if options is None else dict(options)
         self.calls.append("read")
         return object()
@@ -281,6 +284,174 @@ def test_source_executor_passes_spark_read_options_from_source_config(tmp_path):
     assert reader.seen_options == read_options
 
 
+def test_source_executor_passes_explicit_schema_for_headerless_csv_sources(tmp_path):
+    @dataclass(slots=True)
+    class CnpjCsvStrategy(FakeStrategy):
+        def extract(self, plan, hook=None, *, spark=None):
+            del hook
+            del spark
+            self.calls.append("extract")
+            self.seen_metadata_output_path = plan.metadata_output.path
+            return ExtractionResult.from_plan(
+                plan,
+                artifacts=(
+                    ExtractedArtifact(
+                        path=str(
+                            tmp_path
+                            / "data"
+                            / "raw"
+                            / "receita_federal"
+                            / "cnpj"
+                            / "empresas"
+                            / "extracted"
+                            / "current"
+                            / "Empresas0"
+                            / "K3241.K03200Y0.D30513.EMPRECSV"
+                        ),
+                        format="csv",
+                        checksum="abc123",
+                    ),
+                ),
+                records_extracted=1,
+            )
+
+    calls: list[str] = []
+    source_config = _source_config_with_absolute_schema(
+        load_registry(PROJECT_ROOT).get_source(
+            "receita_federal__cnpj__empresas",
+            include_disabled=True,
+        )
+    )
+    run_context = RunContext.create(
+        run_id="run-executor-cnpj-schema-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+    )
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=CnpjCsvStrategy(calls),
+        hook=None,
+    )
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj" / "empresas"
+    reader = FakeReader(calls)
+
+    executed_run = SourceExecutor(
+        reader=reader,
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-executor-cnpj-schema-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(
+            calls,
+            tmp_path / "warehouse" / "bronze" / "receita_federal" / "cnpj" / "empresas",
+        ),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    ).execute(
+        planned_run,
+        spark=object(),
+        environment_config={},
+    )
+
+    assert executed_run.is_successful is True
+    assert reader.seen_format_name == "csv"
+    assert reader.seen_schema is not None
+    assert reader.seen_schema.fieldNames() == [
+        "cnpj_basico",
+        "razao_social",
+        "natureza_juridica",
+        "qualificacao_do_responsavel",
+        "capital_social",
+        "porte_empresa",
+        "ente_federativo_responsavel",
+    ]
+    assert reader.seen_options == source_config.spark.read_options
+
+
+def test_source_executor_reads_using_handoff_format_instead_of_source_config_format(tmp_path):
+    @dataclass(slots=True)
+    class JsonlStrategy(FakeStrategy):
+        def extract(self, plan, hook=None, *, spark=None):
+            del hook
+            del spark
+            self.calls.append("extract")
+            self.seen_metadata_output_path = plan.metadata_output.path
+            return ExtractionResult.from_plan(
+                plan,
+                artifacts=(
+                    ExtractedArtifact(
+                        path=str(
+                            tmp_path
+                            / "data"
+                            / "raw"
+                            / "receita_federal"
+                            / "cnpj"
+                            / "empresas"
+                            / "rows.jsonl"
+                        ),
+                        format="jsonl",
+                        checksum="abc123",
+                    ),
+                ),
+                records_extracted=1,
+            )
+
+    calls: list[str] = []
+    source_config = load_registry(PROJECT_ROOT).get_source(
+        "receita_federal__cnpj__empresas",
+        include_disabled=True,
+    )
+    run_context = RunContext.create(
+        run_id="run-executor-jsonl-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 19, 12, 0, tzinfo=UTC),
+    )
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=JsonlStrategy(calls),
+        hook=None,
+    )
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj" / "empresas"
+    reader = FakeReader(calls)
+
+    executed_run = SourceExecutor(
+        reader=reader,
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-executor-jsonl-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(
+            calls,
+            tmp_path / "warehouse" / "bronze" / "receita_federal" / "cnpj" / "empresas",
+        ),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    ).execute(
+        planned_run,
+        spark=object(),
+        environment_config={},
+    )
+
+    assert executed_run.is_successful is True
+    assert reader.seen_format_name == "jsonl"
+    assert reader.seen_schema is None
+    assert reader.seen_options is None
+
+
 def test_source_executor_records_failed_status_when_quality_validation_fails(tmp_path):
     calls: list[str] = []
     planned_run = _planned_run(tmp_path, calls)
@@ -364,6 +535,18 @@ def _planned_run(
         plan=ExecutionPlan.from_source_config(source_config, run_context),
         strategy=FakeStrategy(calls),
         hook=None,
+    )
+
+
+def _source_config_with_absolute_schema(source_config):
+    if source_config.schema.path is None:
+        return source_config
+    return replace(
+        source_config,
+        schema=replace(
+            source_config.schema,
+            path=str(PROJECT_ROOT / source_config.schema.path),
+        ),
     )
 
 

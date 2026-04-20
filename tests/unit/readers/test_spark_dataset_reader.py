@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from pyspark.sql import SparkSession
 from janus.models import ExecutionPlan, ExtractedArtifact, ExtractionResult, RunContext
 from janus.readers import SparkDatasetReader
 from janus.registry import load_registry
+from janus.schema_contracts import load_spark_schema_from_schema_path
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
 
@@ -82,6 +84,62 @@ def test_spark_dataset_reader_requires_explicit_format_for_mixed_artifacts(
         match="Artifacts contain multiple formats; pass format_name explicitly to read them",
     ):
         reader.read_extraction_result(spark, extraction_result)
+
+
+def test_spark_dataset_reader_applies_explicit_schema_to_headerless_cnpj_csv(
+    spark: SparkSession,
+    tmp_path,
+):
+    source_config = load_registry(PROJECT_ROOT).get_source(
+        "receita_federal__cnpj__empresas",
+        include_disabled=True,
+    )
+    source_config = replace(
+        source_config,
+        schema=replace(
+            source_config.schema,
+            path=str(PROJECT_ROOT / source_config.schema.path),
+        ),
+    )
+    run_context = RunContext.create(
+        run_id="run-reader-cnpj-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+    )
+    plan = ExecutionPlan.from_source_config(source_config, run_context)
+    raw_path = tmp_path / "K3241.K03200Y0.D30513.EMPRECSV"
+    raw_path.write_text(
+        "12345678;ACME LTDA;2062;49;1000,00;01;\n",
+        encoding="ISO-8859-1",
+    )
+    extraction_result = ExtractionResult.from_plan(
+        plan,
+        artifacts=(ExtractedArtifact(path=str(raw_path), format="csv"),),
+        records_extracted=1,
+    )
+
+    dataframe = SparkDatasetReader().read_extraction_result(
+        spark,
+        extraction_result,
+        format_name="csv",
+        schema=load_spark_schema_from_schema_path(Path(source_config.schema.path)),
+        options=source_config.spark.read_options,
+    )
+
+    assert dataframe.columns == [
+        "cnpj_basico",
+        "razao_social",
+        "natureza_juridica",
+        "qualificacao_do_responsavel",
+        "capital_social",
+        "porte_empresa",
+        "ente_federativo_responsavel",
+    ]
+    row = dataframe.first()
+    assert row.cnpj_basico == "12345678"
+    assert row.razao_social == "ACME LTDA"
+    assert row.natureza_juridica == "2062"
 
 
 def _build_plan(tmp_path: Path, *, run_id: str, started_at: datetime) -> ExecutionPlan:

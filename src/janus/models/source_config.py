@@ -131,6 +131,7 @@ class AccessConfig:
     path: str | None = None
     url: str | None = None
     discovery_pattern: str | None = None
+    remote_file_pattern: str | None = None
     file_pattern: str | None = None
     headers: dict[str, str] | None = None
     params: dict[str, str] | None = None
@@ -315,6 +316,7 @@ def _build_access_config(
     path = _optional_string(data, "path", issues, "access")
     url = _optional_string(data, "url", issues, "access")
     discovery_pattern = _optional_string(data, "discovery_pattern", issues, "access")
+    remote_file_pattern = _optional_string(data, "remote_file_pattern", issues, "access")
     file_pattern = _optional_string(data, "file_pattern", issues, "access")
     headers = _optional_string_mapping(data, "headers", issues, "access")
     params = _optional_string_mapping(data, "params", issues, "access")
@@ -375,6 +377,7 @@ def _build_access_config(
         path=path,
         url=url,
         discovery_pattern=discovery_pattern,
+        remote_file_pattern=remote_file_pattern,
         file_pattern=file_pattern,
         headers=headers,
         params=params,

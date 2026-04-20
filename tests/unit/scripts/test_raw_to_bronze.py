@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from zipfile import ZipFile
 
 from janus.models import ExecutionPlan, RunContext, WriteResult
@@ -10,8 +12,8 @@ from janus.planner import PlannedRun
 from janus.quality import PersistedValidationReport, ValidationCheck, ValidationReport
 from janus.registry import load_registry
 from janus.scripts.raw_to_bronze import RawToBronzeLoader, _artifact_format_for_path
-from janus.strategies.files import FileStrategy
 from janus.strategies.catalog import CatalogStrategy
+from janus.strategies.files import FileStrategy
 from janus.utils.storage import StorageLayout
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -51,6 +53,9 @@ class FakeStrategy:
 @dataclass(slots=True)
 class FakeReader:
     calls: list[str]
+    seen_format_name: str | None = None
+    seen_schema: Any | None = None
+    seen_options: dict[str, str] | None = None
 
     def read_extraction_result(
         self,
@@ -62,9 +67,9 @@ class FakeReader:
     ):
         del spark
         del extraction_result
-        del format_name
-        del schema
-        del options
+        self.seen_format_name = format_name
+        self.seen_schema = schema
+        self.seen_options = None if options is None else dict(options)
         self.calls.append("read")
         return object()
 
@@ -280,10 +285,79 @@ def test_raw_to_bronze_loader_regenerates_catalog_jsonl_handoff_from_raw_pages(t
     ).exists()
 
 
-def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads(tmp_path):
+def test_raw_to_bronze_loader_reads_using_handoff_format_instead_of_source_config_format(tmp_path):
+    calls: list[str] = []
     source_config = load_registry(PROJECT_ROOT).get_source(
-        "receita_federal__cnpj__static",
+        "receita_federal__cnpj__empresas",
         include_disabled=True,
+    )
+    run_context = RunContext.create(
+        run_id="run-raw-to-bronze-jsonl-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 19, 12, 0, tzinfo=UTC),
+    )
+
+    class JsonlHandoffStrategy(FakeStrategy):
+        def build_normalization_handoff(self, plan, extraction_result, hook=None):
+            del plan
+            del hook
+            self.calls.append("handoff")
+            assert extraction_result.artifacts[0].format == "jsonl"
+            return extraction_result
+
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=JsonlHandoffStrategy(calls),
+        hook=None,
+    )
+
+    raw_root = tmp_path / "data" / "raw" / "receita_federal" / "cnpj" / "empresas"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    (raw_root / "rows.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj" / "empresas"
+    reader = FakeReader(calls)
+
+    result = RawToBronzeLoader(
+        reader=reader,
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-raw-to-bronze-jsonl-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: FakeWriter(
+            calls,
+            expected_namespace="bronze__receita_federal",
+            expected_table_name="cnpj_jsonl",
+            result_path="bronze__receita_federal.cnpj_jsonl",
+        ),
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    ).ingest(
+        planned_run,
+        spark=object(),
+        environment_config={},
+        bronze_table="bronze__receita_federal.cnpj_jsonl",
+    )
+
+    assert result.is_successful is True
+    assert reader.seen_format_name == "jsonl"
+    assert reader.seen_schema is None
+    assert reader.seen_options is None
+
+
+def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads(tmp_path):
+    source_config = _source_config_with_absolute_schema(
+        load_registry(PROJECT_ROOT).get_source(
+            "receita_federal__cnpj__empresas",
+            include_disabled=True,
+        )
     )
     run_context = RunContext.create(
         run_id="run-file-raw-to-bronze-001",
@@ -297,21 +371,34 @@ def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads
         hook=None,
     )
 
-    raw_download_dir = tmp_path / "data" / "raw" / "receita_federal" / "cnpj" / "downloads" / "current"
+    raw_download_dir = (
+        tmp_path
+        / "data"
+        / "raw"
+        / "receita_federal"
+        / "cnpj"
+        / "empresas"
+        / "downloads"
+        / "current"
+    )
     raw_download_dir.mkdir(parents=True, exist_ok=True)
     archive_path = raw_download_dir / "Empresas0.zip"
     with ZipFile(archive_path, "w") as archive:
-        archive.writestr("K3241.K03200Y0.D30513.EMPRECSV", "1;ACME\n")
+        archive.writestr(
+            "K3241.K03200Y0.D30513.EMPRECSV",
+            "12345678;ACME LTDA;2062;49;1000,00;01;\n",
+        )
 
     validation_report = ValidationReport.from_plan(
         planned_run.plan,
         [ValidationCheck.passed("output", "materialized_outputs", "ok")],
     )
-    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj"
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj" / "empresas"
     calls: list[str] = []
+    reader = FakeReader(calls)
 
     loader = RawToBronzeLoader(
-        reader=FakeReader(calls),
+        reader=reader,
         normalizer=FakeNormalizer(calls),
         quality_gate=FakeQualityGate(
             calls,
@@ -322,8 +409,8 @@ def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads
         writer_factory=lambda storage_layout: FakeWriter(
             calls,
             expected_namespace="bronze__receita_federal",
-            expected_table_name="cnpj",
-            result_path="bronze__receita_federal.cnpj",
+            expected_table_name="cnpj_empresas",
+            result_path="bronze__receita_federal.cnpj_empresas",
         ),
         storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
     )
@@ -332,7 +419,7 @@ def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads
         planned_run,
         spark=object(),
         environment_config={},
-        bronze_table="bronze__receita_federal.cnpj",
+        bronze_table="bronze__receita_federal.cnpj_empresas",
     )
 
     extracted_path = (
@@ -341,6 +428,7 @@ def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads
         / "raw"
         / "receita_federal"
         / "cnpj"
+        / "empresas"
         / "extracted"
         / "current"
         / "Empresas0"
@@ -349,8 +437,22 @@ def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads
 
     assert result.is_successful is True
     assert any(artifact.format == "csv" for artifact in result.handoff.artifacts)
+    assert reader.seen_schema is not None
+    assert reader.seen_schema.fieldNames() == [
+        "cnpj_basico",
+        "razao_social",
+        "natureza_juridica",
+        "qualificacao_do_responsavel",
+        "capital_social",
+        "porte_empresa",
+        "ente_federativo_responsavel",
+    ]
+    assert reader.seen_options == source_config.spark.read_options
     assert extracted_path.exists()
-    assert extracted_path.read_text(encoding="utf-8") == "1;ACME\n"
+    assert (
+        extracted_path.read_text(encoding="utf-8")
+        == "12345678;ACME LTDA;2062;49;1000,00;01;\n"
+    )
     assert calls == [
         "start",
         "read",
@@ -391,6 +493,18 @@ def _planned_run(tmp_path: Path, calls: list[str]) -> PlannedRun:
         plan=ExecutionPlan.from_source_config(source_config, run_context),
         strategy=FakeStrategy(calls),
         hook=None,
+    )
+
+
+def _source_config_with_absolute_schema(source_config):
+    if source_config.schema.path is None:
+        return source_config
+    return replace(
+        source_config,
+        schema=replace(
+            source_config.schema,
+            path=str(PROJECT_ROOT / source_config.schema.path),
+        ),
     )
 
 

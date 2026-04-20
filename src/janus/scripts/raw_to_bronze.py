@@ -14,6 +14,7 @@ from janus.normalizers import BaseNormalizer
 from janus.planner import PlannedRun
 from janus.quality import PersistedValidationReport, QualityGate, ValidationReportStore
 from janus.readers import SparkDatasetReader
+from janus.schema_contracts import resolve_spark_schema_for_plan
 from janus.runtime.executor import _plan_with_storage_layout_outputs
 from janus.strategies.api import ApiRequest, build_paginator
 from janus.strategies.api.request_inputs import load_request_inputs
@@ -200,11 +201,23 @@ class RawToBronzeLoader:
             normalized_dataframe = None
             if not handoff.is_empty:
                 _log_info(logger, "spark_read_started", artifact_count=len(handoff.artifacts))
+                handoff_format = handoff.single_artifact_format()
+                spark_schema = (
+                    resolve_spark_schema_for_plan(plan)
+                    if handoff_format == plan.source_config.spark.input_format
+                    else None
+                )
+                read_options = (
+                    plan.source_config.spark.read_options
+                    if handoff_format == plan.source_config.spark.input_format
+                    else None
+                )
                 raw_dataframe = self.reader.read_extraction_result(
                     spark,
                     handoff,
-                    format_name=plan.source_config.spark.input_format,
-                    options=plan.source_config.spark.read_options,
+                    format_name=handoff_format,
+                    schema=spark_schema,
+                    options=read_options,
                 )
                 _log_info(logger, "spark_read_finished")
 
