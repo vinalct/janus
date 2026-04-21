@@ -16,8 +16,12 @@ spark:
   config:
     spark.driver.bindAddress: ${JANUS_SPARK_DRIVER_BIND_ADDRESS:-127.0.0.1}
     spark.driver.host: ${JANUS_SPARK_DRIVER_HOST:-127.0.0.1}
+    spark.driver.memory: ${JANUS_SPARK_DRIVER_MEMORY:-8g}
+    spark.driver.maxResultSize: ${JANUS_SPARK_DRIVER_MAX_RESULT_SIZE:-2g}
     spark.sql.session.timeZone: UTC
-    spark.sql.shuffle.partitions: "4"
+    spark.sql.shuffle.partitions: ${JANUS_SPARK_SQL_SHUFFLE_PARTITIONS:-256}
+    spark.sql.files.maxPartitionBytes: ${JANUS_SPARK_SQL_FILES_MAX_PARTITION_BYTES:-134217728}
+    spark.sql.adaptive.enabled: "true"
     spark.ui.enabled: "false"
 
 storage:
