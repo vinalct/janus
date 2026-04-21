@@ -202,8 +202,6 @@ def _rebalance_for_write(
         return dataframe
 
     current_partitions = dataframe.rdd.getNumPartitions()
-    if target_partitions < current_partitions:
-        return dataframe.coalesce(target_partitions)
     if target_partitions > current_partitions:
         return dataframe.repartition(target_partitions)
     return dataframe

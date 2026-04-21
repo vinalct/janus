@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -78,6 +78,7 @@ class FakeReader:
     seen_format_name: str | None = None
     seen_schema: Any | None = None
     seen_options: dict[str, str] | None = None
+    read_artifact_counts: list[int] = field(default_factory=list)
 
     def read_extraction_result(
         self,
@@ -88,7 +89,7 @@ class FakeReader:
         options=None,
     ):
         del spark
-        del extraction_result
+        self.read_artifact_counts.append(len(extraction_result.artifacts))
         self.seen_format_name = format_name
         self.seen_schema = schema
         self.seen_options = None if options is None else dict(options)
@@ -125,6 +126,28 @@ class FakeWriter:
             records_written=2,
             partition_by=("ingestion_date",),
             metadata={"writer": "fake"},
+        )
+
+
+@dataclass(slots=True)
+class RecordingWriter:
+    calls: list[str]
+    modes: list[str]
+    bronze_path: Path
+
+    def write(self, dataframe, plan, zone, **kwargs):
+        del dataframe
+        self.calls.append("write")
+        mode = kwargs.get("mode") or plan.source_config.spark.write_mode
+        self.modes.append(mode)
+        return WriteResult.from_plan(
+            plan,
+            zone,
+            path=str(self.bronze_path),
+            format_name=plan.bronze_output.format,
+            mode=mode,
+            records_written=None,
+            partition_by=plan.source_config.spark.partition_by,
         )
 
 
@@ -318,7 +341,7 @@ def test_source_executor_passes_explicit_schema_for_headerless_csv_sources(tmp_p
     calls: list[str] = []
     source_config = _source_config_with_absolute_schema(
         load_registry(PROJECT_ROOT).get_source(
-            "receita_federal__cnpj__empresas",
+            "receita_federal__cnpj__empresas_full_refresh",
             include_disabled=True,
         )
     )
@@ -405,7 +428,7 @@ def test_source_executor_reads_using_handoff_format_instead_of_source_config_for
 
     calls: list[str] = []
     source_config = load_registry(PROJECT_ROOT).get_source(
-        "receita_federal__cnpj__empresas",
+        "receita_federal__cnpj__empresas_full_refresh",
         include_disabled=True,
     )
     run_context = RunContext.create(
@@ -450,6 +473,100 @@ def test_source_executor_reads_using_handoff_format_instead_of_source_config_for
     assert reader.seen_format_name == "jsonl"
     assert reader.seen_schema is None
     assert reader.seen_options is None
+
+
+def test_source_executor_batches_file_handoff_artifacts_and_appends_after_overwrite(tmp_path):
+    @dataclass(slots=True)
+    class MultiFileCnpjStrategy(FakeStrategy):
+        @property
+        def strategy_family(self) -> str:
+            return "file"
+
+        def extract(self, plan, hook=None, *, spark=None):
+            del hook
+            del spark
+            self.calls.append("extract")
+            raw_root = (
+                tmp_path
+                / "data"
+                / "raw"
+                / "receita_federal"
+                / "cnpj"
+                / "empresas"
+                / "extracted"
+                / "current"
+            )
+            return ExtractionResult.from_plan(
+                plan,
+                artifacts=(
+                    ExtractedArtifact(
+                        path=str(raw_root / "Empresas0" / "K3241.K03200Y0.D30513.EMPRECSV"),
+                        format="csv",
+                        checksum="abc123",
+                    ),
+                    ExtractedArtifact(
+                        path=str(raw_root / "Empresas1" / "K3241.K03200Y1.D30513.EMPRECSV"),
+                        format="csv",
+                        checksum="def456",
+                    ),
+                ),
+                records_extracted=2,
+            )
+
+    calls: list[str] = []
+    source_config = _source_config_with_absolute_schema(
+        load_registry(PROJECT_ROOT).get_source(
+            "receita_federal__cnpj__empresas_full_refresh",
+            include_disabled=True,
+        )
+    )
+    run_context = RunContext.create(
+        run_id="run-executor-cnpj-batches-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+    )
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=MultiFileCnpjStrategy(calls),
+        hook=None,
+    )
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj" / "empresas"
+    reader = FakeReader(calls)
+    writer = RecordingWriter(
+        calls,
+        modes=[],
+        bronze_path=tmp_path / "warehouse" / "bronze" / "receita_federal" / "cnpj" / "empresas",
+    )
+
+    executed_run = SourceExecutor(
+        reader=reader,
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-executor-cnpj-batches-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: writer,
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    ).execute(
+        planned_run,
+        spark=object(),
+        environment_config={},
+    )
+
+    assert executed_run.is_successful is True
+    assert reader.read_artifact_counts == [1, 1]
+    assert writer.modes == ["overwrite", "append"]
+    assert [write.mode for write in executed_run.write_results if write.zone == "bronze"] == [
+        "overwrite",
+        "append",
+    ]
 
 
 def test_source_executor_records_failed_status_when_quality_validation_fails(tmp_path):

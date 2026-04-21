@@ -264,7 +264,7 @@ def test_spark_dataset_writer_uses_configured_bronze_iceberg_namespace_and_table
     assert NORMALIZED_COLUMNS.issubset(set(persisted.columns))
 
 
-def test_rebalance_for_write_prefers_coalesce_when_reducing_partitions():
+def test_rebalance_for_write_keeps_existing_parallelism_when_target_is_lower():
     class FakeRDD:
         def __init__(self, partitions: int) -> None:
             self._partitions = partitions
@@ -294,7 +294,7 @@ def test_rebalance_for_write_prefers_coalesce_when_reducing_partitions():
     )
 
     assert result is frame
-    assert frame.calls == [("coalesce", 8)]
+    assert frame.calls == []
 
 
 def test_rebalance_for_write_uses_repartition_when_increasing_partitions():

@@ -41,7 +41,10 @@ def test_checked_in_registry_returns_typed_source_config():
 def test_checked_in_registry_loads_cnpj_entity_source_contracts():
     registry = load_registry(PROJECT_ROOT)
 
-    source = registry.get_source("receita_federal__cnpj__empresas", include_disabled=True)
+    source = registry.get_source(
+        "receita_federal__cnpj__empresas_full_refresh",
+        include_disabled=True,
+    )
 
     assert source.enabled is False
     assert source.source_hook is None
@@ -581,7 +584,10 @@ def test_registry_rejects_request_input_bindings_when_request_inputs_are_invalid
         load_registry(project_root)
 
     message = str(exc_info.value)
-    assert "access.request_inputs.type: must be one of: combined, date_window, iceberg_rows, none" in message
+    assert (
+        "access.request_inputs.type: must be one of: combined, date_window, iceberg_rows, none"
+        in message
+    )
     assert (
         "access.parameter_bindings.id.from: requires access.request_inputs to declare a non-'none' type"  # noqa: E501
         in message

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +56,7 @@ class FakeReader:
     seen_format_name: str | None = None
     seen_schema: Any | None = None
     seen_options: dict[str, str] | None = None
+    read_artifact_counts: list[int] = field(default_factory=list)
 
     def read_extraction_result(
         self,
@@ -66,7 +67,7 @@ class FakeReader:
         options=None,
     ):
         del spark
-        del extraction_result
+        self.read_artifact_counts.append(len(extraction_result.artifacts))
         self.seen_format_name = format_name
         self.seen_schema = schema
         self.seen_options = None if options is None else dict(options)
@@ -106,6 +107,28 @@ class FakeWriter:
             format_name="iceberg",
             mode="overwrite",
             records_written=1,
+        )
+
+
+@dataclass(slots=True)
+class RecordingWriter:
+    modes: list[str]
+    paths: list[str]
+
+    def write(self, dataframe, plan, zone, **kwargs):
+        del dataframe
+        assert zone == "bronze"
+        mode = kwargs.get("mode") or plan.source_config.spark.write_mode
+        path = f"{plan.bronze_output.namespace}.{plan.bronze_output.table_name}"
+        self.modes.append(mode)
+        self.paths.append(path)
+        return WriteResult.from_plan(
+            plan,
+            zone,
+            path=path,
+            format_name="iceberg",
+            mode=mode,
+            records_written=None,
         )
 
 
@@ -288,7 +311,7 @@ def test_raw_to_bronze_loader_regenerates_catalog_jsonl_handoff_from_raw_pages(t
 def test_raw_to_bronze_loader_reads_using_handoff_format_instead_of_source_config_format(tmp_path):
     calls: list[str] = []
     source_config = load_registry(PROJECT_ROOT).get_source(
-        "receita_federal__cnpj__empresas",
+        "receita_federal__cnpj__empresas_full_refresh",
         include_disabled=True,
     )
     run_context = RunContext.create(
@@ -355,7 +378,7 @@ def test_raw_to_bronze_loader_reads_using_handoff_format_instead_of_source_confi
 def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads(tmp_path):
     source_config = _source_config_with_absolute_schema(
         load_registry(PROJECT_ROOT).get_source(
-            "receita_federal__cnpj__empresas",
+            "receita_federal__cnpj__empresas_full_refresh",
             include_disabled=True,
         )
     )
@@ -460,6 +483,72 @@ def test_raw_to_bronze_loader_rehydrates_file_archive_members_from_raw_downloads
         "write",
         "validate",
         "success",
+    ]
+
+
+def test_file_raw_to_bronze_writes_handoff_artifacts_in_append_batches(tmp_path):
+    source_config = _source_config_with_absolute_schema(
+        load_registry(PROJECT_ROOT).get_source(
+            "receita_federal__cnpj__empresas_full_refresh",
+            include_disabled=True,
+        )
+    )
+    run_context = RunContext.create(
+        run_id="run-file-raw-to-bronze-batches-001",
+        environment="local",
+        project_root=tmp_path,
+        started_at=datetime(2026, 4, 19, 12, 0, tzinfo=UTC),
+    )
+    planned_run = PlannedRun(
+        plan=ExecutionPlan.from_source_config(source_config, run_context),
+        strategy=FileStrategy(),
+        hook=None,
+    )
+
+    raw_root = tmp_path / "data" / "raw" / "receita_federal" / "cnpj" / "empresas"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    (raw_root / "part-000.csv").write_text(
+        "12345678;ACME LTDA;2062;49;1000,00;01;\n",
+        encoding="utf-8",
+    )
+    (raw_root / "part-001.csv").write_text(
+        "23456789;BRAVO LTDA;2062;49;2000,00;01;\n",
+        encoding="utf-8",
+    )
+
+    validation_report = ValidationReport.from_plan(
+        planned_run.plan,
+        [ValidationCheck.passed("output", "materialized_outputs", "ok")],
+    )
+    metadata_root = tmp_path / "data" / "metadata" / "receita_federal" / "cnpj" / "empresas"
+    calls: list[str] = []
+    reader = FakeReader(calls)
+    writer = RecordingWriter(modes=[], paths=[])
+
+    result = RawToBronzeLoader(
+        reader=reader,
+        normalizer=FakeNormalizer(calls),
+        quality_gate=FakeQualityGate(
+            calls,
+            validation_report,
+            metadata_root / "validations" / "run-file-raw-to-bronze-batches-001.json",
+        ),
+        observer=FakeObserver(calls, metadata_root),
+        writer_factory=lambda storage_layout: writer,
+        storage_layout_resolver=lambda plan, config: _storage_layout(tmp_path),
+    ).ingest(
+        planned_run,
+        spark=object(),
+        environment_config={},
+        bronze_table="bronze__receita_federal.cnpj_empresas",
+    )
+
+    assert result.is_successful is True
+    assert reader.read_artifact_counts == [1, 1]
+    assert writer.modes == ["overwrite", "append"]
+    assert [write.mode for write in result.write_results if write.zone == "bronze"] == [
+        "overwrite",
+        "append",
     ]
 
 
