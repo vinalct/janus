@@ -15,14 +15,16 @@ import pytest
 from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.strategies.api import ApiRequest, ApiResponse
 from janus.strategies.api.core import (
-    _compare_checkpoint_values,
-    _freeze_string_mapping,
     _raw_relative_path,
     _request_input_key,
+)
+from janus.strategies.api.pagination import PaginationState
+from janus.strategies.common import (
+    _compare_checkpoint_values,
+    _freeze_string_mapping,
     _retry_delay_seconds,
     _stringify_mapping,
 )
-from janus.strategies.api.pagination import PaginationState
 
 
 # ---------------------------------------------------------------------------

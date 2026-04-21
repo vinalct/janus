@@ -14,11 +14,11 @@ import pytest
 
 from janus.models import ExecutionPlan, RunContext, SourceConfig
 from janus.strategies.api import ApiRequest, ApiResponse
-from janus.strategies.files.core import (
+from janus.strategies.common import (
     _compare_checkpoint_values,
-    _infer_format_name,
     _retry_delay_seconds,
 )
+from janus.strategies.files.core import _infer_format_name
 
 
 # ---------------------------------------------------------------------------

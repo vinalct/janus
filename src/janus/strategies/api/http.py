@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPSHandler, OpenerDirector, Request, build_opener
 
 from janus.models import AuthConfig
+from janus.strategies.common import _freeze_string_mapping, _stringify_mapping
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,32 +293,3 @@ def _render_token(prefix: str | None, token: str) -> str:
     return f"{normalized_prefix} {token}"
 
 
-def _freeze_string_mapping(values: Mapping[str, str] | None) -> tuple[tuple[str, str], ...]:
-    if not values:
-        return ()
-
-    frozen_items: list[tuple[str, str]] = []
-    for key, value in values.items():
-        normalized_key = str(key).strip()
-        normalized_value = str(value).strip()
-        if not normalized_key:
-            raise ValueError("mapping keys must be non-empty strings")
-        if not normalized_value:
-            raise ValueError("mapping values must be non-empty strings")
-        frozen_items.append((normalized_key, normalized_value))
-    return tuple(sorted(frozen_items))
-
-
-def _stringify_mapping(values: Mapping[str, Any]) -> dict[str, str]:
-    rendered: dict[str, str] = {}
-    for key, value in values.items():
-        normalized_key = str(key).strip()
-        if not normalized_key:
-            raise ValueError("mapping keys must be non-empty strings")
-        if value is None:
-            continue
-        normalized_value = str(value).strip()
-        if not normalized_value:
-            continue
-        rendered[normalized_key] = normalized_value
-    return rendered
