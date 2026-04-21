@@ -76,7 +76,7 @@ There are two valid top-level shapes:
 1. One source per file.
 
 ```yaml
-source_id: transparencia_servidores_por_orgao
+source_id: transparencia__poder_executivo_federal__servidores_por_orgao__full_refresh
 name: Portal da Transparencia - Servidores agregados por orgao
 ...
 ```
@@ -122,12 +122,15 @@ The registry contract is intentionally small. The most important current options
 - `access.pagination.type` must match the chosen family variant when pagination is used: `page_number`, `offset`, `cursor`, or `none`.
 - `access.rate_limit` carries `requests_per_minute`, optional `backoff_seconds`, and optional `concurrency`.
 - `access.params` is the home for static literal request parameters.
-- `access.request_inputs` is an optional API-only block for bounded runtime request contexts before pagination starts.
-- `access.parameter_bindings` is an optional API-only block for request parameters resolved from the current request input or checkpoint state.
+- `access.request_inputs` is an optional API/catalog block for bounded runtime request contexts before pagination starts.
+- `access.parameter_bindings` is an optional API/catalog block for request parameters resolved from the current request input or checkpoint state.
+- `access.link_resolver` is a file-source option for remote URL discovery. Supported values are `auto`, `direct`, `html_links`, and `nextcloud_webdav`.
+- `access.remote_file_pattern` filters files discovered from a remote URL before download.
+- `access.file_pattern` filters local file discovery and archive members before Spark handoff.
 
-### API Request Shaping
+### API and Catalog Request Shaping
 
-For API sources, keep the request contract split by responsibility:
+For API and catalog sources, keep the request contract split by responsibility:
 
 - `access.params` holds fixed literals that should be sent on every request.
 - `access.request_inputs` defines the bounded outer request contexts JANUS should resolve before pagination starts.
@@ -156,7 +159,7 @@ Keep the boundaries sharp:
 - use `access.parameter_bindings` for values such as `mesAno`, `dataIdaDe`, `dataIdaAte`, or a detail identifier that changes per request input;
 - use a hook only when the request shape is still irregular, such as custom signing, request-body generation, or a one-off cursor rule.
 
-Request inputs do not replace pagination. They sit outside it. Choose the strategy variant and `access.pagination` that match the API request loop, then add `access.request_inputs` only when the endpoint also needs a bounded outer context.
+Request inputs do not replace pagination. They sit outside it. Choose the strategy variant and `access.pagination` that match the request loop, then add `access.request_inputs` only when the endpoint also needs a bounded outer context.
 
 ### Example: Monthly Parameter Binding
 
@@ -301,6 +304,14 @@ schema:
 
 If `mode` is `explicit`, `path` is required. JANUS does not currently support inline field definitions, inline types, or other schema metadata in the source YAML.
 
+The schema path may point to a Spark `StructType` JSON document or to a JSON field contract that JANUS can read as field names. Supported field-contract shapes are:
+
+- a JSON array of field names;
+- a mapping with `fields` or `columns`;
+- a mapping with `schema.fields` or `schema.columns`.
+
+During execution, JANUS passes an explicit Spark schema to the reader when the normalization handoff format matches `spark.input_format`. The same schema file also feeds the quality gate's expected-field check.
+
 ### `spark`
 
 - `spark.input_format` tells JANUS how the normalization handoff should be read.
@@ -340,7 +351,9 @@ Examples of behavior that should stay in config:
 - base URL or direct file URL;
 - auth mode and env var names;
 - page size or offset parameter names;
+- file URL resolver mode, remote file filters, and archive-member filters;
 - checkpoint field and checkpoint strategy;
+- explicit schema path and Spark read options;
 - output formats and paths, plus optional `outputs.bronze.namespace` and `outputs.bronze.table_name` for Iceberg bronze targets;
 - quality rules such as required fields and uniqueness keys.
 

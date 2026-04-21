@@ -42,13 +42,13 @@ More detail: [strategy patterns](docs/strategy-patterns.md), [source onboarding]
 
 The checked-in source contracts already cover the three core strategy families.
 
-| Source | Family | Notes |
+| Source group | Family | Notes |
 | --- | --- | --- |
-| `transparencia_servidores_por_orgao` | `api` | Portal da Transparencia; disabled by default; requires `TRANSPARENCIA_API_TOKEN` for live execution |
-| `dados_abertos_catalog` | `catalog` | dados.gov.br catalog metadata; disabled by default; requires `DADOS_GOV_BR_API_TOKEN` for live execution |
-| `ibge_pib_brasil` | `api` | IBGE SIDRA; disabled by default; public execution path; uses the `ibge.sidra_flat` hook |
-| `ibge_agro_abacaxi_pronaf` | `api` | Second IBGE SIDRA example with richer dimensions; disabled by default |
-| `inep_censo_escolar_microdados` | `file` | INEP ZIP package; disabled by default; exercises archive extraction |
+| Portal da Transparencia APIs | `api` | Contratos, emendas, gastos com cartoes, licitacoes, orgaos, renuncias fiscais, and servidores; disabled by default; require `TRANSPARENCIA_API_TOKEN` for live execution |
+| dados.gov.br catalog | `catalog` | Catalog listing and detail sources; disabled by default; require `DADOS_GOV_BR_API_TOKEN` for live execution |
+| IBGE SIDRA | `api` | `ibge_pib_brasil` and `ibge_agro_abacaxi_pronaf`; disabled by default; public execution path; use the `ibge.sidra_flat` hook |
+| INEP microdata | `file` | `inep_censo_escolar_microdados`; disabled by default; exercises ZIP extraction and configured CSV read options |
+| Receita Federal CNPJ | `file` | Declarative CNPJ entity ingestions for empresas, estabelecimentos, socios, simples, and lookup tables; disabled by default; use WebDAV discovery, archive filtering, and explicit schemas |
 | `federal_open_data_example` | `api` | Contract example only; points to `example.invalid` and is not a live source |
 
 Output zones live under `data/`:

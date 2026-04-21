@@ -89,6 +89,8 @@ The supported formats are the formats we need for the early source work:
 - `text`
 - `binary`
 
+The reader can also receive a Spark schema object from the runtime. During normal execution, JANUS resolves `schema.mode: explicit` into a reader schema when the normalization handoff format matches `spark.input_format`. That is what lets headerless CSV file sources land with contract-defined column names instead of anonymous `_c0`, `_c1`, and so on.
+
 One behavior worth calling out is JSON handling.
 
 The raw writer serializes `json` payloads as ordinary multi-line JSON documents, while `jsonl` remains line-oriented. The reader now reflects that distinction instead of treating both the same way. By default:
@@ -146,6 +148,7 @@ They cover:
 - writing a raw JSON artifact to the resolved raw path and capturing its checksum in metadata;
 - defaulting JSON reads to multi-line document mode while keeping JSONL line-oriented;
 - allowing explicit Spark read options to override the default JSON reader behavior;
+- applying explicit schemas when reading headerless CSV artifacts;
 - reading extracted raw artifacts through the generic reader when Spark is available;
 - writing normalized bronze output through the generic Spark writer when Spark is available.
 

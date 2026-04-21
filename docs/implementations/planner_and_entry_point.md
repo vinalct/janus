@@ -10,10 +10,12 @@ That matters because it keeps JANUS aligned with the foundation and PRD principl
 
 - `src/janus/planner/core.py` defines the planning flow and the small planner-facing objects.
 - `src/janus/runtime/executor.py` defines the runtime orchestration layer through `SourceExecutor` and the execution result contract through `ExecutedRun`.
+- `src/janus/scripts/raw_to_bronze.py` defines the operational path for loading already-preserved raw artifacts into a selected bronze table.
 - `src/janus/runtime/__init__.py` exposes the runtime API for CLI and tests.
 - `src/janus/main.py` now supports both deterministic planning and full framework execution from the command line.
 - `tests/unit/planner/test_planner.py` covers planning, disabled-source handling, and CLI wiring.
 - `tests/unit/runtime/test_executor.py` covers the runtime orchestration path, quality failures, and execution summaries.
+- `tests/unit/scripts/test_raw_to_bronze.py` covers raw artifact rediscovery and the raw-to-bronze reload path.
 
 ## What the planner is responsible for
 
@@ -93,7 +95,7 @@ It carries execution status, extracted artifacts, materialized outputs, persiste
 
 ## The command-line flow
 
-`janus` supports four useful modes.
+`janus` supports five useful modes.
 
 ### 1. Runtime validation only
 
@@ -140,7 +142,24 @@ janus \
 
 That keeps the default behavior safe while still supporting controlled operational runs.
 
-### 4. Resuming an interrupted extraction
+### 4. Loading existing raw artifacts into bronze
+
+```bash
+janus \
+  --environment local \
+  --source-id inep_censo_escolar_microdados \
+  --include-disabled \
+  --ingest-raw-to-bronze \
+  --bronze-table bronze_inep.censo_escolar_microdados
+```
+
+`--ingest-raw-to-bronze` skips live extraction. It plans the selected source, re-discovers raw artifacts already present under the configured raw output path, prepares the same strategy normalization handoff, reads through Spark, writes the requested bronze table, and persists validation, lineage, and run metadata.
+
+The `--bronze-table` value accepts either a table name or one `namespace.table_name` identifier. This path is useful when raw files were staged by a prior extraction run and the operator needs to re-materialize bronze without hitting the upstream source again.
+
+For catalog sources, the loader replays the catalog raw pages into normalized JSONL entity artifacts before Spark reads them. For file sources, it rehydrates extracted archive members from preserved ZIP or tarball downloads when needed.
+
+### 5. Resuming an interrupted extraction
 
 ```bash
 janus \
@@ -170,6 +189,7 @@ They cover:
 - allowing disabled sources only when explicitly requested;
 - printing a stable CLI planning summary;
 - wiring the CLI execution path to `SourceExecutor`;
+- wiring the raw-to-bronze CLI path to raw artifact rediscovery, Spark reads, bronze writes, and metadata persistence;
 - returning failed execution status when quality validation fails.
 
 ## Why this matters architecturally

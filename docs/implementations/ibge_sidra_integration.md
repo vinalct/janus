@@ -21,7 +21,7 @@ Both sources are modeled as:
 Both write to the standard JANUS zones:
 
 - raw: exact API response pages and normalized handoff artifacts
-- bronze: Spark-readable Parquet dataset
+- bronze: Iceberg table materialized from the Spark-readable handoff
 - metadata: run information, checkpoints, and lineage
 
 The implementation also includes the IBGE hook registry wiring, fixtures, and integration tests.

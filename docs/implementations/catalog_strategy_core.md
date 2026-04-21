@@ -24,6 +24,7 @@ Its job is not to ingest business facts like payments, census rows, or health re
 That means the strategy now owns these responsibilities:
 
 - building and sending catalog requests from the source contract;
+- loading bounded request inputs and applying parameter bindings before each catalog request loop;
 - applying the configured pagination strategy;
 - respecting configured request pacing and retry rules;
 - recording unrecoverable request inputs in source-scoped dead-letter state once request-level retries are exhausted;
@@ -111,6 +112,11 @@ Every successful catalog response is now written under a deterministic raw path:
 - `pages/page-0002.json`
 - or the equivalent offset or cursor naming when other pagination modes are used.
 
+When request inputs are configured, the same page naming is nested under stable input folders:
+
+- `request-input-000001/page-0001.json`
+- `request-input-000002/page-0001.json`
+
 After traversal, the strategy also persists normalization-ready metadata artifacts under:
 
 - `normalized/organizations.jsonl`
@@ -128,11 +134,14 @@ The catalog strategy reuses the shared request and pagination primitives already
 
 That means a catalog source now gets the same operational basics as the other runtime strategies:
 
+- request inputs and parameter bindings for catalog detail endpoints;
 - page-number, offset, cursor, or no-pagination request flow;
 - bounded retry behavior for transient failures;
 - single-threaded throttling through `requests_per_minute`;
 - source-scoped dead-letter tracking for request inputs whose bounded retries are exhausted;
 - incremental refresh support through the checkpoint layer.
+
+Request inputs are handled as an outer loop. For each input, JANUS resolves configured bindings, fills matching `{name}` placeholders in the catalog URL, leaves non-placeholder bindings as query params, and then runs the normal paginator inside that bound request stream. This lets a catalog listing feed a later catalog-detail source without adding source-id branches to the catalog strategy.
 
 If one request input still fails after the retry loop, the strategy records it in the dead-letter state and continues only while `extraction.dead_letter_max_items` allows it. When the operator runs with `--resume`, previously dead-lettered inputs are skipped instead of being retried again.
 
@@ -170,6 +179,7 @@ They cover:
 
 - planner resolution of catalog variants to the real runtime strategy;
 - page-number traversal across more than one catalog page;
+- request-input and parameter-binding execution for catalog detail loops;
 - extraction of organizations, groups, datasets, and resources from one catalog flow;
 - checkpoint-aware incremental filtering for metadata refreshes;
 - `resource_catalog` behavior where resources are the primary root entity;
@@ -182,4 +192,3 @@ The focused verification for this step passed with:
 - `python -m pytest tests/unit/strategies/api/test_api_strategy.py tests/unit/strategies/files/test_file_strategy.py tests/unit/planner/test_planner.py tests/unit/strategies/catalog/test_catalog_strategy.py -q`
 
 That last command matters because the catalog strategy now participates in the default planner catalog. The adjacent API, file, and planner checks still passed after that registration change.
-

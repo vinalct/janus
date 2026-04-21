@@ -67,11 +67,12 @@ Use the file family when the source is fundamentally about locating, downloading
 
 The shared file strategy already owns:
 
-- local or remote file discovery;
+- local file discovery and remote URL resolution;
+- direct, HTML-link, and Nextcloud WebDAV link discovery;
 - version selection;
 - checksum validation when available;
 - deterministic raw download persistence;
-- ZIP extraction and safe member handling;
+- ZIP and gzip tarball extraction with safe member handling;
 - filtering extracted members for Spark handoff;
 - version-oriented checkpoint behavior.
 
@@ -79,7 +80,7 @@ Typical fit:
 
 - one direct CSV or Parquet file;
 - periodic publications where the newest file matters;
-- ZIP packages that contain one or more tabular files.
+- ZIP or `.tar.gz` packages that contain one or more tabular files.
 
 Good hook use in this family:
 
@@ -101,6 +102,7 @@ Use the catalog family when the source is fundamentally about ingesting metadata
 The shared catalog strategy already owns:
 
 - catalog request flow and pagination;
+- bounded request-input loading and parameter binding for catalog detail loops;
 - retry and request pacing;
 - metadata-oriented checkpoint behavior;
 - traversal of organizations, groups, datasets, and resources;

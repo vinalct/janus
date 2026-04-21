@@ -34,7 +34,7 @@ That keeps the original ZIP in raw storage while selecting only the Censo Escola
 The output layout follows the same JANUS zones used by the other sources:
 
 - raw archive and extracted files: `data/raw/inep/censo_escolar_microdados`
-- bronze Parquet output: `data/bronze/inep/censo_escolar_microdados`
+- bronze Iceberg output: `bronze_inep.censo_escolar_microdados`
 - run metadata, lineage, and related records: `data/metadata/inep/censo_escolar_microdados`
 
 The source is disabled by default. Running it requires `--include-disabled`, which is the safer default for a bulk download source during development.
@@ -69,7 +69,7 @@ The test coverage checks that:
 - the archive is persisted under a deterministic raw download path;
 - the selected CSV member is extracted under a deterministic raw extracted path;
 - the normalization handoff receives the CSV, not the ZIP;
-- bronze Parquet and metadata can be materialized when Spark is available;
+- bronze Iceberg and metadata can be materialized when Spark is available;
 - reruns reuse the same raw paths.
 
 The fixture lives under:
@@ -99,7 +99,7 @@ The selected member path contains the archive root directory and the internal `d
 
 The INEP file is a ZIP download, so the access format is `binary`. The Spark handoff reads the extracted CSV.
 
-The sample test reads the CSV using:
+The source contract reads the CSV using:
 
 ```text
 header=true
@@ -107,7 +107,7 @@ sep=;
 inferSchema=true
 ```
 
-That reflects the shape of the INEP CSV. The source contract already declares the Spark input format as `csv`; CSV reader options should stay explicit in the runtime path when the full ingestion command is exercised against the real package.
+That reflects the shape of the INEP CSV. The source contract declares both `spark.input_format: csv` and the CSV reader options under `spark.read_options`, so the same parser settings drive the framework execution path and the raw-to-bronze reload path.
 
 ## Certificate issue found during the first real run
 

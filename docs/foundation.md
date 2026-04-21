@@ -551,18 +551,22 @@ janus/
 │   │   ├── local.yaml
 │   │   └── cluster.yaml
 │   ├── sources/
-│   │   ├── transparencia.yaml
-│   │   ├── dados_abertos_catalog.yaml
-│   │   ├── ibge.yaml
-│   │   ├── inep.yaml
-│   │   └── saude.yaml
+│   │   ├── transparencia/
+│   │   ├── dados_abertos_catalog/
+│   │   ├── receita_federal/
+│   │   ├── ibge/
+│   │   ├── inep/
+│   │   └── example/
 │   └── schemas/
 │       ├── transparencia/
+│       ├── receita_federal/
 │       ├── ibge/
 │       └── inep/
 ├── src/
 │   └── janus/
+│       ├── schema_contracts.py
 │       ├── main.py
+│       ├── scripts/
 │       ├── planner/
 │       ├── registry/
 │       ├── strategies/
@@ -608,57 +612,77 @@ One of the main best practices in JANUS is to define sources declaratively whene
 ### Example source YAML
 
 ```yaml
-source_id: transparencia_servidores
-name: Portal da Transparência - Servidores do Poder Executivo Federal
+source_id: transparencia__poder_executivo_federal__servidores_por_orgao__full_refresh
+name: Portal da Transparencia - Servidores agregados por orgao
 owner: janus
-enabled: true
+enabled: false
 source_type: api
 strategy: api
 strategy_variant: page_number_api
-source_hook: transparencia.servidores
 federation_level: federal
-domain: transparency
+domain: transparencia
 public_access: true
 
-request:
-  base_url: https://api.portaldatransparencia.gov.br/api-de-dados
-  path: /servidores
+access:
+  base_url: https://api.portaldatransparencia.gov.br
+  path: /api-de-dados/servidores/por-orgao
   method: GET
+  format: json
+  timeout_seconds: 60
+  headers:
+    Accept: application/json
   auth:
     type: header_token
     env_var: TRANSPARENCIA_API_TOKEN
+    header_name: chave-api-dados
   pagination:
     type: page_number
     page_param: pagina
     size_param: tamanhoPagina
-    page_size: 500
+    page_size: 15
   rate_limit:
-    requests_per_minute: 20
+    requests_per_minute: 90
+    concurrency: 10
     backoff_seconds: 10
 
 extraction:
-  mode: incremental
-  checkpoint_field: ultimaAtualizacao
-  checkpoint_strategy: max_value
+  mode: full_refresh
+  checkpoint_strategy: none
+  dead_letter_max_items: 100
   retry:
-    max_attempts: 5
-    strategy: exponential_backoff
+    max_attempts: 4
+    backoff_strategy: exponential
+    backoff_seconds: 5
+
+schema:
+  mode: explicit
+  path: conf/schemas/transparencia/servidores_por_orgao_schema.json
 
 spark:
   input_format: json
-  repartition: 8
-  write_mode: append
+  write_mode: overwrite
+  repartition: 1
   partition_by:
     - ingestion_date
 
-output:
-  raw_path: data/raw/transparencia/servidores
-  bronze_path: data/bronze/transparencia/servidores
-  metadata_path: data/metadata/transparencia/servidores
+outputs:
+  raw:
+    path: data/raw/transparencia/poder_executivo_federal__servidores_por_orgao
+    format: json
+  bronze:
+    path: data/bronze/transparencia/poder_executivo_federal__servidores_por_orgao
+    format: iceberg
+    namespace: bronze__transparencia
+    table_name: poder_executivo_federal__servidores_por_orgao
+  metadata:
+    path: data/metadata/transparencia/poder_executivo_federal__servidores_por_orgao
+    format: json
 
 quality:
   required_fields:
-    - id
+    - qntPessoas
+    - qntVinculos
+    - codOrgaoExercicioSiape
   allow_schema_evolution: true
 ```
 

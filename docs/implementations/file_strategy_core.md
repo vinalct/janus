@@ -6,14 +6,15 @@ Before this step, the planner could classify a source as `static_file`, `version
 
 This step fills that gap with a reusable file strategy that sits on top of the JANUS contracts already in place: source config, execution plans, checkpoints, raw writers, and extraction metadata.
 
-The result is not an INEP integration yet. It is the generic runtime layer that an INEP-style source is supposed to use.
+The result is the generic runtime layer used by bulk-file sources such as INEP and Receita Federal CNPJ. Source-specific package rules still stay in configuration or narrow hooks.
 
 ## What was added
 
 - `src/janus/strategies/files/core.py` now implements the `FileStrategy` itself, plus the file-specific hook points and helper objects that support discovery, download, version handling, archive extraction, normalization handoff, and metadata emission.
+- `src/janus/strategies/files/resolvers.py` provides the reusable link resolver chain used when a file source starts from a landing page or public share instead of a direct download URL.
 - `src/janus/strategies/files/__init__.py` now exposes the file strategy package surface for downstream imports.
 - `src/janus/planner/core.py` now resolves file variants to the real `FileStrategy` in the default strategy catalog.
-- `tests/unit/strategies/files/test_file_strategy.py` now covers the main runtime behaviors introduced in this step.
+- `tests/unit/strategies/files/test_file_strategy.py` and `tests/unit/strategies/files/test_resolvers.py` now cover the main runtime behaviors introduced in this step.
 
 ## What the file layer is responsible for
 
@@ -24,13 +25,14 @@ Its job is not to parse business data into a final bronze dataset. Its job is to
 That means the strategy now owns these responsibilities:
 
 - discovering files from `access.path`, `access.discovery_pattern`, or a direct remote `access.url`;
+- resolving remote links through direct URL, redirect, Nextcloud WebDAV, or HTML-link discovery;
 - choosing which discovered file or files should actually run for the configured variant;
 - downloading remote payloads when the source is HTTP-based;
 - applying auth and retry behavior for remote file requests;
 - recording irrecoverable file candidates in source-scoped dead-letter state;
 - validating a checksum when one is available;
 - persisting raw downloads through the shared raw writer;
-- extracting ZIP packages through reusable archive logic;
+- extracting ZIP and gzip tarball packages through reusable archive logic;
 - filtering extracted members when the source config provides a file pattern;
 - exposing only reader-compatible artifacts to the normalization handoff;
 - emitting extraction metadata in the same contract shape the rest of JANUS already expects.
@@ -49,7 +51,18 @@ A discovered file records the information the strategy needs before raw persiste
 - the inferred format;
 - the version token when one can be resolved.
 
-The strategy supports three main discovery paths.
+The main moving parts are remote URL resolution and the three file variants.
+
+### Remote URL resolution
+
+When a file source uses `access.url`, the strategy resolves that URL before download. In `access.link_resolver: auto`, JANUS tries the reusable chain in order:
+
+- direct file URLs with known file extensions;
+- HTTP `HEAD` responses that resolve to a non-HTML payload;
+- public Nextcloud shares through WebDAV `PROPFIND`;
+- HTML pages with matching anchor links.
+
+The resolver can be pinned with `direct`, `nextcloud_webdav`, or `html_links` when a source should avoid auto-detection. `access.remote_file_pattern` then filters the discovered remote candidates before the download loop starts.
 
 ### Static file sources
 
@@ -76,7 +89,7 @@ That gives the file layer a sensible generic version-selection rule without hard
 
 For `archive_package`, the strategy still treats the original archive as the raw download to preserve, but it also extracts reusable member artifacts for downstream handoff.
 
-At this stage the reusable archive support is ZIP-based, which is enough for the first bulk-file delivery and for the INEP path that follows later.
+The reusable archive support covers ZIP files and gzip tarballs (`.tar.gz` or `.tgz`).
 
 ## Remote download behavior
 
@@ -145,7 +158,7 @@ If no checksum is available, the strategy still computes the persisted raw check
 
 ## Archive extraction and handoff
 
-The ZIP extraction path is intentionally reusable and intentionally cautious.
+The archive extraction path is intentionally reusable and intentionally cautious.
 
 The strategy rejects unsafe archive member paths such as absolute paths or members that try to escape with `..`. Safe members are extracted in memory and then persisted back through the shared raw writer just like any other artifact.
 
@@ -157,7 +170,7 @@ That distinction matters.
 
 The full extraction result can include:
 
-- the original ZIP file;
+- the original ZIP or tarball file;
 - extracted CSV files;
 - extracted text side files;
 - any other preserved raw members.
@@ -170,6 +183,7 @@ This step also adds `FileHook`, which is the escape hatch for the file-family ca
 
 The hook can now intervene in a few bounded places:
 
+- override URL link resolution;
 - reorder or filter discovered files;
 - override version resolution;
 - provide an expected checksum;
@@ -185,16 +199,17 @@ The unit tests added for this step focus on the behavior later file integrations
 They cover:
 
 - planner resolution of file variants to the real runtime strategy;
+- direct, HTML-link, and Nextcloud WebDAV resolver behavior;
 - deterministic raw persistence for a simple local CSV source;
 - latest-version selection for a versioned full-refresh source;
 - checkpoint-aware filtering for an incremental versioned source;
 - remote download retry behavior together with checksum validation;
-- ZIP extraction with filtered CSV handoff;
+- ZIP and tar.gz extraction with filtered CSV handoff;
 - failure on checksum mismatch.
 
 The focused verification for this step passed with:
 
-- `python -m ruff check src/janus/strategies/files src/janus/planner/core.py tests/unit/strategies/files/test_file_strategy.py`
-- `python -m pytest tests/unit/strategies/files/test_file_strategy.py tests/unit/planner/test_planner.py tests/unit/strategies/api/test_api_strategy.py -q`
+- `python -m ruff check src/janus/strategies/files src/janus/planner/core.py tests/unit/strategies/files`
+- `python -m pytest tests/unit/strategies/files tests/unit/planner/test_planner.py tests/unit/strategies/api/test_api_strategy.py -q`
 
 That second command matters because the file strategy now participates in the default planner catalog. The adjacent planner and API checks still passed after that registration change.

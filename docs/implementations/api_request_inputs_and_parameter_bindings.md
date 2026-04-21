@@ -1,14 +1,14 @@
-# API Request Inputs and Parameter Bindings
+# Request Inputs and Parameter Bindings
 
-The short version is: JANUS now has a bounded request-shaping layer inside the API family for endpoints that need runtime request parameters or one request stream per upstream identifier.
+The short version is: JANUS now has a bounded request-shaping layer for API and catalog sources that need runtime request parameters or one request stream per upstream identifier.
 
-This work extends the existing registry, planner, and API runtime. It does not introduce a workflow engine, cross-source orchestration, or a second request subsystem.
+This work extends the existing registry, planner, API runtime, and catalog runtime. It does not introduce a workflow engine, cross-source orchestration, or a second request subsystem.
 
 ## Where this fits
 
 The request-shaping layer sits between base request construction and pagination:
 
-`source YAML -> registry -> planner -> API strategy -> request inputs -> parameter bindings -> pagination -> raw artifacts -> Spark handoff -> metadata`
+`source YAML -> registry -> planner -> API/catalog strategy -> request inputs -> parameter bindings -> pagination -> raw artifacts -> Spark handoff -> metadata`
 
 That placement matters.
 
@@ -16,7 +16,7 @@ Pagination is still the reusable inner loop for page, offset, cursor, or non-pag
 
 ## Contract boundary
 
-The feature adds two optional API-only blocks under `access`:
+The feature adds two optional API/catalog blocks under `access`:
 
 - `request_inputs`
 - `parameter_bindings`
@@ -106,7 +106,7 @@ The registry and runtime keep the binding surface explicit. JANUS rejects:
 
 ## Runtime behavior
 
-At extraction time, the API strategy now executes in this order:
+At extraction time, API and catalog strategies execute in this order:
 
 1. Build the base request with auth and any checkpoint-aware default params.
 2. Load or synthesize the configured request inputs.
@@ -114,6 +114,8 @@ At extraction time, the API strategy now executes in this order:
 4. Merge the resolved values with static `access.params`.
 5. Run the existing pagination flow for that bound request stream.
 6. Persist raw artifacts and extraction metadata with request-input context.
+
+Catalog sources also use bound values to fill `{name}` placeholders in `access.path` or `access.url`. Bound values that do not match a path placeholder remain query parameters.
 
 This keeps the implementation aligned with the JANUS foundation:
 
@@ -164,6 +166,7 @@ The implementation is covered at three levels:
 - registry validation tests in `tests/unit/registry/test_source_registry.py`
 - request-input and binding unit tests in `tests/unit/strategies/api/test_request_inputs.py`
 - end-to-end API runtime tests in `tests/unit/strategies/api/test_api_strategy.py`
+- catalog request-input runtime tests in `tests/unit/strategies/catalog/test_catalog_strategy.py`
 
 That coverage locks down:
 
@@ -175,4 +178,4 @@ That coverage locks down:
 - deterministic raw artifact naming
 - backward compatibility for existing static-param API sources
 
-The result stays intentionally small enough to explain during source onboarding without introducing new platform concepts beyond the API family itself.
+The result stays intentionally small enough to explain during source onboarding without introducing new platform concepts beyond the request-facing strategy families.

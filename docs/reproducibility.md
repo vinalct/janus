@@ -228,11 +228,33 @@ Today `src/janus/main.py` is a reproducible runtime entry point for:
 - loading environment profiles;
 - materializing runtime paths;
 - validating Spark bootstrap;
-- planning one configured source.
+- planning one configured source;
+- executing one configured source end to end with `--execute`;
+- resuming interrupted extraction state with `--resume`;
+- loading already-preserved raw artifacts into a requested bronze table with `--ingest-raw-to-bronze --bronze-table ...`.
 
-It is not yet the top-level end-to-end command that orchestrates live source extraction, normalization, quality checks, and metadata persistence for integrated federal sources. The strategy runtimes already exist in code, but the public CLI entry point is still centered on validation and planning.
+For example, a live framework run looks like:
 
-That is not a weakness in the documentation. It is the honest shape of the repository at this task boundary.
+```bash
+python -m janus.main \
+  --environment local \
+  --source-id ibge_pib_brasil \
+  --include-disabled \
+  --execute
+```
+
+And a raw-to-bronze reload looks like:
+
+```bash
+python -m janus.main \
+  --environment local \
+  --source-id inep_censo_escolar_microdados \
+  --include-disabled \
+  --ingest-raw-to-bronze \
+  --bronze-table bronze_inep.censo_escolar_microdados
+```
+
+The CLI still runs one selected source at a time. Cross-source scheduling, dependency orchestration, and production job control belong outside this entry point for now.
 
 ## Safe reruns and stable outputs
 
