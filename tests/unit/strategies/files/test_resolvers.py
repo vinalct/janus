@@ -792,3 +792,66 @@ def _build_strategy(
         clock=lambda: 0.0,
     )
     return strategy, transport
+
+
+# ---------------------------------------------------------------------------
+# resolver chain falls through on transport exceptions
+# ---------------------------------------------------------------------------
+
+
+def test_redirect_resolver_returns_empty_on_transport_exception():
+    """RedirectResolver must swallow transport errors and return empty — not crash."""
+    from urllib.error import URLError
+
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/data/file"
+
+    files = RedirectResolver().resolve(url, "csv", transport)
+
+    assert list(files) == []
+
+
+def test_html_link_resolver_returns_empty_on_transport_exception():
+    """HtmlLinkResolver must swallow transport errors and return empty — not crash."""
+    from urllib.error import URLError
+
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/portal/page"
+
+    files = HtmlLinkResolver().resolve(url, "csv", transport)
+
+    assert list(files) == []
+
+
+def test_nextcloud_webdav_resolver_returns_empty_on_transport_exception():
+    """NextcloudWebDavResolver must swallow transport errors and return empty."""
+    from urllib.error import URLError
+
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/index.php/s/TOKEN"
+
+    files = NextcloudWebDavResolver().resolve(url, None, transport)
+
+    assert list(files) == []
+
+
+def test_resolve_link_chain_falls_through_when_redirect_resolver_fails():
+    """
+    When RedirectResolver raises a transport exception the chain must continue
+    and the next matching resolver (HtmlLinkResolver) gets a chance to resolve.
+    """
+    from urllib.error import URLError
+
+    head_exception = URLError("connection refused")
+    html_body = b"<html><body><a href='/data/report.csv'>CSV</a></body></html>"
+    transport = FakeTransport([
+        head_exception,
+        ResponseSpec(200, html_body, {"Content-Type": "text/html"}),
+    ])
+    url = "https://example.gov.br/portal/page"
+    chain = (RedirectResolver(), HtmlLinkResolver())
+
+    files = resolve_link(url, "csv", transport, chain)
+
+    assert len(files) == 1
+    assert files[0].filename == "report.csv"
