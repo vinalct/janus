@@ -39,6 +39,7 @@ from janus.strategies.api import (
     build_paginator,
     inject_auth,
 )
+from janus.strategies.api.pagination import _resume_pagination_state
 from janus.strategies.api.request_inputs import (
     ApiRequestInputLoadError,
     load_request_inputs,
@@ -52,6 +53,8 @@ from janus.strategies.common import (
     _freeze_string_mapping,
     _max_checkpoint_value,
     _parse_datetime,
+    _raw_page_path,
+    _request_input_key,
     _retry_delay_seconds,
     _stringify_mapping,
 )
@@ -391,6 +394,7 @@ class CatalogStrategy(BaseStrategy):
             entity_type: [] for entity_type in ENTITY_TYPE_ORDER
         }
         entity_indexes: dict[tuple[str, str], int] = {}
+        checkpoint_request_value = _checkpoint_request_value(plan, checkpoint_state)
         checkpoint_value: str | None = None
         successful_requests = 0
         total_attempts = 0
@@ -398,9 +402,12 @@ class CatalogStrategy(BaseStrategy):
 
         with ApiClient(self.transport_factory()) as client:
             for request_input_index, request_input in enumerate(request_inputs, start=1):
-                request_input_key = _catalog_request_input_key(request_input)
+                request_input_key = _request_input_key(request_input)
                 per_input_request = _apply_per_input_params(
-                    base_request, parameter_bindings, request_input
+                    base_request,
+                    parameter_bindings,
+                    request_input,
+                    checkpoint_value=checkpoint_request_value,
                 )
 
                 if request_input_key in completed_by_key:
@@ -453,7 +460,7 @@ class CatalogStrategy(BaseStrategy):
                         plan, storage_layout, progress, request_input_index, request_input_count
                     )
                     request_input_raw_artifacts.extend(pre_artifacts)
-                    pagination_state = _catalog_resume_pagination_state(
+                    pagination_state = _resume_pagination_state(
                         paginator, paginator.initial_state(per_input_request), progress
                     )
                     if logger is not None:
@@ -1095,11 +1102,17 @@ def _apply_per_input_params(
     base_request: ApiRequest,
     parameter_bindings: Any,
     request_input: dict[str, Any] | None,
+    *,
+    checkpoint_value: str | None = None,
 ) -> ApiRequest:
     """Apply per-request-input parameter bindings to the base request."""
     if not parameter_bindings:
         return base_request
-    bound_params = resolve_parameter_bindings(parameter_bindings, request_input=request_input)
+    bound_params = resolve_parameter_bindings(
+        parameter_bindings,
+        request_input=request_input,
+        checkpoint_value=checkpoint_value,
+    )
     if not bound_params:
         return base_request
     path_params, query_params = _split_path_and_query_params(base_request.url, bound_params)
@@ -1161,17 +1174,12 @@ def _raw_relative_path(
     request_input_index: int = 1,
     request_input_count: int = 1,
 ) -> Path:
-    if pagination_state.page_number is not None:
-        filename = f"page-{pagination_state.page_number:04d}.json"
-    elif pagination_state.offset is not None:
-        filename = f"offset-{pagination_state.offset:08d}.json"
-    elif pagination_state.cursor is not None:
-        filename = f"cursor-{pagination_state.request_index:04d}.json"
-    else:
-        filename = f"response-{pagination_state.request_index:04d}.json"
-    if request_input_count > 1:
-        return Path(f"request-input-{request_input_index:06d}") / filename
-    return Path("pages") / filename
+    return _raw_page_path(
+        pagination_state,
+        ".json",
+        request_input_index=request_input_index,
+        request_input_count=request_input_count,
+    )
 
 
 def _normalized_relative_path(entity_type: str) -> Path:
@@ -1760,12 +1768,6 @@ def _catalog_request_input_dead_letter_metadata(
     return metadata
 
 
-def _catalog_request_input_key(request_input: dict[str, Any] | None) -> str:
-    """Stable, content-based fingerprint for a catalog request input context."""
-    if request_input is None:
-        return "__none__"
-    return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
-
 
 def _payload_hash(payload: Any) -> str:
     return sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
@@ -1949,18 +1951,3 @@ def _persist_generic_artifacts(
     return artifacts, parse_summary
 
 
-def _catalog_resume_pagination_state(
-    paginator: Any,
-    pagination_state: PaginationState,
-    progress: dict[str, Any],
-) -> PaginationState:
-    """Return a pagination state that resumes after the last recorded page."""
-    last_page = progress.get("last_page_number")
-    if last_page is not None:
-        return PaginationState(request_index=1, page_number=last_page + 1)
-
-    last_offset = progress.get("last_offset")
-    if last_offset is not None and isinstance(paginator, OffsetPaginator):
-        return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
-
-    return pagination_state

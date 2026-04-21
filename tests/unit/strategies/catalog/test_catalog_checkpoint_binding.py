@@ -29,13 +29,6 @@ _CHECKPOINT_BINDING = {"desde": ParameterBinding(from_="checkpoint_value")}
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "FR-4: _apply_per_input_params does not forward checkpoint_value to "
-        "resolve_parameter_bindings. Fixed in task 03."
-    ),
-    strict=True,
-)
 def test_catalog_per_input_binding_receives_checkpoint_value():
     """
     A catalog source using 'from: checkpoint_value' should receive the active

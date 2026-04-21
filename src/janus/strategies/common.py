@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 from janus.models import ExecutionPlan
@@ -123,6 +124,34 @@ def _stringify_mapping(values: Mapping[str, Any]) -> dict[str, str]:
             continue
         rendered[normalized_key] = normalized_value
     return rendered
+
+
+def _request_input_key(request_input: dict[str, Any] | None) -> str:
+    """Stable, content-based fingerprint for a request input context."""
+    if request_input is None:
+        return "__none__"
+    return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
+
+
+def _raw_page_path(
+    pagination_state: Any,
+    suffix: str,
+    *,
+    request_input_index: int,
+    request_input_count: int,
+) -> Path:
+    """Return the relative raw artifact path for a paginated response."""
+    if pagination_state.page_number is not None:
+        filename = f"page-{pagination_state.page_number:04d}{suffix}"
+    elif pagination_state.offset is not None:
+        filename = f"offset-{pagination_state.offset:08d}{suffix}"
+    elif pagination_state.cursor is not None:
+        filename = f"cursor-{pagination_state.request_index:04d}{suffix}"
+    else:
+        filename = f"response-{pagination_state.request_index:04d}{suffix}"
+    if request_input_count > 1:
+        return Path(f"request-input-{request_input_index:06d}") / filename
+    return Path("pages") / filename
 
 
 def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:

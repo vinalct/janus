@@ -187,6 +187,23 @@ def build_paginator(config: PaginationConfig) -> ApiPaginator:
     raise ValueError(f"Unsupported pagination type: {config.type}")
 
 
+def _resume_pagination_state(
+    paginator: Any,
+    pagination_state: PaginationState,
+    progress: dict[str, Any],
+) -> PaginationState:
+    """Return a pagination state that resumes after the last recorded page."""
+    last_page = progress.get("last_page_number")
+    if last_page is not None:
+        return PaginationState(request_index=1, page_number=last_page + 1)
+
+    last_offset = progress.get("last_offset")
+    if last_offset is not None and isinstance(paginator, OffsetPaginator):
+        return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
+
+    return pagination_state
+
+
 def default_cursor_from_payload(payload: Any) -> str | None:
     if isinstance(payload, dict):
         for key in _CURSOR_HINT_KEYS:

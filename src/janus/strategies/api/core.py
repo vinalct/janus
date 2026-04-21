@@ -37,6 +37,8 @@ from janus.strategies.common import (
     _format_datetime,
     _freeze_string_mapping,
     _parse_datetime,
+    _raw_page_path,
+    _request_input_key,
     _retry_delay_seconds,
     _stringify_mapping,
 )
@@ -58,6 +60,7 @@ from .pagination import (
     OffsetPaginator,
     PageNumberPaginator,
     PaginationState,
+    _resume_pagination_state,
     build_paginator,
 )
 from .request_inputs import (
@@ -1297,18 +1300,12 @@ def _raw_relative_path(
     request_input_index: int,
     request_input_count: int,
 ) -> Path:
-    suffix = RAW_FILE_SUFFIXES[raw_format]
-    if pagination_state.page_number is not None:
-        filename = f"page-{pagination_state.page_number:04d}{suffix}"
-    elif pagination_state.offset is not None:
-        filename = f"offset-{pagination_state.offset:08d}{suffix}"
-    elif pagination_state.cursor is not None:
-        filename = f"cursor-{pagination_state.request_index:04d}{suffix}"
-    else:
-        filename = f"response-{pagination_state.request_index:04d}{suffix}"
-    if request_input_count > 1:
-        return Path(f"request-input-{request_input_index:06d}") / filename
-    return Path("pages") / filename
+    return _raw_page_path(
+        pagination_state,
+        RAW_FILE_SUFFIXES[raw_format],
+        request_input_index=request_input_index,
+        request_input_count=request_input_count,
+    )
 
 
 def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> dict[str, str]:
@@ -1354,12 +1351,6 @@ def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> di
     return metadata
 
 
-def _request_input_key(request_input: dict[str, Any] | None) -> str:
-    """Stable, content-based fingerprint for a request input context."""
-    if request_input is None:
-        return "__none__"
-    return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
-
 
 def _request_input_dead_letter_metadata(
     *,
@@ -1387,21 +1378,6 @@ def _request_input_field_names(
     return tuple(sorted(str(field_name) for field_name in request_input))
 
 
-def _resume_pagination_state(
-    paginator: Any,
-    pagination_state: PaginationState,
-    progress: dict[str, Any],
-) -> PaginationState:
-    """Return a pagination state that resumes after the last recorded page."""
-    last_page = progress.get("last_page_number")
-    if last_page is not None:
-        return PaginationState(request_index=1, page_number=last_page + 1)
-
-    last_offset = progress.get("last_offset")
-    if last_offset is not None and isinstance(paginator, OffsetPaginator):
-        return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
-
-    return pagination_state
 
 
 def _pages_dir(
