@@ -4,6 +4,8 @@ from janus.strategies.catalog.core import (
     CatalogResponseError,
     CatalogStrategy,
     CatalogStrategyError,
+)
+from janus.strategies.catalog.document import (
     NodeClassification,
     classify_catalog_node,
 )
