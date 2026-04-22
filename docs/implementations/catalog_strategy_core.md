@@ -10,7 +10,8 @@ The result is not a `dados.gov.br` integration yet. It is the generic execution 
 
 ## What was added
 
-- `src/janus/strategies/catalog/core.py` now implements the `CatalogStrategy` itself, plus the catalog-specific hook points and helper objects used for traversal, entity extraction, checkpoint-aware metadata collection, and normalization handoff.
+- `src/janus/strategies/catalog/core.py` now implements the `CatalogStrategy` itself, plus the catalog-specific hook points and orchestration used for request execution, checkpoint-aware metadata collection, raw persistence, and normalization handoff.
+- `src/janus/strategies/catalog/document.py` contains the pure catalog document traversal, entity classification, entity batching, generic node and edge shaping, payload hashing, and parse-summary helpers.
 - `src/janus/strategies/catalog/__init__.py` now exposes the catalog strategy package surface for downstream imports.
 - `src/janus/planner/core.py` now resolves catalog variants to the real `CatalogStrategy` in the default strategy catalog.
 - `tests/unit/strategies/catalog/test_catalog_strategy.py` now covers the main runtime behaviors introduced in this step.
@@ -75,6 +76,14 @@ From there it keeps walking nested catalog structures. For example:
 - dataset records can contain one or more resources.
 
 The strategy collects each of those entity types separately and keeps the parent-child links needed for lineage-friendly metadata. A resource record, for example, keeps the dataset identity that led to it.
+
+## Document helper boundary
+
+Catalog document traversal now lives in `janus.strategies.catalog.document`.
+
+That module is deliberately side-effect free. It walks arbitrary JSON-like catalog payloads, recognizes common organization, group, dataset, and resource shapes, classifies generic catalog nodes, builds lineage-friendly document nodes and edges, hashes payload fragments, and reports parse quality metrics. It does not send requests, read checkpoints, write raw files, touch Spark, or record dead letters.
+
+`catalog.core` remains the orchestration layer around those pure helpers. It owns HTTP execution, retry and throttling behavior, request inputs and parameter bindings, checkpoint and dead-letter state, raw page persistence, JSONL handoff writing, and metadata emission.
 
 ## Metadata normalization
 
