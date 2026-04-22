@@ -289,7 +289,9 @@ class FileStrategy(BaseStrategy):
         loaded_file_count = 0
         checkpoint_value: str | None = None
         resolved_versions: list[str] = []
-        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_keys = (
+            set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        )
         dead_letter_skip_count = 0
 
         with ApiClient(self.transport_factory()) as client:
@@ -384,7 +386,13 @@ class FileStrategy(BaseStrategy):
                             fallback=plan.source_config.access.format,
                         ),
                     )
-                    version = self._resolve_version(plan, resolved_file, payload, response, file_hook)
+                    version = self._resolve_version(
+                        plan,
+                        resolved_file,
+                        payload,
+                        response,
+                        file_hook,
+                    )
 
                     if _should_skip_for_checkpoint(plan, checkpoint_state, version):
                         skipped_file_count += 1
@@ -415,7 +423,8 @@ class FileStrategy(BaseStrategy):
                         if actual_checksum.lower() != expected_checksum.lower():
                             raise FileIntegrityError(
                                 f"Checksum mismatch for {resolved_filename!r}: "
-                                f"expected {expected_checksum.lower()} got {actual_checksum.lower()}"
+                                f"expected {expected_checksum.lower()} got "
+                                f"{actual_checksum.lower()}"
                             )
                         candidate_checksum_verified_count += 1
 
@@ -863,7 +872,7 @@ class FileStrategy(BaseStrategy):
 
         if last_error is not None:
             raise FileDownloadError(str(last_error)) from last_error
-        raise AssertionError("Retry loop exited without a response or error")
+        raise FileDownloadError("Retry loop exited without a response or error")
 
     def _sleep_for_retry(
         self,
@@ -1111,7 +1120,7 @@ def _is_archive_file(
     if _is_tarball_filename(discovered_file.filename):
         try:
             return tarfile.is_tarfile(BytesIO(payload))
-        except Exception:
+        except (OSError, tarfile.TarError):
             return False
     suffix = Path(discovered_file.filename).suffix.lower()
     return suffix in ARCHIVE_FILE_SUFFIXES and zipfile.is_zipfile(BytesIO(payload))
@@ -1235,5 +1244,3 @@ def _discovered_file_dead_letter_metadata(
         "source_location": _redacted_location(discovered_file),
         "filename": discovered_file.filename,
     }
-
-

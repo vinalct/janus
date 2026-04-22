@@ -816,7 +816,7 @@ class CatalogStrategy(BaseStrategy):
 
         if last_transport_error is not None:
             raise CatalogStrategyError(str(last_transport_error)) from last_transport_error
-        raise AssertionError("Retry loop exited without a response or error")
+        raise CatalogStrategyError("Retry loop exited without a response or error")
 
     def _sleep_for_retry(
         self,

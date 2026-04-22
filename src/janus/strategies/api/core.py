@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
@@ -355,7 +355,9 @@ class ApiStrategy(BaseStrategy):
         )
 
         completed_inputs: list[tuple[str, int]] = list(completed_by_key.items())
-        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_keys = (
+            set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        )
         dead_letter_skip_count = 0
 
         for request_input_index, request_input in enumerate(request_inputs, start=1):
@@ -994,7 +996,7 @@ class ApiStrategy(BaseStrategy):
 
         if last_transport_error is not None:
             raise ApiStrategyError(str(last_transport_error)) from last_transport_error
-        raise AssertionError("Retry loop exited without a response or error")
+        raise ApiStrategyError("Retry loop exited without a response or error")
 
     def _process_response(
         self,
@@ -1515,5 +1517,3 @@ def _string_value(value: Any) -> str | None:
     if not rendered:
         return None
     return rendered
-
-

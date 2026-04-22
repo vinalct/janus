@@ -8,24 +8,32 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from janus.models import ExecutionPlan, RunContext, SourceConfig
-from janus.strategies.api import ApiRequest, ApiResponse
+from janus.strategies.api import (
+    ApiRequest,
+    ApiResponse,
+    ApiTransportError,
+    UrllibApiTransport,
+)
 from janus.strategies.api.core import (
     _raw_relative_path,
     _request_input_key,
 )
-from janus.strategies.api.pagination import PaginationState
+from janus.strategies.api.pagination import (
+    OffsetPaginator,
+    PageNumberPaginator,
+    PaginationState,
+    _resume_pagination_state,
+)
 from janus.strategies.common import (
     _compare_checkpoint_values,
     _freeze_string_mapping,
     _retry_delay_seconds,
     _stringify_mapping,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,7 +67,12 @@ def _build_plan(
                 "format": "json",
                 "timeout_seconds": 30,
                 "auth": {"type": "none"},
-                "pagination": {"type": "page_number", "page_param": "page", "size_param": "size", "page_size": 100},
+                "pagination": {
+                    "type": "page_number",
+                    "page_param": "page",
+                    "size_param": "size",
+                    "page_size": 100,
+                },
                 "rate_limit": {
                     "requests_per_minute": 10,
                     "concurrency": 1,
@@ -112,7 +125,12 @@ def _make_response(retry_after: str | None = None) -> ApiResponse:
 
 
 def test_retry_delay_fixed_backoff_returns_same_delay_for_all_attempts(tmp_path):
-    plan = _build_plan(tmp_path, retry_backoff_strategy="fixed", retry_backoff_seconds=2, retry_max_attempts=5)
+    plan = _build_plan(
+        tmp_path,
+        retry_backoff_strategy="fixed",
+        retry_backoff_seconds=2,
+        retry_max_attempts=5,
+    )
 
     delays = [_retry_delay_seconds(plan, attempt, None) for attempt in range(1, 5)]
 
@@ -125,7 +143,12 @@ def test_retry_delay_fixed_backoff_returns_same_delay_for_all_attempts(tmp_path)
 
 
 def test_retry_delay_exponential_backoff_doubles_on_each_attempt(tmp_path):
-    plan = _build_plan(tmp_path, retry_backoff_strategy="exponential", retry_backoff_seconds=2, retry_max_attempts=5)
+    plan = _build_plan(
+        tmp_path,
+        retry_backoff_strategy="exponential",
+        retry_backoff_seconds=2,
+        retry_max_attempts=5,
+    )
 
     assert _retry_delay_seconds(plan, 1, None) == 2.0
     assert _retry_delay_seconds(plan, 2, None) == 4.0
@@ -151,7 +174,12 @@ def test_retry_delay_exponential_is_capped_by_rate_limit_backoff(tmp_path):
 
 
 def test_retry_delay_valid_retry_after_extends_delay(tmp_path):
-    plan = _build_plan(tmp_path, retry_backoff_strategy="fixed", retry_backoff_seconds=1, rate_limit_backoff_seconds=60)
+    plan = _build_plan(
+        tmp_path,
+        retry_backoff_strategy="fixed",
+        retry_backoff_seconds=1,
+        rate_limit_backoff_seconds=60,
+    )
     response = _make_response(retry_after="30")
 
     delay = _retry_delay_seconds(plan, 1, response)
@@ -160,7 +188,12 @@ def test_retry_delay_valid_retry_after_extends_delay(tmp_path):
 
 
 def test_retry_delay_invalid_retry_after_is_ignored(tmp_path):
-    plan = _build_plan(tmp_path, retry_backoff_strategy="fixed", retry_backoff_seconds=2, rate_limit_backoff_seconds=60)
+    plan = _build_plan(
+        tmp_path,
+        retry_backoff_strategy="fixed",
+        retry_backoff_seconds=2,
+        rate_limit_backoff_seconds=60,
+    )
     response = _make_response(retry_after="not-a-number")
 
     delay = _retry_delay_seconds(plan, 1, response)
@@ -240,7 +273,9 @@ def test_compare_checkpoint_values_mixed_types_fall_back_to_string(tmp_path):
     # "2026-04-10T12:00:00Z" is a datetime; "not-a-date" is text.
     # Types differ → string comparison is used.
     result = _compare_checkpoint_values("2026-04-10T12:00:00Z", "not-a-date")
-    assert result == ("2026-04-10T12:00:00Z" > "not-a-date") - ("2026-04-10T12:00:00Z" < "not-a-date")
+    assert result == ("2026-04-10T12:00:00Z" > "not-a-date") - (
+        "2026-04-10T12:00:00Z" < "not-a-date"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +369,44 @@ def test_api_request_with_params_merges_onto_existing_params():
     )
     updated = req.with_params({"new": "also"})
     assert updated.params_as_dict() == {"existing": "yes", "new": "also"}
+
+
+def test_urllib_transport_raises_explicit_error_when_opener_is_missing():
+    class BrokenTransport(UrllibApiTransport):
+        def open(self) -> None:
+            self.opener = None
+
+    req = ApiRequest(method="GET", url="https://example.invalid/", timeout_seconds=30)
+
+    with pytest.raises(ApiTransportError, match="failed to initialize urllib opener"):
+        BrokenTransport().send(req)
+
+
+def test_page_number_paginator_rejects_offset_state():
+    req = ApiRequest(method="GET", url="https://example.invalid/", timeout_seconds=30)
+    paginator = PageNumberPaginator(page_param="page", size_param="size", page_size=100)
+
+    with pytest.raises(ValueError, match="requires PaginationState.page_number"):
+        paginator.apply(req, PaginationState(request_index=1, offset=0))
+
+
+def test_offset_paginator_rejects_page_number_state():
+    req = ApiRequest(method="GET", url="https://example.invalid/", timeout_seconds=30)
+    paginator = OffsetPaginator(offset_param="offset", limit_param="limit", page_size=100)
+
+    with pytest.raises(ValueError, match="requires PaginationState.offset"):
+        paginator.apply(req, PaginationState(request_index=1, page_number=1))
+
+
+def test_resume_pagination_rejects_mismatched_progress_state():
+    paginator = OffsetPaginator(offset_param="offset", limit_param="limit", page_size=100)
+
+    with pytest.raises(ValueError, match="last_page_number"):
+        _resume_pagination_state(
+            paginator,
+            PaginationState(request_index=1, offset=0),
+            {"last_page_number": 3},
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -65,10 +65,10 @@ class PageNumberPaginator(ApiPaginator):
         return PaginationState(request_index=1, page_number=start_page)
 
     def apply(self, request: ApiRequest, state: PaginationState) -> ApiRequest:
-        assert state.page_number is not None
+        page_number = _require_page_number(state, self.pagination_type)
         return request.with_params(
             {
-                self.page_param: str(state.page_number),
+                self.page_param: str(page_number),
                 self.size_param: str(self.page_size),
             }
         )
@@ -85,10 +85,10 @@ class PageNumberPaginator(ApiPaginator):
         del next_cursor
         if records_extracted == 0 or records_extracted < self.page_size:
             return None
-        assert state.page_number is not None
+        page_number = _require_page_number(state, self.pagination_type)
         return PaginationState(
             request_index=state.request_index + 1,
-            page_number=state.page_number + 1,
+            page_number=page_number + 1,
         )
 
 
@@ -104,10 +104,10 @@ class OffsetPaginator(ApiPaginator):
         return PaginationState(request_index=1, offset=start_offset)
 
     def apply(self, request: ApiRequest, state: PaginationState) -> ApiRequest:
-        assert state.offset is not None
+        offset = _require_offset(state, self.pagination_type)
         return request.with_params(
             {
-                self.offset_param: str(state.offset),
+                self.offset_param: str(offset),
                 self.limit_param: str(self.page_size),
             }
         )
@@ -124,10 +124,10 @@ class OffsetPaginator(ApiPaginator):
         del next_cursor
         if records_extracted == 0 or records_extracted < self.page_size:
             return None
-        assert state.offset is not None
+        offset = _require_offset(state, self.pagination_type)
         return PaginationState(
             request_index=state.request_index + 1,
-            offset=state.offset + self.page_size,
+            offset=offset + self.page_size,
         )
 
 
@@ -195,13 +195,37 @@ def _resume_pagination_state(
     """Return a pagination state that resumes after the last recorded page."""
     last_page = progress.get("last_page_number")
     if last_page is not None:
+        if not isinstance(paginator, PageNumberPaginator):
+            raise ValueError(
+                "Cannot resume pagination from last_page_number with "
+                f"{type(paginator).__name__}"
+            )
         return PaginationState(request_index=1, page_number=last_page + 1)
 
     last_offset = progress.get("last_offset")
-    if last_offset is not None and isinstance(paginator, OffsetPaginator):
+    if last_offset is not None:
+        if not isinstance(paginator, OffsetPaginator):
+            raise ValueError(
+                "Cannot resume pagination from last_offset with "
+                f"{type(paginator).__name__}"
+            )
         return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
 
     return pagination_state
+
+
+def _require_page_number(state: PaginationState, pagination_type: str) -> int:
+    if state.page_number is None:
+        raise ValueError(
+            f"{pagination_type} pagination requires PaginationState.page_number"
+        )
+    return state.page_number
+
+
+def _require_offset(state: PaginationState, pagination_type: str) -> int:
+    if state.offset is None:
+        raise ValueError(f"{pagination_type} pagination requires PaginationState.offset")
+    return state.offset
 
 
 def default_cursor_from_payload(payload: Any) -> str | None:

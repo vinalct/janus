@@ -15,6 +15,7 @@ from urllib.request import HTTPSHandler, OpenerDirector, Request, build_opener
 
 from janus.models import AuthConfig
 from janus.strategies.common import _freeze_string_mapping, _stringify_mapping
+from janus.utils.logging import redact_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +129,8 @@ class UrllibApiTransport:
 
     def send(self, request: ApiRequest) -> ApiResponse:
         self.open()
-        assert self.opener is not None
+        if self.opener is None:
+            raise ApiTransportError("API transport failed to initialize urllib opener")
 
         urllib_request = Request(
             request.full_url(),
@@ -155,7 +157,8 @@ class UrllibApiTransport:
             )
         except (URLError, OSError) as exc:
             raise ApiTransportError(
-                f"Request failed for {request.full_url()!r}: {exc}"
+                f"Request failed for {redact_url(request.full_url())!r}: "
+                f"{type(exc).__name__}"
             ) from exc
 
 
@@ -291,5 +294,4 @@ def _render_token(prefix: str | None, token: str) -> str:
     if not normalized_prefix:
         return token
     return f"{normalized_prefix} {token}"
-
 
