@@ -1164,7 +1164,7 @@ def _normalize_catalog_record(
         "catalog_cursor": pagination_state.cursor,
         "catalog_received_at": response.received_at.isoformat(),
         "catalog_raw_artifact_path": raw_artifact.path,
-        "payload": dict(record),
+        "payload": json.dumps(dict(record), sort_keys=True, ensure_ascii=False),
     }
 
 def _upsert_entity_record(

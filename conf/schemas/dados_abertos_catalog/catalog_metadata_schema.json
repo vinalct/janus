@@ -93,7 +93,7 @@
     },
     {
       "name": "payload",
-      "type": "struct",
+      "type": "string",
       "nullable": true,
       "metadata": {}
     }
