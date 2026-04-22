@@ -12,14 +12,14 @@ from xml.etree import ElementTree
 
 from janus.strategies.api import ApiRequest, ApiTransport
 from janus.strategies.files.core import DiscoveredFile
-
-DIRECT_FILE_EXTENSIONS = frozenset({
-    ".csv", ".json", ".jsonl", ".ndjson", ".parquet",
-    ".zip", ".tar.gz", ".tgz", ".txt", ".tsv", ".xlsx", ".xls", ".pdf", ".xml",
-})
+from janus.strategies.files.formats import (
+    DIRECT_FILE_EXTENSIONS,
+    _filename_from_content_disposition,
+    _filename_from_url,
+    _infer_format_name,
+)
 
 _NEXTCLOUD_SHARE_PATTERN = re.compile(r"/index\.php/s/([^/?#]+)")
-
 _CONTENT_TYPE_FORMAT_MAP: dict[str, str] = {
     "text/csv": "csv",
     "application/json": "json",
@@ -29,10 +29,6 @@ _CONTENT_TYPE_FORMAT_MAP: dict[str, str] = {
     "application/zip": "binary",
     "application/x-zip-compressed": "binary",
 }
-
-_CONTENT_DISPOSITION_FILENAME_RE = re.compile(
-    r"""filename\*?=(?:UTF-8''|")?(?P<filename>[^";]+)"""
-)
 
 _DAV_NS = "DAV:"
 _NEXTCLOUD_WEBDAV_PREFIX = "/public.php/webdav/"
@@ -232,39 +228,6 @@ class _DirectPassthroughResolver:
         return (DiscoveredFile(source_kind="remote", location=url, filename=filename, format=fmt),)
 
 
-def _filename_from_url(url: str) -> str:
-    path = urlsplit(url).path
-    candidate = Path(unquote(path)).name.strip()
-    return candidate or "download.bin"
-
-
-def _infer_format_name(value: str, *, fallback: str) -> str:
-    lower = value.lower()
-    if lower.endswith(".tar.gz") or lower.endswith(".tgz"):
-        return "binary"
-    suffix = Path(value).suffix.lower()
-    if suffix == ".csv":
-        return "csv"
-    if suffix == ".json":
-        return "json"
-    if suffix in {".jsonl", ".ndjson"}:
-        return "jsonl"
-    if suffix == ".parquet":
-        return "parquet"
-    if suffix in {".txt", ".tsv"}:
-        return "text"
-    if suffix in {".zip", ".xlsx", ".xls"}:
-        return "binary"
-    normalized = fallback.strip().lower()
-    return normalized if normalized else "binary"
-
-
-def _filename_from_content_disposition(header: str) -> str | None:
-    match = _CONTENT_DISPOSITION_FILENAME_RE.search(header)
-    if not match:
-        return None
-    name = unquote(match.group("filename").strip())
-    return Path(name).name.strip() or None
 
 
 def _format_from_content_type(content_type: str) -> str | None:

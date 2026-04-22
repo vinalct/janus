@@ -1,9 +1,4 @@
-"""
-Characterization tests for private helpers in janus.strategies.files.core.
-
-These tests lock in current behavior before the helpers are extracted into
-strategies/common.py and files/formats.py.
-"""
+"""Characterization tests for file-strategy helpers in core and formats modules."""
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -18,7 +13,13 @@ from janus.strategies.common import (
     _compare_checkpoint_values,
     _retry_delay_seconds,
 )
-from janus.strategies.files.core import _infer_format_name
+from janus.strategies.files.formats import (
+    _filename_from_content_disposition,
+    _filename_from_url,
+    _infer_format_name,
+    _is_tarball_filename,
+    _safe_path_segment,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -241,3 +242,91 @@ def test_infer_format_name_tar_gz_is_detected_as_binary_before_suffix_check():
 
 def test_infer_format_name_tgz_is_detected_as_binary():
     assert _infer_format_name("data.tgz", fallback="csv") == "binary"
+
+
+def test_infer_format_name_xls_is_binary():
+    assert _infer_format_name("data.xls", fallback="binary") == "binary"
+
+
+# ---------------------------------------------------------------------------
+# _is_tarball_filename
+# ---------------------------------------------------------------------------
+
+
+def test_is_tarball_filename_tar_gz():
+    assert _is_tarball_filename("archive.tar.gz") is True
+
+
+def test_is_tarball_filename_tgz():
+    assert _is_tarball_filename("bundle.tgz") is True
+
+
+def test_is_tarball_filename_zip():
+    assert _is_tarball_filename("file.zip") is False
+
+
+def test_is_tarball_filename_case_insensitive():
+    assert _is_tarball_filename("DATA.TAR.GZ") is True
+
+
+# ---------------------------------------------------------------------------
+# _filename_from_url
+# ---------------------------------------------------------------------------
+
+
+def test_filename_from_url_simple_path():
+    assert _filename_from_url("https://example.gov.br/data/report.csv") == "report.csv"
+
+
+def test_filename_from_url_encoded_chars():
+    assert _filename_from_url("https://example.gov.br/files/my%20file.zip") == "my file.zip"
+
+
+def test_filename_from_url_no_path_returns_fallback():
+    assert _filename_from_url("https://example.gov.br/") == "download.bin"
+
+
+def test_filename_from_url_strips_query_string():
+    assert _filename_from_url("https://example.gov.br/data.csv?v=1") == "data.csv"
+
+
+# ---------------------------------------------------------------------------
+# _filename_from_content_disposition
+# ---------------------------------------------------------------------------
+
+
+def test_filename_from_content_disposition_plain():
+    assert _filename_from_content_disposition('attachment; filename="report.csv"') == "report.csv"
+
+
+def test_filename_from_content_disposition_encoded():
+    assert _filename_from_content_disposition("attachment; filename*=UTF-8''report%202026.csv") == "report 2026.csv"
+
+
+def test_filename_from_content_disposition_no_match():
+    assert _filename_from_content_disposition("attachment") is None
+
+
+def test_filename_from_content_disposition_empty_name():
+    assert _filename_from_content_disposition('attachment; filename=""') is None
+
+
+# ---------------------------------------------------------------------------
+# _safe_path_segment
+# ---------------------------------------------------------------------------
+
+
+def test_safe_path_segment_clean_value():
+    assert _safe_path_segment("2026-04-10") == "2026-04-10"
+
+
+def test_safe_path_segment_replaces_unsafe_chars():
+    assert _safe_path_segment("hello world!") == "hello-world"
+
+
+def test_safe_path_segment_empty_becomes_current():
+    assert _safe_path_segment("") == "current"
+
+
+def test_safe_path_segment_only_unsafe_chars_becomes_current():
+    assert _safe_path_segment("!!!") == "current"

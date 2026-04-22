@@ -15,7 +15,6 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import unquote, urlsplit
 
 from janus.checkpoints import (
     CheckpointState,
@@ -49,20 +48,23 @@ from janus.strategies.common import (
     _parse_datetime,
     _retry_delay_seconds,
 )
+from janus.strategies.files.formats import (
+    ARCHIVE_FILE_SUFFIXES,
+    SUPPORTED_FILE_INPUT_FORMATS,
+    _filename_from_content_disposition,
+    _filename_from_url,
+    _infer_format_name,
+    _is_tarball_filename,
+    _safe_path_segment,
+)
 from janus.utils.environment import resolve_project_path
 from janus.utils.logging import StructuredLogger, redact_url
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-SUPPORTED_FILE_INPUT_FORMATS = frozenset({"binary", "csv", "json", "jsonl", "parquet", "text"})
-ARCHIVE_FILE_SUFFIXES = frozenset({".zip"})
 CHECKSUM_HEADER_CANDIDATES = ("x-checksum-sha256", "x-amz-checksum-sha256")
-CONTENT_DISPOSITION_FILENAME_PATTERN = re.compile(
-    r'''filename\*?=(?:UTF-8''|")?(?P<filename>[^";]+)'''
-)
 VERSION_TOKEN_PATTERN = re.compile(r"(\d{4}(?:[-_]\d{2}(?:[-_]\d{2})?)?)")
-SANITIZE_SEGMENT_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class FileStrategyError(RuntimeError):
@@ -1045,11 +1047,6 @@ def _safe_filename(value: str) -> str:
     return filename
 
 
-def _safe_path_segment(value: str) -> str:
-    normalized = SANITIZE_SEGMENT_PATTERN.sub("-", value.strip()).strip("-.")
-    return normalized or "current"
-
-
 def _archive_member_payloads(payload: bytes, filename: str = "") -> dict[str, bytes]:
     if _is_tarball_filename(filename):
         return _tarball_member_payloads(payload)
@@ -1104,11 +1101,6 @@ def _filter_members(
     return _filter_discovered_files(members, file_pattern)
 
 
-def _is_tarball_filename(filename: str) -> bool:
-    lower = filename.lower()
-    return lower.endswith(".tar.gz") or lower.endswith(".tgz")
-
-
 def _is_archive_file(
     plan: ExecutionPlan,
     discovered_file: DiscoveredFile,
@@ -1131,9 +1123,9 @@ def _resolved_filename(filename: str, response: ApiResponse | None) -> str:
 
     content_disposition = response.headers_as_dict().get("Content-Disposition")
     if isinstance(content_disposition, str):
-        match = CONTENT_DISPOSITION_FILENAME_PATTERN.search(content_disposition)
-        if match is not None:
-            return _safe_filename(unquote(match.group("filename").strip()))
+        cd_name = _filename_from_content_disposition(content_disposition)
+        if cd_name is not None:
+            return _safe_filename(cd_name)
     return _safe_filename(filename)
 
 
@@ -1165,41 +1157,11 @@ def _validate_remote_payload(
         )
 
 
-def _filename_from_url(url: str) -> str:
-    path = urlsplit(url).path
-    candidate = Path(unquote(path)).name.strip()
-    return candidate or "download.bin"
-
-
 def _infer_handoff_format(discovered_file: DiscoveredFile, *, fallback: str) -> str:
     format_name = _infer_format_name(discovered_file.filename, fallback=fallback)
     if format_name == "binary" and fallback in SUPPORTED_FILE_INPUT_FORMATS:
         return fallback
     return format_name
-
-
-def _infer_format_name(value: str, *, fallback: str) -> str:
-    if _is_tarball_filename(value):
-        return "binary"
-    suffix = Path(value).suffix.lower()
-    if suffix == ".csv":
-        return "csv"
-    if suffix == ".json":
-        return "json"
-    if suffix in {".jsonl", ".ndjson"}:
-        return "jsonl"
-    if suffix == ".parquet":
-        return "parquet"
-    if suffix in {".txt", ".tsv"}:
-        return "text"
-    if suffix in ARCHIVE_FILE_SUFFIXES:
-        return "binary"
-    if suffix == ".xlsx":
-        return "binary"
-    normalized_fallback = fallback.strip().lower()
-    if normalized_fallback in SUPPORTED_FILE_INPUT_FORMATS:
-        return normalized_fallback
-    return "binary"
 
 
 def _default_discovered_version(
