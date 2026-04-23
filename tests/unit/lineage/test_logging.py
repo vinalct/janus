@@ -2,7 +2,12 @@ import json
 from io import StringIO
 from urllib.parse import parse_qs, urlsplit
 
-from janus.utils.logging import REDACTED_VALUE, build_structured_logger, sanitize_log_payload
+from janus.utils.logging import (
+    REDACTED_VALUE,
+    build_structured_logger,
+    redact_url,
+    sanitize_log_payload,
+)
 
 
 def test_sanitize_log_payload_redacts_tokens_headers_and_cookies():
@@ -50,3 +55,13 @@ def test_structured_logger_emits_redacted_json_lines():
     query = parse_qs(urlsplit(payload["fields"]["url"]).query)
     assert query["api_key"] == [REDACTED_VALUE]
     assert query["page"] == ["2"]
+
+
+def test_redact_url_masks_nextcloud_share_tokens_in_paths():
+    share_url = "https://example.gov.br/index.php/s/MYTOKEN99?download=1"
+    dav_url = "https://example.gov.br/public.php/dav/files/MYTOKEN99/data.csv"
+
+    assert "MYTOKEN99" not in redact_url(share_url)
+    assert "MYTOKEN99" not in redact_url(dav_url)
+    assert REDACTED_VALUE in redact_url(share_url)
+    assert REDACTED_VALUE in redact_url(dav_url)

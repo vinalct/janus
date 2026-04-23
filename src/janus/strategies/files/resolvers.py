@@ -1,25 +1,33 @@
 from __future__ import annotations
 
 import base64
+import logging
 import re
 from collections.abc import Sequence
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol
+from urllib.error import URLError
 from urllib.parse import quote, unquote, urljoin, urlsplit
 from xml.etree import ElementTree
 
-from janus.strategies.api import ApiRequest, ApiTransport
+from janus.strategies.api import (
+    ApiRequest,
+    ApiTransport,
+    ApiTransportError,
+    AuthResolutionError,
+)
 from janus.strategies.files.core import DiscoveredFile
-
-DIRECT_FILE_EXTENSIONS = frozenset({
-    ".csv", ".json", ".jsonl", ".ndjson", ".parquet",
-    ".zip", ".tar.gz", ".tgz", ".txt", ".tsv", ".xlsx", ".xls", ".pdf", ".xml",
-})
+from janus.strategies.files.formats import (
+    DIRECT_FILE_EXTENSIONS,
+    _filename_from_content_disposition,
+    _filename_from_url,
+    _infer_format_name,
+)
+from janus.utils.logging import redact_url
 
 _NEXTCLOUD_SHARE_PATTERN = re.compile(r"/index\.php/s/([^/?#]+)")
-
 _CONTENT_TYPE_FORMAT_MAP: dict[str, str] = {
     "text/csv": "csv",
     "application/json": "json",
@@ -30,13 +38,11 @@ _CONTENT_TYPE_FORMAT_MAP: dict[str, str] = {
     "application/x-zip-compressed": "binary",
 }
 
-_CONTENT_DISPOSITION_FILENAME_RE = re.compile(
-    r"""filename\*?=(?:UTF-8''|")?(?P<filename>[^";]+)"""
-)
-
 _DAV_NS = "DAV:"
 _NEXTCLOUD_WEBDAV_PREFIX = "/public.php/webdav/"
 _NEXTCLOUD_RECURSIVE_DEPTH = "infinity"
+_LOGGER = logging.getLogger(__name__)
+_TRANSPORT_EXCEPTIONS = (ApiTransportError, AuthResolutionError, URLError, OSError)
 
 
 class LinkResolver(Protocol):
@@ -76,18 +82,28 @@ class RedirectResolver:
         request = ApiRequest(method="HEAD", url=url, timeout_seconds=30)
         try:
             response = transport.send(request)
-        except Exception:
+        except _TRANSPORT_EXCEPTIONS as exc:
+            _log_resolver_diagnostic(self, url, "transport_error", error=exc)
             return ()
 
         if not (200 <= response.status_code < 400):
+            _log_resolver_diagnostic(
+                self,
+                url,
+                "http_status",
+                status_code=response.status_code,
+            )
             return ()
 
         content_type = response.headers_as_dict().get("Content-Type", "")
         if "text/html" in content_type:
+            _log_resolver_diagnostic(self, url, "html_content_type")
             return ()
 
         content_disposition = response.headers_as_dict().get("Content-Disposition", "")
-        filename = _filename_from_content_disposition(content_disposition) or _filename_from_url(url)
+        filename = _filename_from_content_disposition(
+            content_disposition
+        ) or _filename_from_url(url)
         # Prefer filename-based format; only fall back to content-type for non-binary types
         filename_fmt = _infer_format_name(filename, fallback="")
         content_type_fmt = _format_from_content_type(content_type)
@@ -137,13 +153,23 @@ class NextcloudWebDavResolver:
         )
         try:
             response = transport.send(request)
-        except Exception:
+        except _TRANSPORT_EXCEPTIONS as exc:
+            _log_resolver_diagnostic(self, url, "transport_error", error=exc)
             return ()
 
         if response.status_code not in {200, 207}:
+            _log_resolver_diagnostic(
+                self,
+                url,
+                "http_status",
+                status_code=response.status_code,
+            )
             return ()
 
-        return tuple(_parse_propfind_response(response.body, base, token, formato))
+        files = tuple(_parse_propfind_response(response.body, base, token, formato))
+        if not files:
+            _log_resolver_diagnostic(self, url, "no_files_found")
+        return files
 
 
 class HtmlLinkResolver:
@@ -158,15 +184,23 @@ class HtmlLinkResolver:
         request = ApiRequest(method="GET", url=url, timeout_seconds=60)
         try:
             response = transport.send(request)
-        except Exception:
+        except _TRANSPORT_EXCEPTIONS as exc:
+            _log_resolver_diagnostic(self, url, "transport_error", error=exc)
             return ()
 
         if not (200 <= response.status_code < 400):
+            _log_resolver_diagnostic(
+                self,
+                url,
+                "http_status",
+                status_code=response.status_code,
+            )
             return ()
 
         try:
             html = response.body.decode("utf-8", errors="replace")
-        except Exception:
+        except AttributeError as exc:
+            _log_resolver_diagnostic(self, url, "payload_decode_error", error=exc)
             return ()
 
         files = []
@@ -232,44 +266,30 @@ class _DirectPassthroughResolver:
         return (DiscoveredFile(source_kind="remote", location=url, filename=filename, format=fmt),)
 
 
-def _filename_from_url(url: str) -> str:
-    path = urlsplit(url).path
-    candidate = Path(unquote(path)).name.strip()
-    return candidate or "download.bin"
-
-
-def _infer_format_name(value: str, *, fallback: str) -> str:
-    lower = value.lower()
-    if lower.endswith(".tar.gz") or lower.endswith(".tgz"):
-        return "binary"
-    suffix = Path(value).suffix.lower()
-    if suffix == ".csv":
-        return "csv"
-    if suffix == ".json":
-        return "json"
-    if suffix in {".jsonl", ".ndjson"}:
-        return "jsonl"
-    if suffix == ".parquet":
-        return "parquet"
-    if suffix in {".txt", ".tsv"}:
-        return "text"
-    if suffix in {".zip", ".xlsx", ".xls"}:
-        return "binary"
-    normalized = fallback.strip().lower()
-    return normalized if normalized else "binary"
-
-
-def _filename_from_content_disposition(header: str) -> str | None:
-    match = _CONTENT_DISPOSITION_FILENAME_RE.search(header)
-    if not match:
-        return None
-    name = unquote(match.group("filename").strip())
-    return Path(name).name.strip() or None
 
 
 def _format_from_content_type(content_type: str) -> str | None:
     ct = content_type.split(";")[0].strip().lower()
     return _CONTENT_TYPE_FORMAT_MAP.get(ct)
+
+
+def _log_resolver_diagnostic(
+    resolver: LinkResolver,
+    url: str,
+    category: str,
+    *,
+    status_code: int | None = None,
+    error: BaseException | None = None,
+) -> None:
+    _LOGGER.debug(
+        "file_link_resolver_diagnostic resolver=%s category=%s url=%s "
+        "status_code=%s error_type=%s",
+        type(resolver).__name__,
+        category,
+        redact_url(url),
+        status_code,
+        type(error).__name__ if error is not None else None,
+    )
 
 
 def _parse_propfind_response(
@@ -314,7 +334,7 @@ def _parse_propfind_response(
         if modtime_el is not None and modtime_el.text:
             try:
                 modified_at = parsedate_to_datetime(modtime_el.text.strip())
-            except Exception:
+            except (TypeError, ValueError, IndexError, OverflowError):
                 pass
 
         files.append(

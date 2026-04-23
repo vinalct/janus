@@ -7,8 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
@@ -32,7 +31,17 @@ from janus.models import (
     WriteResult,
 )
 from janus.strategies.base import BaseStrategy, SourceHook
-from janus.utils.environment import load_environment_config, prepare_runtime
+from janus.strategies.common import (
+    _compare_checkpoint_values,
+    _default_storage_layout,
+    _format_datetime,
+    _freeze_string_mapping,
+    _parse_datetime,
+    _raw_page_path,
+    _request_input_key,
+    _retry_delay_seconds,
+    _stringify_mapping,
+)
 from janus.utils.logging import StructuredLogger, redact_url
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
@@ -51,6 +60,7 @@ from .pagination import (
     OffsetPaginator,
     PageNumberPaginator,
     PaginationState,
+    _resume_pagination_state,
     build_paginator,
 )
 from .request_inputs import (
@@ -345,7 +355,9 @@ class ApiStrategy(BaseStrategy):
         )
 
         completed_inputs: list[tuple[str, int]] = list(completed_by_key.items())
-        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_keys = (
+            set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        )
         dead_letter_skip_count = 0
 
         for request_input_index, request_input in enumerate(request_inputs, start=1):
@@ -984,7 +996,7 @@ class ApiStrategy(BaseStrategy):
 
         if last_transport_error is not None:
             raise ApiStrategyError(str(last_transport_error)) from last_transport_error
-        raise AssertionError("Retry loop exited without a response or error")
+        raise ApiStrategyError("Retry loop exited without a response or error")
 
     def _process_response(
         self,
@@ -1210,18 +1222,6 @@ class ApiStrategy(BaseStrategy):
         return os.getenv(name)
 
 
-def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:
-    environment_config = load_environment_config(
-        plan.run_context.environment,
-        plan.run_context.project_root,
-    )
-    prepare_runtime(environment_config, plan.run_context.project_root)
-    return StorageLayout.from_environment_config(
-        environment_config,
-        plan.run_context.project_root,
-    )
-
-
 def _split_path_and_query_params(
     url: str,
     bound_params: dict[str, str],
@@ -1277,34 +1277,6 @@ def _checkpoint_request_value(
     return _format_datetime(parsed_datetime - timedelta(days=lookback_days))
 
 
-def _retry_delay_seconds(
-    plan: ExecutionPlan,
-    attempt: int,
-    response: ApiResponse | None,
-) -> float:
-    retry_config = plan.source_config.extraction.retry
-    rate_limit_backoff = plan.source_config.access.rate_limit.backoff_seconds
-    if retry_config.backoff_strategy == "exponential":
-        delay = retry_config.backoff_seconds * (2 ** (attempt - 1))
-    else:
-        delay = retry_config.backoff_seconds
-
-    maximum_delay = rate_limit_backoff or max(
-        retry_config.backoff_seconds,
-        retry_config.backoff_seconds * retry_config.max_attempts,
-    )
-
-    retry_after_header = None
-    if response is not None:
-        retry_after_header = response.headers_as_dict().get("Retry-After")
-    if retry_after_header is not None:
-        try:
-            delay = max(delay, float(retry_after_header))
-        except ValueError:
-            pass
-    return float(min(delay, maximum_delay))
-
-
 def _supports_concurrent_pagination(
     paginator: Any,
     concurrency: int,
@@ -1330,18 +1302,12 @@ def _raw_relative_path(
     request_input_index: int,
     request_input_count: int,
 ) -> Path:
-    suffix = RAW_FILE_SUFFIXES[raw_format]
-    if pagination_state.page_number is not None:
-        filename = f"page-{pagination_state.page_number:04d}{suffix}"
-    elif pagination_state.offset is not None:
-        filename = f"offset-{pagination_state.offset:08d}{suffix}"
-    elif pagination_state.cursor is not None:
-        filename = f"cursor-{pagination_state.request_index:04d}{suffix}"
-    else:
-        filename = f"response-{pagination_state.request_index:04d}{suffix}"
-    if request_input_count > 1:
-        return Path(f"request-input-{request_input_index:06d}") / filename
-    return Path("pages") / filename
+    return _raw_page_path(
+        pagination_state,
+        RAW_FILE_SUFFIXES[raw_format],
+        request_input_index=request_input_index,
+        request_input_count=request_input_count,
+    )
 
 
 def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> dict[str, str]:
@@ -1387,12 +1353,6 @@ def _request_input_metadata(plan: ExecutionPlan, request_input_count: int) -> di
     return metadata
 
 
-def _request_input_key(request_input: dict[str, Any] | None) -> str:
-    """Stable, content-based fingerprint for a request input context."""
-    if request_input is None:
-        return "__none__"
-    return "|".join(sorted(f"{k}={v}" for k, v in request_input.items()))
-
 
 def _request_input_dead_letter_metadata(
     *,
@@ -1420,21 +1380,6 @@ def _request_input_field_names(
     return tuple(sorted(str(field_name) for field_name in request_input))
 
 
-def _resume_pagination_state(
-    paginator: Any,
-    pagination_state: PaginationState,
-    progress: dict[str, Any],
-) -> PaginationState:
-    """Return a pagination state that resumes after the last recorded page."""
-    last_page = progress.get("last_page_number")
-    if last_page is not None:
-        return PaginationState(request_index=1, page_number=last_page + 1)
-
-    last_offset = progress.get("last_offset")
-    if last_offset is not None and isinstance(paginator, OffsetPaginator):
-        return PaginationState(request_index=1, offset=last_offset + paginator.page_size)
-
-    return pagination_state
 
 
 def _pages_dir(
@@ -1572,82 +1517,3 @@ def _string_value(value: Any) -> str | None:
     if not rendered:
         return None
     return rendered
-
-
-def _freeze_string_mapping(values: Mapping[str, str] | None) -> tuple[tuple[str, str], ...]:
-    if not values:
-        return ()
-
-    frozen_items: list[tuple[str, str]] = []
-    for key, value in values.items():
-        normalized_key = str(key).strip()
-        normalized_value = str(value).strip()
-        if not normalized_key:
-            raise ValueError("mapping keys must be non-empty strings")
-        if not normalized_value:
-            raise ValueError("mapping values must be non-empty strings")
-        frozen_items.append((normalized_key, normalized_value))
-    return tuple(sorted(frozen_items))
-
-
-def _stringify_mapping(values: Mapping[str, Any]) -> dict[str, str]:
-    rendered: dict[str, str] = {}
-    for key, value in values.items():
-        normalized_key = str(key).strip()
-        if not normalized_key:
-            raise ValueError("mapping keys must be non-empty strings")
-        if value is None:
-            continue
-        normalized_value = str(value).strip()
-        if not normalized_value:
-            continue
-        rendered[normalized_key] = normalized_value
-    return rendered
-
-
-def _compare_checkpoint_values(left: str, right: str) -> int:
-    normalized_left = _normalize_checkpoint_value(left)
-    normalized_right = _normalize_checkpoint_value(right)
-    if normalized_left[0] == normalized_right[0]:
-        left_value = normalized_left[1]
-        right_value = normalized_right[1]
-        if left_value < right_value:
-            return -1
-        if left_value > right_value:
-            return 1
-        return 0
-
-    if left < right:
-        return -1
-    if left > right:
-        return 1
-    return 0
-
-
-def _normalize_checkpoint_value(value: str) -> tuple[str, Any]:
-    parsed_datetime = _parse_datetime(value)
-    if parsed_datetime is not None:
-        return ("datetime", parsed_datetime.astimezone(UTC))
-
-    try:
-        return ("decimal", Decimal(value))
-    except InvalidOperation:
-        return ("text", value)
-
-
-def _parse_datetime(value: str) -> datetime | None:
-    normalized = value.strip()
-    if normalized.endswith("Z"):
-        normalized = f"{normalized[:-1]}+00:00"
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return parsed
-
-
-def _format_datetime(value: datetime) -> str:
-    normalized = value.astimezone(UTC).isoformat()
-    return normalized.replace("+00:00", "Z")

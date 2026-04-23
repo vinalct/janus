@@ -66,6 +66,12 @@ The concrete families live under:
 
 Each family owns the reusable behavior for that source pattern. Strategy code is where family-level logic belongs, such as pagination, file discovery, archive handling, or catalog traversal.
 
+Shared support modules keep family code small without becoming source-specific:
+
+- `janus.strategies.common` is the family-neutral helper layer for retry-delay calculation, checkpoint value comparison, stable request-input keys, raw page naming, immutable mapping normalization, and default storage layout resolution. It must not import concrete strategy families or branch on source ids.
+- `janus.strategies.files.formats` is the file-family source of truth for filename resolution, file-format inference, supported Spark handoff formats, archive suffix constants, and safe raw path segment rendering.
+- `janus.strategies.catalog.document` contains pure catalog document traversal, node classification, entity batching, graph node and edge shaping, payload hashing, and parse-summary helpers. It has no transport, storage, Spark, checkpoint, or dead-letter side effects; `catalog.core` orchestrates those runtime concerns.
+
 ### 4. Optional source hooks
 
 Hooks exist so JANUS can handle the small number of sources that do not fit a family cleanly through configuration alone.

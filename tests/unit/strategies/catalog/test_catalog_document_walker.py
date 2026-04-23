@@ -5,7 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from janus.models import ExecutionPlan, RunContext, SourceConfig
-from janus.strategies.catalog.core import (
+from janus.strategies.catalog.core import _persist_generic_artifacts
+from janus.strategies.catalog.document import (
     CATALOG_EDGES_FILE,
     CATALOG_NODES_FILE,
     CatalogBatch,
@@ -17,14 +18,12 @@ from janus.strategies.catalog.core import (
     _classification_confidence,
     _compute_parse_summary,
     _payload_hash,
-    _persist_generic_artifacts,
     _root_batches,
     classify_catalog_node,
     walk_document,
 )
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
-
 
 # --- walk_document ---
 
@@ -34,8 +33,16 @@ def test_walk_document_list_style_page():
     payload = [{"id": "1", "title": "A"}, {"id": "2", "title": "B"}]
     nodes = walk_document(payload, path="payload")
     assert len(nodes) == 2
-    assert nodes[0] == DocumentNode(path="payload[0]", collection_path="payload", data={"id": "1", "title": "A"})
-    assert nodes[1] == DocumentNode(path="payload[1]", collection_path="payload", data={"id": "2", "title": "B"})
+    assert nodes[0] == DocumentNode(
+        path="payload[0]",
+        collection_path="payload",
+        data={"id": "1", "title": "A"},
+    )
+    assert nodes[1] == DocumentNode(
+        path="payload[1]",
+        collection_path="payload",
+        data={"id": "2", "title": "B"},
+    )
 
 
 def test_walk_document_single_object_detail():
@@ -184,7 +191,11 @@ _SAMPLE_CHILD_RECORD = {
 
 def test_build_generic_catalog_node_has_all_required_fields():
     """Generic node contains every field from the handoff spec including classification_signals."""
-    node = _build_generic_catalog_node(_SAMPLE_ENTITY_RECORD, parent_node_path=None, variant="metadata_catalog")
+    node = _build_generic_catalog_node(
+        _SAMPLE_ENTITY_RECORD,
+        parent_node_path=None,
+        variant="metadata_catalog",
+    )
     required_fields = {
         "node_key", "node_path", "parent_node_key", "parent_node_path",
         "root_document_key", "payload", "payload_hash", "request_url",
@@ -323,7 +334,7 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def test_persist_generic_artifacts_collection_page_emits_nodes_and_edges(tmp_path):
-    """Collection page with parent-child entities produces both catalog_nodes.jsonl and catalog_edges.jsonl."""
+    """Collection with parent-child entities emits catalog node and edge artifacts."""
     plan = _build_plan_for_generic_tests(tmp_path)
     raw_writer = RawArtifactWriter(_storage_layout(tmp_path))
     normalized_records = {
@@ -339,8 +350,16 @@ def test_persist_generic_artifacts_collection_page_emits_nodes_and_edges(tmp_pat
     assert f"{CATALOG_NODES_FILE}.jsonl" in artifact_names
     assert f"{CATALOG_EDGES_FILE}.jsonl" in artifact_names
 
-    nodes_path = next(Path(a.path) for a in artifacts if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl")
-    edges_path = next(Path(a.path) for a in artifacts if Path(a.path).name == f"{CATALOG_EDGES_FILE}.jsonl")
+    nodes_path = next(
+        Path(a.path)
+        for a in artifacts
+        if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl"
+    )
+    edges_path = next(
+        Path(a.path)
+        for a in artifacts
+        if Path(a.path).name == f"{CATALOG_EDGES_FILE}.jsonl"
+    )
 
     nodes = _read_jsonl(nodes_path)
     edges = _read_jsonl(edges_path)
@@ -357,7 +376,7 @@ def test_persist_generic_artifacts_collection_page_emits_nodes_and_edges(tmp_pat
 
 
 def test_persist_generic_artifacts_detail_document_emits_node_no_edge(tmp_path):
-    """Single root-level entity (no parent) produces catalog_nodes.jsonl but no catalog_edges.jsonl."""
+    """Single root-level entity emits a node artifact without edge artifacts."""
     plan = _build_plan_for_generic_tests(tmp_path)
     raw_writer = RawArtifactWriter(_storage_layout(tmp_path))
     normalized_records = {
@@ -373,7 +392,11 @@ def test_persist_generic_artifacts_detail_document_emits_node_no_edge(tmp_path):
     assert f"{CATALOG_NODES_FILE}.jsonl" in artifact_names
     assert f"{CATALOG_EDGES_FILE}.jsonl" not in artifact_names
 
-    nodes_path = next(Path(a.path) for a in artifacts if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl")
+    nodes_path = next(
+        Path(a.path)
+        for a in artifacts
+        if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl"
+    )
     nodes = _read_jsonl(nodes_path)
 
     assert len(nodes) == 1
@@ -393,7 +416,11 @@ def test_persist_generic_artifacts_parent_node_path_resolved_from_sibling_record
     }
 
     artifacts, _ = _persist_generic_artifacts(plan, raw_writer, normalized_records)
-    nodes_path = next(Path(a.path) for a in artifacts if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl")
+    nodes_path = next(
+        Path(a.path)
+        for a in artifacts
+        if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl"
+    )
     nodes = _read_jsonl(nodes_path)
 
     resource_node = next(n for n in nodes if n["node_key"] == "res-1")
@@ -579,7 +606,11 @@ def test_classify_catalog_node_signals_present_in_generic_node(tmp_path):
     }
 
     artifacts, _ = _persist_generic_artifacts(plan, raw_writer, normalized_records)
-    nodes_path = next(Path(a.path) for a in artifacts if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl")
+    nodes_path = next(
+        Path(a.path)
+        for a in artifacts
+        if Path(a.path).name == f"{CATALOG_NODES_FILE}.jsonl"
+    )
     nodes = _read_jsonl(nodes_path)
 
     node = nodes[0]
@@ -588,7 +619,7 @@ def test_classify_catalog_node_signals_present_in_generic_node(tmp_path):
 
 
 def test_classify_catalog_node_unknown_reflected_in_parse_summary(tmp_path):
-    """Nodes with low-confidence unknown classification are counted as unknown in the parse summary."""
+    """Low-confidence unknown classification is counted in the parse summary."""
     plan = _build_plan_for_generic_tests(tmp_path)
     raw_writer = RawArtifactWriter(_storage_layout(tmp_path))
     bare_record = {

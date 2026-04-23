@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import logging
 import textwrap
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from janus.models import ExecutionPlan, RunContext, SourceConfig
-from janus.strategies.api import ApiResponse, ApiRequest
+from janus.strategies.api import ApiRequest, ApiResponse
 from janus.strategies.files import DiscoveredFile, FileHook, FileStrategy
 from janus.strategies.files.resolvers import (
     DEFAULT_RESOLVER_CHAIN,
@@ -21,7 +20,6 @@ from janus.strategies.files.resolvers import (
     resolve_link,
 )
 from janus.utils.storage import StorageLayout
-
 
 # ---------------------------------------------------------------------------
 # Shared test infrastructure
@@ -792,3 +790,83 @@ def _build_strategy(
         clock=lambda: 0.0,
     )
     return strategy, transport
+
+
+# ---------------------------------------------------------------------------
+# resolver chain falls through on transport exceptions
+# ---------------------------------------------------------------------------
+
+
+def test_redirect_resolver_returns_empty_on_transport_exception():
+    """RedirectResolver must swallow transport errors and return empty — not crash."""
+    from urllib.error import URLError
+
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/data/file"
+
+    files = RedirectResolver().resolve(url, "csv", transport)
+
+    assert list(files) == []
+
+
+def test_html_link_resolver_returns_empty_on_transport_exception():
+    """HtmlLinkResolver must swallow transport errors and return empty — not crash."""
+    from urllib.error import URLError
+
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/portal/page"
+
+    files = HtmlLinkResolver().resolve(url, "csv", transport)
+
+    assert list(files) == []
+
+
+def test_nextcloud_webdav_resolver_returns_empty_on_transport_exception():
+    """NextcloudWebDavResolver must swallow transport errors and return empty."""
+    from urllib.error import URLError
+
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/index.php/s/TOKEN"
+
+    files = NextcloudWebDavResolver().resolve(url, None, transport)
+
+    assert list(files) == []
+
+
+def test_resolve_link_chain_falls_through_when_redirect_resolver_fails():
+    """
+    When RedirectResolver raises a transport exception the chain must continue
+    and the next matching resolver (HtmlLinkResolver) gets a chance to resolve.
+    """
+    from urllib.error import URLError
+
+    head_exception = URLError("connection refused")
+    html_body = b"<html><body><a href='/data/report.csv'>CSV</a></body></html>"
+    transport = FakeTransport([
+        head_exception,
+        ResponseSpec(200, html_body, {"Content-Type": "text/html"}),
+    ])
+    url = "https://example.gov.br/portal/page"
+    chain = (RedirectResolver(), HtmlLinkResolver())
+
+    files = resolve_link(url, "csv", transport, chain)
+
+    assert len(files) == 1
+    assert files[0].filename == "report.csv"
+
+
+def test_resolver_transport_diagnostic_uses_redacted_url(caplog):
+    from urllib.error import URLError
+
+    caplog.set_level(logging.DEBUG, logger="janus.strategies.files.resolvers")
+    transport = FakeTransport([URLError("connection refused")])
+    url = "https://example.gov.br/index.php/s/TOKEN123?token=secret&page=1"
+
+    files = NextcloudWebDavResolver().resolve(url, None, transport)
+
+    assert list(files) == []
+    assert "NextcloudWebDavResolver" in caplog.text
+    assert "transport_error" in caplog.text
+    assert "TOKEN123" not in caplog.text
+    assert "secret" not in caplog.text
+    assert "***REDACTED***" in caplog.text

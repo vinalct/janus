@@ -11,6 +11,7 @@ The result is the generic runtime layer used by bulk-file sources such as INEP a
 ## What was added
 
 - `src/janus/strategies/files/core.py` now implements the `FileStrategy` itself, plus the file-specific hook points and helper objects that support discovery, download, version handling, archive extraction, normalization handoff, and metadata emission.
+- `src/janus/strategies/files/formats.py` is the file-family source of truth for filename handling, format inference, supported handoff formats, archive suffix constants, and safe path segment rendering.
 - `src/janus/strategies/files/resolvers.py` provides the reusable link resolver chain used when a file source starts from a landing page or public share instead of a direct download URL.
 - `src/janus/strategies/files/__init__.py` now exposes the file strategy package surface for downstream imports.
 - `src/janus/planner/core.py` now resolves file variants to the real `FileStrategy` in the default strategy catalog.
@@ -90,6 +91,14 @@ That gives the file layer a sensible generic version-selection rule without hard
 For `archive_package`, the strategy still treats the original archive as the raw download to preserve, but it also extracts reusable member artifacts for downstream handoff.
 
 The reusable archive support covers ZIP files and gzip tarballs (`.tar.gz` or `.tgz`).
+
+## Format inference boundary
+
+File-format inference now lives in `janus.strategies.files.formats`.
+
+That module is intentionally narrow. It decides how JANUS derives a filename from a URL or content-disposition header, how a filename maps to a file-family format, which formats can be handed to Spark directly, which suffixes are archive candidates, and how version or archive path segments are made safe for raw persistence.
+
+The file strategy calls those helpers instead of carrying its own extension checks. Resolvers use the same helpers when classifying remote candidates. That keeps CSV, JSONL, Parquet, binary archive, and text decisions consistent across local discovery, remote discovery, download persistence, archive extraction, and Spark handoff filtering.
 
 ## Remote download behavior
 

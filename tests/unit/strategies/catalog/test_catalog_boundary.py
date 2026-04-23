@@ -13,6 +13,7 @@ rejected in review and redirected to a bounded hook instead.
 
 import ast
 import inspect
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -183,7 +184,7 @@ def test_normalized_catalog_record_payload_field_carries_original_data():
         raw_artifact=_fake_artifact(),
         parent=None,
     )
-    assert result["payload"] == record
+    assert result["payload"] == json.dumps(record, sort_keys=True, ensure_ascii=False)
     assert "custom_source_field" in result["payload"]
     assert "custom_source_field" not in result
 

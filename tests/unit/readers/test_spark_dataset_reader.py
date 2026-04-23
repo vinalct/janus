@@ -91,7 +91,7 @@ def test_spark_dataset_reader_applies_explicit_schema_to_headerless_cnpj_csv(
     tmp_path,
 ):
     source_config = load_registry(PROJECT_ROOT).get_source(
-        "receita_federal__cnpj__empresas",
+        "receita_federal__cnpj__empresas_full_refresh",
         include_disabled=True,
     )
     source_config = replace(

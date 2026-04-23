@@ -157,12 +157,11 @@ def _sanitize_string(value: str, *, field_name: str | None = None) -> str:
 def redact_url(url: str) -> str:
     """Redact sensitive query parameters from URLs while leaving the rest readable."""
     parsed = urlsplit(url)
-    if not parsed.scheme or not parsed.netloc or not parsed.query:
+    if not parsed.scheme or not parsed.netloc:
         return url
 
-    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    if not query_pairs:
-        return url
+    redacted_path = _redact_sensitive_path(parsed.path)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True) if parsed.query else []
 
     redacted_pairs = []
     changed = False
@@ -173,6 +172,22 @@ def redact_url(url: str) -> str:
         else:
             redacted_pairs.append((key, value))
 
-    if not changed:
+    if not changed and redacted_path == parsed.path:
         return url
-    return urlunsplit(parsed._replace(query=urlencode(redacted_pairs)))
+    return urlunsplit(
+        parsed._replace(path=redacted_path, query=urlencode(redacted_pairs))
+    )
+
+
+def _redact_sensitive_path(path: str) -> str:
+    parts = path.split("/")
+    for index, part in enumerate(parts[:-1]):
+        if part == "s" and index > 0 and parts[index - 1] == "index.php":
+            parts[index + 1] = REDACTED_VALUE
+        if (
+            part == "public.php"
+            and index + 3 < len(parts)
+            and parts[index + 1 : index + 3] == ["dav", "files"]
+        ):
+            parts[index + 3] = REDACTED_VALUE
+    return "/".join(parts)

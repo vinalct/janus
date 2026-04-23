@@ -15,7 +15,6 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import unquote, urlsplit
 
 from janus.checkpoints import (
     CheckpointState,
@@ -41,20 +40,31 @@ from janus.strategies.api import (
     inject_auth,
 )
 from janus.strategies.base import BaseStrategy, SourceHook
-from janus.utils.environment import load_environment_config, prepare_runtime, resolve_project_path
+from janus.strategies.common import (
+    _compare_checkpoint_values,
+    _default_storage_layout,
+    _freeze_string_mapping,
+    _max_checkpoint_value,
+    _parse_datetime,
+    _retry_delay_seconds,
+)
+from janus.strategies.files.formats import (
+    ARCHIVE_FILE_SUFFIXES,
+    SUPPORTED_FILE_INPUT_FORMATS,
+    _filename_from_content_disposition,
+    _filename_from_url,
+    _infer_format_name,
+    _is_tarball_filename,
+    _safe_path_segment,
+)
+from janus.utils.environment import resolve_project_path
 from janus.utils.logging import StructuredLogger, redact_url
 from janus.utils.storage import StorageLayout
 from janus.writers import RawArtifactWriter
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-SUPPORTED_FILE_INPUT_FORMATS = frozenset({"binary", "csv", "json", "jsonl", "parquet", "text"})
-ARCHIVE_FILE_SUFFIXES = frozenset({".zip"})
 CHECKSUM_HEADER_CANDIDATES = ("x-checksum-sha256", "x-amz-checksum-sha256")
-CONTENT_DISPOSITION_FILENAME_PATTERN = re.compile(
-    r'''filename\*?=(?:UTF-8''|")?(?P<filename>[^";]+)'''
-)
 VERSION_TOKEN_PATTERN = re.compile(r"(\d{4}(?:[-_]\d{2}(?:[-_]\d{2})?)?)")
-SANITIZE_SEGMENT_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class FileStrategyError(RuntimeError):
@@ -279,7 +289,9 @@ class FileStrategy(BaseStrategy):
         loaded_file_count = 0
         checkpoint_value: str | None = None
         resolved_versions: list[str] = []
-        dead_letter_keys = set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        dead_letter_keys = (
+            set(dead_letter_state.item_keys) if dead_letter_state is not None else set()
+        )
         dead_letter_skip_count = 0
 
         with ApiClient(self.transport_factory()) as client:
@@ -374,7 +386,13 @@ class FileStrategy(BaseStrategy):
                             fallback=plan.source_config.access.format,
                         ),
                     )
-                    version = self._resolve_version(plan, resolved_file, payload, response, file_hook)
+                    version = self._resolve_version(
+                        plan,
+                        resolved_file,
+                        payload,
+                        response,
+                        file_hook,
+                    )
 
                     if _should_skip_for_checkpoint(plan, checkpoint_state, version):
                         skipped_file_count += 1
@@ -405,7 +423,8 @@ class FileStrategy(BaseStrategy):
                         if actual_checksum.lower() != expected_checksum.lower():
                             raise FileIntegrityError(
                                 f"Checksum mismatch for {resolved_filename!r}: "
-                                f"expected {expected_checksum.lower()} got {actual_checksum.lower()}"
+                                f"expected {expected_checksum.lower()} got "
+                                f"{actual_checksum.lower()}"
                             )
                         candidate_checksum_verified_count += 1
 
@@ -853,7 +872,7 @@ class FileStrategy(BaseStrategy):
 
         if last_error is not None:
             raise FileDownloadError(str(last_error)) from last_error
-        raise AssertionError("Retry loop exited without a response or error")
+        raise FileDownloadError("Retry loop exited without a response or error")
 
     def _sleep_for_retry(
         self,
@@ -1004,18 +1023,6 @@ class FileStrategy(BaseStrategy):
         return os.getenv(name)
 
 
-def _default_storage_layout(plan: ExecutionPlan) -> StorageLayout:
-    environment_config = load_environment_config(
-        plan.run_context.environment,
-        plan.run_context.project_root,
-    )
-    prepare_runtime(environment_config, plan.run_context.project_root)
-    return StorageLayout.from_environment_config(
-        environment_config,
-        plan.run_context.project_root,
-    )
-
-
 def _raw_download_relative_path(version: str, filename: str) -> Path:
     return Path("downloads") / _safe_path_segment(version) / _safe_filename(filename)
 
@@ -1047,11 +1054,6 @@ def _safe_filename(value: str) -> str:
     if not filename:
         raise FileDiscoveryError("Resolved filename must not be empty")
     return filename
-
-
-def _safe_path_segment(value: str) -> str:
-    normalized = SANITIZE_SEGMENT_PATTERN.sub("-", value.strip()).strip("-.")
-    return normalized or "current"
 
 
 def _archive_member_payloads(payload: bytes, filename: str = "") -> dict[str, bytes]:
@@ -1108,11 +1110,6 @@ def _filter_members(
     return _filter_discovered_files(members, file_pattern)
 
 
-def _is_tarball_filename(filename: str) -> bool:
-    lower = filename.lower()
-    return lower.endswith(".tar.gz") or lower.endswith(".tgz")
-
-
 def _is_archive_file(
     plan: ExecutionPlan,
     discovered_file: DiscoveredFile,
@@ -1123,7 +1120,7 @@ def _is_archive_file(
     if _is_tarball_filename(discovered_file.filename):
         try:
             return tarfile.is_tarfile(BytesIO(payload))
-        except Exception:
+        except (OSError, tarfile.TarError):
             return False
     suffix = Path(discovered_file.filename).suffix.lower()
     return suffix in ARCHIVE_FILE_SUFFIXES and zipfile.is_zipfile(BytesIO(payload))
@@ -1135,9 +1132,9 @@ def _resolved_filename(filename: str, response: ApiResponse | None) -> str:
 
     content_disposition = response.headers_as_dict().get("Content-Disposition")
     if isinstance(content_disposition, str):
-        match = CONTENT_DISPOSITION_FILENAME_PATTERN.search(content_disposition)
-        if match is not None:
-            return _safe_filename(unquote(match.group("filename").strip()))
+        cd_name = _filename_from_content_disposition(content_disposition)
+        if cd_name is not None:
+            return _safe_filename(cd_name)
     return _safe_filename(filename)
 
 
@@ -1169,41 +1166,11 @@ def _validate_remote_payload(
         )
 
 
-def _filename_from_url(url: str) -> str:
-    path = urlsplit(url).path
-    candidate = Path(unquote(path)).name.strip()
-    return candidate or "download.bin"
-
-
 def _infer_handoff_format(discovered_file: DiscoveredFile, *, fallback: str) -> str:
     format_name = _infer_format_name(discovered_file.filename, fallback=fallback)
     if format_name == "binary" and fallback in SUPPORTED_FILE_INPUT_FORMATS:
         return fallback
     return format_name
-
-
-def _infer_format_name(value: str, *, fallback: str) -> str:
-    if _is_tarball_filename(value):
-        return "binary"
-    suffix = Path(value).suffix.lower()
-    if suffix == ".csv":
-        return "csv"
-    if suffix == ".json":
-        return "json"
-    if suffix in {".jsonl", ".ndjson"}:
-        return "jsonl"
-    if suffix == ".parquet":
-        return "parquet"
-    if suffix in {".txt", ".tsv"}:
-        return "text"
-    if suffix in ARCHIVE_FILE_SUFFIXES:
-        return "binary"
-    if suffix == ".xlsx":
-        return "binary"
-    normalized_fallback = fallback.strip().lower()
-    if normalized_fallback in SUPPORTED_FILE_INPUT_FORMATS:
-        return normalized_fallback
-    return "binary"
 
 
 def _default_discovered_version(
@@ -1235,48 +1202,6 @@ def _version_sort_key(discovered_file: DiscoveredFile) -> tuple[str, Any]:
         return ("decimal", Decimal(normalized))
     except InvalidOperation:
         return ("text", normalized)
-
-
-def _compare_checkpoint_values(left: str, right: str) -> int:
-    left_key = _version_sort_key(
-        DiscoveredFile(
-            source_kind="comparison",
-            location="left",
-            filename="left",
-            format="binary",
-            version=left,
-        )
-    )
-    right_key = _version_sort_key(
-        DiscoveredFile(
-            source_kind="comparison",
-            location="right",
-            filename="right",
-            format="binary",
-            version=right,
-        )
-    )
-
-    if left_key[0] == right_key[0]:
-        if left_key[1] < right_key[1]:
-            return -1
-        if left_key[1] > right_key[1]:
-            return 1
-        return 0
-
-    if left < right:
-        return -1
-    if left > right:
-        return 1
-    return 0
-
-
-def _max_checkpoint_value(current_value: str | None, candidate_value: str) -> str:
-    if current_value is None:
-        return candidate_value
-    if _compare_checkpoint_values(candidate_value, current_value) > 0:
-        return candidate_value
-    return current_value
 
 
 def _should_skip_for_checkpoint(
@@ -1319,60 +1244,3 @@ def _discovered_file_dead_letter_metadata(
         "source_location": _redacted_location(discovered_file),
         "filename": discovered_file.filename,
     }
-
-
-def _retry_delay_seconds(
-    plan: ExecutionPlan,
-    attempt: int,
-    response: ApiResponse | None,
-) -> float:
-    retry_config = plan.source_config.extraction.retry
-    rate_limit_backoff = plan.source_config.access.rate_limit.backoff_seconds
-    if retry_config.backoff_strategy == "exponential":
-        delay = retry_config.backoff_seconds * (2 ** (attempt - 1))
-    else:
-        delay = retry_config.backoff_seconds
-
-    maximum_delay = rate_limit_backoff or max(
-        retry_config.backoff_seconds,
-        retry_config.backoff_seconds * retry_config.max_attempts,
-    )
-
-    retry_after_header = None
-    if response is not None:
-        retry_after_header = response.headers_as_dict().get("Retry-After")
-    if retry_after_header is not None:
-        try:
-            delay = max(delay, float(retry_after_header))
-        except ValueError:
-            pass
-    return float(min(delay, maximum_delay))
-
-
-def _parse_datetime(value: str) -> datetime | None:
-    normalized = value.strip()
-    if normalized.endswith("Z"):
-        normalized = f"{normalized[:-1]}+00:00"
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return parsed
-
-
-def _freeze_string_mapping(values: Mapping[str, str] | None) -> tuple[tuple[str, str], ...]:
-    if not values:
-        return ()
-
-    frozen_items: list[tuple[str, str]] = []
-    for key, value in values.items():
-        normalized_key = str(key).strip()
-        normalized_value = str(value).strip()
-        if not normalized_key:
-            raise ValueError("mapping keys must be non-empty strings")
-        if not normalized_value:
-            raise ValueError("mapping values must be non-empty strings")
-        frozen_items.append((normalized_key, normalized_value))
-    return tuple(sorted(frozen_items))
